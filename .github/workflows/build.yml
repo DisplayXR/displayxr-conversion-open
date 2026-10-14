@@ -1,0 +1,113 @@
+# Copyright 2026, The DisplayXR Project
+# SPDX-License-Identifier: BSL-1.0
+#
+# Build the provider and the fake host on Windows, Ubuntu 22.04 and macOS, run every CTest
+# (inference on the CPU execution provider), check the provider exports exactly one symbol,
+# and validate the model pack (including: no pre-fetched blob is non-commercial).
+
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pack:
+    name: model pack
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate the default pack (schema, licence AND, prefetch is commercial-only)
+        run: python3 -I scripts/check_model_pack.py packs/dxr-open-default.models.json
+      - name: Validate the research test pack
+        run: python3 -I scripts/check_model_pack.py --allow-research tests/packs/research.models.json
+
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache pinned archives and test models
+        uses: actions/cache@v4
+        with:
+          path: |
+            downloads
+            models-cache
+          key: deps-${{ runner.os }}-${{ hashFiles('cmake/OnnxRuntime.cmake', 'packs/*.json') }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch the test models (hash-checked)
+        run: python -I scripts/fetch_models.py packs/dxr-open-default.models.json models-cache --models vda-small-stream-518x294,da2-small
+
+      - name: MSVC developer environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        shell: bash
+        # Ninja on Windows (single-config, MSVC from the developer environment); the default
+        # Makefiles elsewhere.
+        run: >
+          cmake -S . -B build ${{ runner.os == 'Windows' && '-G Ninja' || '' }} -DCMAKE_BUILD_TYPE=Release -DOPENCONV_WERROR=ON
+          -DOPENCONV_DOWNLOAD_DIR="${{ github.workspace }}/downloads" -DOPENCONV_TEST_MODELS_DIR="${{ github.workspace }}/models-cache"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Exactly one export (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $out = & dumpbin /nologo /exports build\DisplayXR-OpenConversion.dll
+          $names = $out | Select-String -Pattern '^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]+\s+(\S+)' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value }
+          Write-Host "exports: $($names -join ', ')"
+          if (@($names).Count -ne 1 -or $names -ne 'xrtConversionPluginNegotiate') {
+            Write-Error "expected exactly xrtConversionPluginNegotiate"
+          }
+          $deps = & dumpbin /nologo /dependents build\DisplayXR-OpenConversion.dll | Select-String '\.dll' |
+            ForEach-Object { $_.Line.Trim() } | Where-Object { $_ -notmatch '^Dump of file' }
+          Write-Host "imports: $($deps -join ', ')"
+          if ($deps -match 'onnxruntime|DirectML') { Write-Error "ONNX Runtime / DirectML must not be imported statically" }
+
+      - name: Exactly one export (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          names=$(nm -D --defined-only build/DisplayXR-OpenConversion.so | awk '$2 == "T" && $3 != "_init" && $3 != "_fini" { print $3 }')
+          echo "exports: $names"
+          test "$names" = "xrtConversionPluginNegotiate"
+          ! readelf -d build/DisplayXR-OpenConversion.so | grep -q onnxruntime
+
+      - name: Exactly one export (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          names=$(nm -gU build/DisplayXR-OpenConversion.dylib | awk '$2 == "T" { print $3 }')
+          echo "exports: $names"
+          test "$names" = "_xrtConversionPluginNegotiate"
+          ! otool -L build/DisplayXR-OpenConversion.dylib | grep -q onnxruntime
+
+      - name: Install tree
+        run: cmake --install build --prefix dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: open-conversion-${{ matrix.os }}
+          path: dist
+          if-no-files-found: error

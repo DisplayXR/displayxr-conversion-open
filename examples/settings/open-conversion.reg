@@ -1,0 +1,23 @@
+Windows Registry Editor Version 5.00
+
+; Example registry row for the open-model conversion provider (64-bit view).
+; The bundle installer writes the same values. Order matters for an installer: Version is
+; written LAST (the "row complete" marker the service re-describes on). Importing this file
+; is a dev convenience only.
+;
+; Settings\<KEY> is read by the provider through host->get_setting(); the environment variable
+; DXR_CONV_OPEN_CONVERSION_<KEY> in the service's environment overrides it. Keys: README.md.
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\DisplayXR\ConversionProviders\open-conversion]
+"Binary"="C:\Program Files\DisplayXR\ConversionProviders\open-conversion\DisplayXR-OpenConversion.dll"
+"DisplayName"="DisplayXR Open Conversion"
+"Vendor"="DisplayXR"
+"ProbeOrder"=dword:000000c8
+"Packs"=hex(7):43,00,3a,00,5c,00,50,00,72,00,6f,00,67,00,72,00,61,00,6d,00,20,00,46,00,69,00,6c,00,65,00,73,00,5c,00,44,00,69,00,73,00,70,00,6c,00,61,00,79,00,58,00,52,00,5c,00,43,00,6f,00,6e,00,76,00,65,00,72,00,73,00,69,00,6f,00,6e,00,50,00,72,00,6f,00,76,00,69,00,64,00,65,00,72,00,73,00,5c,00,6f,00,70,00,65,00,6e,00,2d,00,63,00,6f,00,6e,00,76,00,65,00,72,00,73,00,69,00,6f,00,6e,00,5c,00,64,00,78,00,72,00,2d,00,6f,00,70,00,65,00,6e,00,2d,00,64,00,65,00,66,00,61,00,75,00,6c,00,74,00,2e,00,6d,00,6f,00,64,00,65,00,6c,00,73,00,2e,00,6a,00,73,00,6f,00,6e,00,00,00,00,00
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\DisplayXR\ConversionProviders\open-conversion\Settings]
+"QUALITY"="medium"
+"THREADS"="4"
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\DisplayXR\ConversionProviders\open-conversion]
+"Version"="0.1.0"

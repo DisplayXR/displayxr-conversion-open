@@ -1,0 +1,18 @@
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "open-conversion",
+        "display_name": "DisplayXR Open Conversion",
+        "vendor":       "DisplayXR",
+        "version":      "0.1.0",
+        "binary_path":  "/absolute/path/to/DisplayXR-OpenConversion.so",
+        "probe_order":  200,
+        "packs": [
+            "/absolute/path/to/dxr-open-default.models.json"
+        ],
+        "settings": {
+            "QUALITY": "medium",
+            "THREADS": "4"
+        }
+    }
+}
