@@ -257,7 +257,7 @@ static struct
 	bool no_download;
 	bool clean; //!< --clean-store: start from an empty store
 	uint32_t chunk_ms;
-	char root[1024];
+	char root[384]; //!< short enough that root/blobs/<sha256>.ok fits xrt_conv_model_location::path
 	char blob_base[1024];
 	struct blob blobs[OC_PACK_MAX_MODELS];
 	uint32_t blob_count;
@@ -472,7 +472,12 @@ store_setup(const char *pack_path, const char *blob_base, const char *root)
 	}
 	snprintf(g_store.blob_base, sizeof(g_store.blob_base), "%s",
 	         blob_base != NULL ? blob_base : pack->blob_base_url);
-	snprintf(g_store.root, sizeof(g_store.root), "%s", root);
+	if (strlen(root) >= sizeof(g_store.root)) {
+		fprintf(stderr, "store: root path longer than %u bytes\n", (unsigned)sizeof(g_store.root) - 1);
+		free(pack);
+		return false;
+	}
+	oc_copy_str(g_store.root, sizeof(g_store.root), root);
 	mkdir_utf8(g_store.root);
 	char blobs[1100];
 	snprintf(blobs, sizeof(blobs), "%s/blobs", g_store.root);
@@ -498,7 +503,7 @@ store_setup(const char *pack_path, const char *blob_base, const char *root)
 			for (int k = 0; k < (v == 0 ? 2 : 1); k++) {
 				for (int r = 0; r < 4; r++) {
 					if (b->refs[r][0] == '\0') {
-						snprintf(b->refs[r], sizeof(b->refs[r]), "%s", refs[k]);
+						oc_copy_str(b->refs[r], sizeof(b->refs[r]), refs[k]);
 						break;
 					}
 				}
