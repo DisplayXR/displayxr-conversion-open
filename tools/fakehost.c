@@ -1159,7 +1159,7 @@ main(int argc, char **argv)
 		     g_store.no_download ? ", downloads forbidden" : "");
 	}
 
-	char full[1100], err[256] = "";
+	char full[4096], err[256] = ""; // realpath() writes up to PATH_MAX (4096 on Linux)
 #ifdef _WIN32
 	{
 		wchar_t w[1024], wf[1024];
