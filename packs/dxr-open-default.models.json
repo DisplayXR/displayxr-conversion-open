@@ -1,0 +1,302 @@
+{
+  "schema": 2,
+  "pack": "dxr-open-default",
+  "generated": "2026-10-14",
+  "provider": "open-conversion",
+  "blobBaseUrl": "https://github.com/DisplayXR/displayxr-models/releases/download/blobs",
+  "commercial": true,
+  "models": [
+    {
+      "name": "vda-small-stream-518x294",
+      "version": "1.0.0",
+      "task": "depth-video",
+      "pipeline_tag": "depth-estimation",
+      "io": {
+        "input": {
+          "color_space": "srgb",
+          "range": [0, 1],
+          "layout": "nchw-rgb",
+          "normalize": null,
+          "resolution": "fixed-518x294",
+          "native_long_edge": 518,
+          "intrinsics_in": "none"
+        },
+        "output": {
+          "depth_kind": "affine-disparity",
+          "measure": "planar",
+          "intrinsics_out": "none",
+          "confidence": false,
+          "coords": null,
+          "splat_format": null
+        },
+        "tensors": {
+          "image": "image",
+          "cache_in": "cache_in",
+          "cache_out": "cache_out",
+          "is_first": "is_first",
+          "depth": "depth"
+        },
+        "state": { "cache_shape": [42, 956160], "cache_dtype": "float32" }
+      },
+      "license": {
+        "spdx": "Apache-2.0",
+        "link": "https://huggingface.co/depth-anything/Video-Depth-Anything-Small",
+        "commercial": true,
+        "attribution": "Video Depth Anything (Small) by the Video Depth Anything authors, Apache-2.0",
+        "dependencies": [{ "name": "DINOv2 ViT-S/14 backbone", "spdx": "Apache-2.0", "commercial": true }]
+      },
+      "provenance": {
+        "source_url": "https://github.com/DepthAnything/Video-Depth-Anything",
+        "base_model": "depth-anything/Video-Depth-Anything-Small",
+        "converted_by": "DisplayXR: streaming ONNX export with an explicit temporal cache; fp16 weights, fp32 compute"
+      },
+      "prefetch": true,
+      "variants": [
+        {
+          "id": "w16",
+          "backend": "onnxruntime",
+          "ep": ["dml", "cpu"],
+          "precision": "fp16-weights",
+          "os": ["windows>=10.0.19041", "linux", "macos"],
+          "files": [
+            {
+              "role": "model",
+              "format": "onnx",
+              "sha256": "71e3ae9e96606afe905eb2f4bab71700e7b9a5b6167bf9d145851720b452a949",
+              "size": 57803548
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "vda-small-stream-364x210",
+      "version": "1.0.0",
+      "task": "depth-video",
+      "pipeline_tag": "depth-estimation",
+      "io": {
+        "input": {
+          "color_space": "srgb",
+          "range": [0, 1],
+          "layout": "nchw-rgb",
+          "normalize": null,
+          "resolution": "fixed-364x210",
+          "native_long_edge": 364,
+          "intrinsics_in": "none"
+        },
+        "output": {
+          "depth_kind": "affine-disparity",
+          "measure": "planar",
+          "intrinsics_out": "none",
+          "confidence": false,
+          "coords": null,
+          "splat_format": null
+        },
+        "tensors": {
+          "image": "image",
+          "cache_in": "cache_in",
+          "cache_out": "cache_out",
+          "is_first": "is_first",
+          "depth": "depth"
+        },
+        "state": { "cache_shape": [42, 479232], "cache_dtype": "float32" }
+      },
+      "license": {
+        "spdx": "Apache-2.0",
+        "link": "https://huggingface.co/depth-anything/Video-Depth-Anything-Small",
+        "commercial": true,
+        "attribution": "Video Depth Anything (Small) by the Video Depth Anything authors, Apache-2.0",
+        "dependencies": [{ "name": "DINOv2 ViT-S/14 backbone", "spdx": "Apache-2.0", "commercial": true }]
+      },
+      "provenance": {
+        "source_url": "https://github.com/DepthAnything/Video-Depth-Anything",
+        "base_model": "depth-anything/Video-Depth-Anything-Small",
+        "converted_by": "DisplayXR: streaming ONNX export with an explicit temporal cache; fp16 weights, fp32 compute"
+      },
+      "prefetch": false,
+      "variants": [
+        {
+          "id": "w16",
+          "backend": "onnxruntime",
+          "ep": ["dml", "cpu"],
+          "precision": "fp16-weights",
+          "os": ["windows>=10.0.19041", "linux", "macos"],
+          "files": [
+            {
+              "role": "model",
+              "format": "onnx",
+              "sha256": "2bcf27020b45bd25f3ed4e28b3fc328c33af934661c0ee2be73a427a30d4f184",
+              "size": 57506238
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "da2-small",
+      "version": "1.0.0",
+      "task": "depth-mono",
+      "pipeline_tag": "depth-estimation",
+      "io": {
+        "input": {
+          "color_space": "srgb",
+          "range": [0, 1],
+          "layout": "nchw-rgb",
+          "normalize": { "mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225] },
+          "resolution": "dynamic-multiple-of-14",
+          "native_long_edge": 518,
+          "temporal_window": 1,
+          "intrinsics_in": "none"
+        },
+        "output": {
+          "depth_kind": "affine-disparity",
+          "measure": "planar",
+          "intrinsics_out": "none",
+          "confidence": false,
+          "coords": null,
+          "splat_format": null
+        },
+        "tensors": { "image": "pixel_values", "depth": "predicted_depth" }
+      },
+      "license": {
+        "spdx": "Apache-2.0",
+        "link": "https://huggingface.co/depth-anything/Depth-Anything-V2-Small",
+        "commercial": true,
+        "attribution": "Depth Anything V2 (Small) by the Depth Anything V2 authors, Apache-2.0",
+        "dependencies": [{ "name": "DINOv2 ViT-S/14 backbone", "spdx": "Apache-2.0", "commercial": true }]
+      },
+      "provenance": {
+        "source_url": "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model_fp16.onnx",
+        "base_model": "depth-anything/Depth-Anything-V2-Small",
+        "converted_by": "onnx-community (byte-identical to the upstream onnx/model_fp16.onnx)"
+      },
+      "prefetch": true,
+      "variants": [
+        {
+          "id": "fp16",
+          "backend": "onnxruntime",
+          "ep": ["dml", "cpu"],
+          "precision": "fp16",
+          "os": ["windows>=10.0.19041", "linux", "macos"],
+          "files": [
+            {
+              "role": "model",
+              "format": "onnx",
+              "sha256": "2df6223f206b5164e21f664ace61dabeb9bb6a49b8b5a3e00510b4807d0f5b04",
+              "size": 49642442
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "light-inpaint-v1-512x288",
+      "version": "1.0.0",
+      "task": "aux:inpaint",
+      "pipeline_tag": "image-inpainting",
+      "io": {
+        "input": {
+          "color_space": "srgb",
+          "range": [0, 1],
+          "layout": "nchw-rgb",
+          "normalize": null,
+          "resolution": "fixed-512x288",
+          "mask": "1 = hole"
+        },
+        "output": { "color_space": "srgb", "range": [0, 1] },
+        "tensors": { "image": "rgb", "mask": "mask", "output": "out" }
+      },
+      "license": {
+        "spdx": "MIT",
+        "link": "https://github.com/nagadomi/nunif/blob/master/LICENSE",
+        "commercial": true,
+        "attribution": "nunif iw3 light_inpaint_v1 by nagadomi, MIT",
+        "dependencies": []
+      },
+      "provenance": {
+        "source_url": "https://github.com/nagadomi/nunif/releases/download/0.0.0/iw3_light_inpaint_v1_20250919.pth",
+        "base_model": "nunif iw3 light_inpaint_v1",
+        "converted_by": "DisplayXR: static-shape ONNX export, fp16"
+      },
+      "prefetch": true,
+      "variants": [
+        {
+          "id": "fp16",
+          "backend": "onnxruntime",
+          "ep": ["dml", "cpu"],
+          "precision": "fp16",
+          "os": ["windows>=10.0.19041", "linux", "macos"],
+          "files": [
+            {
+              "role": "model",
+              "format": "onnx",
+              "sha256": "c1cd5b9ac2a37840efa135641f4f7e5824ee8f6b067472c0f5037d9b2e8be011",
+              "size": 5167981
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "light-inpaint-v1-1024x576",
+      "version": "1.0.0",
+      "task": "aux:inpaint",
+      "pipeline_tag": "image-inpainting",
+      "io": {
+        "input": {
+          "color_space": "srgb",
+          "range": [0, 1],
+          "layout": "nchw-rgb",
+          "normalize": null,
+          "resolution": "fixed-1024x576",
+          "mask": "1 = hole"
+        },
+        "output": { "color_space": "srgb", "range": [0, 1] },
+        "tensors": { "image": "rgb", "mask": "mask", "output": "out" }
+      },
+      "license": {
+        "spdx": "MIT",
+        "link": "https://github.com/nagadomi/nunif/blob/master/LICENSE",
+        "commercial": true,
+        "attribution": "nunif iw3 light_inpaint_v1 by nagadomi, MIT",
+        "dependencies": []
+      },
+      "provenance": {
+        "source_url": "https://github.com/nagadomi/nunif/releases/download/0.0.0/iw3_light_inpaint_v1_20250919.pth",
+        "base_model": "nunif iw3 light_inpaint_v1",
+        "converted_by": "DisplayXR: static-shape ONNX export, fp16"
+      },
+      "prefetch": false,
+      "variants": [
+        {
+          "id": "fp16",
+          "backend": "onnxruntime",
+          "ep": ["dml", "cpu"],
+          "precision": "fp16",
+          "os": ["windows>=10.0.19041", "linux", "macos"],
+          "files": [
+            {
+              "role": "model",
+              "format": "onnx",
+              "sha256": "2af8952a4da6e8fde91da120329656ef885e16e159faa25b821902688658ad36",
+              "size": 6936267
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "defaults": {
+    "depth-video": {
+      "low": "vda-small-stream-364x210",
+      "medium": "vda-small-stream-518x294",
+      "high": "vda-small-stream-518x294"
+    },
+    "depth-mono": { "low": "da2-small", "medium": "da2-small", "high": "da2-small" },
+    "aux:inpaint": {
+      "low": "light-inpaint-v1-512x288",
+      "medium": "light-inpaint-v1-512x288",
+      "high": "light-inpaint-v1-1024x576"
+    }
+  }
+}
