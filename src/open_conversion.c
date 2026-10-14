@@ -948,14 +948,16 @@ resolve:
 		const uint32_t reason = r == OC_RUN_OUT_OF_MEMORY ? XRT_CONV_FAIL_RESOURCES
 		                        : r == OC_RUN_DEVICE_LOST ? XRT_CONV_FAIL_DEVICE_LOST
 		                                                  : XRT_CONV_FAIL_MODEL;
-		snprintf(why, sizeof(why), "%s: %s", m->name, err);
+		// Bounded: the detail is for a human and truncates by design (XRT_CONV_DETAIL_MAX).
+		snprintf(why, sizeof(why), "%.40s: %.80s", m->name, err);
 		set_state(p, c, XRT_CONV_STATE_FAILED, reason, reason == XRT_CONV_FAIL_DEVICE_LOST ? 1u : 0u, -1.0f,
 		          why);
 		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
 	}
 
 	oc_lock(&p->lock);
-	snprintf(c->version, sizeof(c->version), "%s@%s ort %s", m->name, m->version, oc_ort_version(p->ort));
+	// 24 + 1 + 8 + 5 + 9 + NUL fits version[48].
+	snprintf(c->version, sizeof(c->version), "%.24s@%.8s ort %.9s", m->name, m->version, oc_ort_version(p->ort));
 	oc_unlock(&p->lock);
 	snprintf(why, sizeof(why), "%s: ready (%s)", m->name, c->backend);
 	set_state(p, c, XRT_CONV_STATE_READY, XRT_CONV_FAIL_NONE, 0, 1.0f, why);
@@ -1028,7 +1030,7 @@ infer(struct oc_provider *p,
 	if (r == OC_RUN_DEVICE_LOST) {
 		// The runtime reads FAILED(DEVICE_LOST, retryable) and re-warms on its thread.
 		char why[XRT_CONV_DETAIL_MAX];
-		snprintf(why, sizeof(why), "%s: device lost: %s", m->name, err);
+		snprintf(why, sizeof(why), "%.40s: device lost: %.70s", m->name, err);
 		set_state(p, c, XRT_CONV_STATE_FAILED, XRT_CONV_FAIL_DEVICE_LOST, 1, -1.0f, why);
 		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
 	}

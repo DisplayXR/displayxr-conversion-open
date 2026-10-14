@@ -1356,6 +1356,19 @@ main(int argc, char **argv)
 		const bool watching = thread_start(&watcher, watch_main, NULL);
 		const uint64_t t0 = oc_now_ms();
 		r = iface->warm(inst, caps[i].cap_id, never_cancelled, NULL);
+		// warm may return before READY (the contract lets a provider publish
+		// progress and finish later): wait up to --warm-timeout-ms for a final state.
+		for (;;) {
+			memset(&st, 0, sizeof(st));
+			st.struct_size = (uint32_t)sizeof(st);
+			(void)iface->get_state(inst, caps[i].cap_id, &st);
+			const bool waiting =
+			    st.state == XRT_CONV_STATE_WARMING || st.state == XRT_CONV_STATE_DOWNLOADING;
+			if (!waiting || oc_now_ms() - t0 > warm_timeout_ms) {
+				break;
+			}
+			oc_sleep_ms(20);
+		}
 		const uint64_t t1 = oc_now_ms();
 		g_watch.stop = true;
 		if (watching) {
