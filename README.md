@@ -146,6 +146,19 @@ environment, else `Settings\<KEY>` under the registry row (Windows) or the manif
 | `PACK` | absolute path | another pack manifest (default: `dxr-open-default.models.json` next to the binary) |
 | `ONNXRUNTIME` | absolute path | another ONNX Runtime library (default: next to the binary) |
 
+## Releases and installing
+
+A `vX.Y.Z` tag builds and attaches (unsigned):
+
+- `DisplayXROpenConversionSetup-<version>.exe` (Windows, DirectML + CPU): installs under
+  `Program Files\DisplayXR\Plugins\OpenConversion`, writes the `ConversionProviders\open-conversion`
+  row (`ProbeOrder` 200, `Packs` = the shipped pack manifest, `Version` last). It downloads no
+  model; the runtime model store fetches blobs by URL and SHA-256 on first use. The uninstaller
+  removes only this provider's row and files, never the model store.
+- `displayxr-open-conversion-<version>-linux-x86_64.tar.gz` (CPU): `install.sh` copies the payload
+  to `${XDG_DATA_HOME:-~/.local/share}/DisplayXR/OpenConversion` and writes the JSON manifest.
+  `uninstall.sh` removes both.
+
 ## Registration
 
 Windows: `HKLM\Software\DisplayXR\ConversionProviders\open-conversion` with `Binary`,

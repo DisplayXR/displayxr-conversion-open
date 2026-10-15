@@ -1,0 +1,81 @@
+# Copyright 2026, The DisplayXR Project
+# SPDX-License-Identifier: BSL-1.0
+#
+# Tag-triggered release: vX.Y.Z -> Windows NSIS installer + Linux tarball attached to the
+# GitHub Release. Builds are unsigned (the release notes say so). The ordinary `build`
+# workflow already runs every test on each push; this lane only builds and packages.
+
+name: release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version from tag
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Configure
+        shell: bash
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DOPENCONV_BUILD_TESTS=OFF -DOPENCONV_DOWNLOAD_DIR="${{ github.workspace }}/downloads"
+      - name: Build
+        run: cmake --build build
+      - name: Install tree
+        run: cmake --install build --prefix dist
+      - name: NSIS
+        run: choco install nsis -y --no-progress
+      - name: Installer
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" /V2 "/DVERSION=$env:VERSION" "/DDIST_DIR=$PWD\dist" "/DOUTPUT_DIR=$PWD\out" installer\DisplayXROpenConversionInstaller.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
+          Get-ChildItem out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: out/DisplayXROpenConversionSetup-*.exe
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version from tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOPENCONV_BUILD_TESTS=OFF -DOPENCONV_DOWNLOAD_DIR="$PWD/downloads"
+          cmake --build build
+          cmake --install build --prefix dist
+      - name: Tarball
+        run: scripts/package_posix.sh dist "$VERSION" out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-tarball
+          path: out/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [windows, linux]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - run: ls -l assets
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          draft: false
+          prerelease: false
