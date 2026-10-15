@@ -15,6 +15,12 @@
 cmake_minimum_required(VERSION 3.22)
 project(displayxr_conversion_open VERSION 0.1.0 LANGUAGES C)
 
+# The runtime release the vendored include/xrt/ headers match (README "The ABI it builds
+# against"). Metadata only: nothing compiles against it. The runtime repository downstream-pins.json
+# tracks this literal and opens a repin PR only when the conversion-provider ABI major changes;
+# re-vendor the headers in that PR.
+set(DXR_RUNTIME_GIT_TAG "v2.42.0")
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 # gnu11 on GCC / Clang: POSIX (nanosleep, realpath, dladdr) is visible without feature macros.
