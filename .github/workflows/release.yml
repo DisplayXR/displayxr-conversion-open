@@ -35,6 +35,7 @@ jobs:
       - name: Installer
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Force out | Out-Null
           & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" /V2 "/DVERSION=$env:VERSION" "/DDIST_DIR=$PWD\dist" "/DOUTPUT_DIR=$PWD\out" installer\DisplayXROpenConversionInstaller.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
           Get-ChildItem out
@@ -56,7 +57,7 @@ jobs:
           cmake --build build
           cmake --install build --prefix dist
       - name: Tarball
-        run: scripts/package_posix.sh dist "$VERSION" out
+        run: bash scripts/package_posix.sh dist "$VERSION" out
       - uses: actions/upload-artifact@v4
         with:
           name: linux-tarball
