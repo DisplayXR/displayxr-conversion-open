@@ -108,6 +108,12 @@ jobs:
 
       # The release workflow is tag-only, so this is the one place a PR proves the NSIS script
       # still compiles and that the ADR-054 allowlist row is generated for the DLL we ship.
+      - name: NSIS (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe")) { choco install nsis -y --no-progress }
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe")) { throw "makensis not available" }
       - name: Installer smoke (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
