@@ -106,6 +106,21 @@ jobs:
       - name: Install tree
         run: cmake --install build --prefix dist
 
+      # The release workflow is tag-only, so this is the one place a PR proves the NSIS script
+      # still compiles and that the ADR-054 allowlist row is generated for the DLL we ship.
+      - name: Installer smoke (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake "-DBIN_DIR=$PWD\dist" "-DVERSION=0.0.0-ci" "-DOUT=$PWD\build\Allowlist.nsh" -P installer\gen_allowlist_nsh.cmake
+          if ($LASTEXITCODE -ne 0) { throw "gen_allowlist_nsh failed" }
+          $nsh = Get-Content -Raw build\Allowlist.nsh
+          if ($nsh -notmatch 'Trust\\Allowlist" "[0-9a-f]{64}"') { throw "Allowlist.nsh carries no SHA-256 row" }
+          New-Item -ItemType Directory -Force out | Out-Null
+          & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" /V2 "/DVERSION=0.0.0-ci" "/DDIST_DIR=$PWD\dist" "/DOUTPUT_DIR=$PWD\out" "/DALLOWLIST_NSH=$PWD\build\Allowlist.nsh" installer\DisplayXROpenConversionInstaller.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
+          if (-not (Test-Path out\DisplayXROpenConversionSetup-0.0.0-ci.exe)) { throw "installer not produced" }
+
       - uses: actions/upload-artifact@v4
         with:
           name: open-conversion-${{ matrix.os }}
