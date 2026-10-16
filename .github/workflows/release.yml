@@ -32,11 +32,19 @@ jobs:
         run: cmake --install build --prefix dist
       - name: NSIS
         run: choco install nsis -y --no-progress
+      # ADR-054 N4b: the runtime's provenance gate enforces on Windows and these builds are
+      # unsigned, so the installer must carry the SHA-256 of the DLL it ships (allowlist row).
+      - name: Allowlist row for the unsigned provider DLL
+        shell: pwsh
+        run: |
+          cmake "-DBIN_DIR=$PWD\dist" "-DVERSION=$env:VERSION" "-DOUT=$PWD\build\Allowlist.nsh" -P installer\gen_allowlist_nsh.cmake
+          if ($LASTEXITCODE -ne 0) { throw "gen_allowlist_nsh failed" }
+          Get-Content build\Allowlist.nsh
       - name: Installer
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force out | Out-Null
-          & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" /V2 "/DVERSION=$env:VERSION" "/DDIST_DIR=$PWD\dist" "/DOUTPUT_DIR=$PWD\out" installer\DisplayXROpenConversionInstaller.nsi
+          & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" /V2 "/DVERSION=$env:VERSION" "/DDIST_DIR=$PWD\dist" "/DOUTPUT_DIR=$PWD\out" "/DALLOWLIST_NSH=$PWD\build\Allowlist.nsh" installer\DisplayXROpenConversionInstaller.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
           Get-ChildItem out
       - uses: actions/upload-artifact@v4

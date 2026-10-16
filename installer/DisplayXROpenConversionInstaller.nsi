@@ -11,7 +11,15 @@
 ; Order-independent: no runtime prerequisite. The uninstaller removes only this provider row
 ; and files, never the runtime or its model store.
 ;
-; Build-time definitions: VERSION, DIST_DIR (a `cmake --install` tree), OUTPUT_DIR.
+; Build-time definitions: VERSION, DIST_DIR (a `cmake --install` tree), OUTPUT_DIR, and
+; ALLOWLIST_NSH (see below).
+;
+; ADR-054 N4b: the runtime's provenance gate ENFORCES on Windows — a component DLL must be
+; Authenticode-signed or have its SHA-256 under HKLM\Software\DisplayXR\Trust\Allowlist, or
+; the loader refuses it as `unverified`. These builds are unsigned, so the installer writes
+; the digest of exactly the DLL it ships (generated at packaging time by
+; installer/gen_allowlist_nsh.cmake into ALLOWLIST_NSH) and the uninstaller removes the
+; same row. Without it the 0.1.0 release installed a provider the runtime never loaded.
 
 !ifndef VERSION
 	!define VERSION "0.0.0"
@@ -21,6 +29,16 @@
 !endif
 !ifndef OUTPUT_DIR
 	!define OUTPUT_DIR "."
+!endif
+
+!ifdef ALLOWLIST_NSH
+	!include "${ALLOWLIST_NSH}"
+!else
+	!warning "ALLOWLIST_NSH not defined: this installer will write no provenance allowlist row, and an enforcing runtime will refuse the unsigned provider DLL"
+	!macro DXR_ALLOWLIST_WRITE
+	!macroend
+	!macro DXR_ALLOWLIST_REMOVE
+	!macroend
 !endif
 
 !define PROVIDER_ID "open-conversion"
@@ -92,6 +110,9 @@ Section "Open Conversion provider"
 		SetErrorLevel 6
 		Abort "could not write the Packs value"
 	${EndIf}
+	; ADR-054 N4b: the digest of the DLL just written, before the row is marked complete, so
+	; the service never re-describes a row whose binary it would refuse.
+	!insertmacro DXR_ALLOWLIST_WRITE
 	WriteRegStr   HKLM "${ROW}" "Version"         "${VERSION}"
 
 	WriteRegStr HKLM "Software\DisplayXR\Plugins\OpenConversion" "InstallPath" "$INSTDIR"
@@ -117,6 +138,9 @@ Section "Uninstall"
 	SetRegView 64
 	; Only this provider row and files. The runtime model store is never touched.
 	DeleteRegKey HKLM "${ROW}"
+	; ADR-054 N4b: only the allowlist row this installer wrote; rows other installers or
+	; register_dev_plugin.bat wrote are left alone.
+	!insertmacro DXR_ALLOWLIST_REMOVE
 	DeleteRegKey HKLM "Software\DisplayXR\Plugins\OpenConversion"
 	DeleteRegKey HKLM "${UNINST}"
 	Delete "$INSTDIR\DisplayXR-OpenConversion.dll"

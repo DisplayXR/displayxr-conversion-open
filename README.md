@@ -152,9 +152,12 @@ A `vX.Y.Z` tag builds and attaches (unsigned):
 
 - `DisplayXROpenConversionSetup-<version>.exe` (Windows, DirectML + CPU): installs under
   `Program Files\DisplayXR\Plugins\OpenConversion`, writes the `ConversionProviders\open-conversion`
-  row (`ProbeOrder` 200, `Packs` = the shipped pack manifest, `Version` last). It downloads no
-  model; the runtime model store fetches blobs by URL and SHA-256 on first use. The uninstaller
-  removes only this provider's row and files, never the model store.
+  row (`ProbeOrder` 200, `Packs` = the shipped pack manifest, `Version` last) and, because the
+  build is unsigned, the provider DLL's SHA-256 under `HKLM\Software\DisplayXR\Trust\Allowlist`
+  (ADR-054 N4b: the runtime's provenance gate enforces on Windows and refuses an unsigned,
+  non-allowlisted component — 0.1.0 shipped without the row and was never loaded). It downloads
+  no model; the runtime model store fetches blobs by URL and SHA-256 on first use. The uninstaller
+  removes only this provider's row, its allowlist row and files, never the model store.
 - `displayxr-open-conversion-<version>-linux-x86_64.tar.gz` (CPU): `install.sh` copies the payload
   to `${XDG_DATA_HOME:-~/.local/share}/DisplayXR/OpenConversion` and writes the JSON manifest.
   `uninstall.sh` removes both.
@@ -163,7 +166,10 @@ A `vX.Y.Z` tag builds and attaches (unsigned):
 
 Windows: `HKLM\Software\DisplayXR\ConversionProviders\open-conversion` with `Binary`,
 `DisplayName`, `Vendor`, `ProbeOrder` = 200, `Packs` (the pack manifest's absolute path) and
-`Version` written last — see `examples/settings/open-conversion.reg`. POSIX:
+`Version` written last — see `examples/settings/open-conversion.reg`. A hand registration of an
+unsigned build also needs the DLL's SHA-256 as a value name under
+`HKLM\Software\DisplayXR\Trust\Allowlist` (the runtime's `scripts\register_dev_plugin.bat conv
+<dll>` writes both), or the runtime logs `provenance UNVERIFIED` and skips it. POSIX:
 `200-open-conversion-conversion-provider.json` in a plug-in root — see `examples/manifest/`.
 The provider is satellite-hosted by default (one `displayxr-conversion-host` process); updates
 follow the runtime's installer contract (discovery spec §3.8: own
