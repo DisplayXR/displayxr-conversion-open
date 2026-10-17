@@ -175,7 +175,7 @@
         {
           "id": "fp16",
           "backend": "onnxruntime",
-          "ep": ["dml", "coreml", "cpu"],
+          "ep": ["dml", "cpu"],
           "precision": "fp16",
           "os": ["windows>=10.0.19041", "linux", "macos"],
           "files": [

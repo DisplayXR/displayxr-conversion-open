@@ -612,12 +612,15 @@ oc_probe(struct xrt_conversion_plugin_instance **out_inst)
 	    (strcmp(buf, "cpu") == 0 || strcmp(buf, "dml") == 0 || strcmp(buf, "coreml") == 0)) {
 		oc_copy_str(p->ep_setting, sizeof(p->ep_setting), buf);
 	}
-	p->coreml_units = OC_COREML_ALL;
+	// CPU + GPU by default: the measured configuration. "all" / "ane" let Core ML
+	// use the Neural Engine, whose first-use compile runs in a system service
+	// that a warm cannot cancel, and which computes in fp16.
+	p->coreml_units = OC_COREML_GPU;
 	if (setting("COREML_UNITS", buf, sizeof(buf))) {
-		p->coreml_units = strcmp(buf, "gpu") == 0   ? OC_COREML_GPU
+		p->coreml_units = strcmp(buf, "all") == 0   ? OC_COREML_ALL
 		                  : strcmp(buf, "ane") == 0 ? OC_COREML_ANE
 		                  : strcmp(buf, "cpu") == 0 ? OC_COREML_CPU
-		                                            : OC_COREML_ALL;
+		                                            : OC_COREML_GPU;
 	}
 	// Core ML compiles the model on the first session; the compiled model is kept
 	// in the host's per-provider scratch directory (never the model store), keyed
