@@ -158,7 +158,7 @@ struct oc_provider
 	char ort_detail[128];
 	int dml_device;
 	uint64_t dml_luid;
-	bool coreml_cache_ready; //!< the cache directory exists (created on first use)
+	bool coreml_cache_ready; //!< the cache directory exists and was swept (first use)
 
 	/* [S]-only scratch, grown on demand. */
 	float *chw;
@@ -913,8 +913,107 @@ coreml_cache_dir(struct oc_provider *p, char *buf, size_t size)
 			p->coreml_cache[0] = '\0';
 			return NULL;
 		}
+		// Temp dirs of processes that died mid-compile.
+		oc_sweep_stale(buf, ".tmp-");
 	}
 	return buf;
+}
+
+/*!
+ * The Core ML cache as a transaction (the scratch-dir rule: write to a temp
+ * name, rename when complete). A model's cache is <base>/<blob file name>,
+ * usable only once it holds the ".complete" stamp. A cold warm compiles into
+ * <base>/.tmp-<blob>-<pid>; after the warm-up inference succeeds the stamp is
+ * written and the directory renamed into place. A process killed mid-compile
+ * leaves only a temp dir (swept later), never a half-written cache, and a
+ * stamped cache that fails to load is dropped and compiled afresh rather than
+ * moving the capability to the CPU.
+ */
+struct coreml_cache_txn
+{
+	char final_dir[1400];
+	char tmp_dir[1400];
+	bool fresh;    //!< the session compiled into tmp_dir
+	bool used_hit; //!< the session loaded the stamped final_dir
+};
+
+static void
+cache_stamp_path(const char *dir, char *buf, size_t size)
+{
+	snprintf(buf, size, "%s%c.complete", dir, OC_PATH_SEP);
+}
+
+/*! Create the cap's session; on Core ML through the cache transaction. */
+static enum oc_run_status
+create_session(
+    struct oc_provider *p, struct oc_cap *c, const char *path, struct coreml_cache_txn *txn, char *err, size_t err_size)
+{
+	memset(txn, 0, sizeof(*txn));
+	struct oc_ep_config epc = {
+	    .dml_device = p->dml_device,
+	    .coreml_units = p->coreml_units,
+	    .coreml_cache_dir = NULL,
+	};
+	char base[1200];
+	const char *b = c->ep == OC_EP_COREML ? coreml_cache_dir(p, base, sizeof(base)) : NULL;
+	if (b == NULL) {
+		return oc_session_create(p->ort, path, c->ep, &epc, p->threads, p->opt, &c->session, err, err_size);
+	}
+	const char *leaf = strrchr(path, OC_PATH_SEP);
+	leaf = leaf != NULL ? leaf + 1 : path; // the store's blob file name (its sha256)
+	snprintf(txn->final_dir, sizeof(txn->final_dir), "%s%c%.80s", b, OC_PATH_SEP, leaf);
+	char stamp[1500];
+	cache_stamp_path(txn->final_dir, stamp, sizeof(stamp));
+	if (oc_file_exists(stamp)) {
+		epc.coreml_cache_dir = txn->final_dir;
+		const enum oc_run_status r =
+		    oc_session_create(p->ort, path, c->ep, &epc, p->threads, p->opt, &c->session, err, err_size);
+		if (r == OC_RUN_OK) {
+			txn->used_hit = true;
+			return r;
+		}
+		fprintf(stderr, "[open-conversion] %s: the Core ML cache did not load (%s); compiling afresh\n",
+		        c->task_name, err);
+	}
+	// No complete cache: drop whatever is there and compile into a temp dir.
+	(void)oc_remove_tree(txn->final_dir);
+	snprintf(txn->tmp_dir, sizeof(txn->tmp_dir), "%s%c.tmp-%.80s-%llu", b, OC_PATH_SEP, leaf,
+	         (unsigned long long)oc_process_id());
+	(void)oc_remove_tree(txn->tmp_dir);
+	if (!oc_make_dir(txn->tmp_dir)) {
+		txn->tmp_dir[0] = '\0';
+		return oc_session_create(p->ort, path, c->ep, &epc, p->threads, p->opt, &c->session, err, err_size);
+	}
+	epc.coreml_cache_dir = txn->tmp_dir;
+	const enum oc_run_status r =
+	    oc_session_create(p->ort, path, c->ep, &epc, p->threads, p->opt, &c->session, err, err_size);
+	if (r == OC_RUN_OK) {
+		txn->fresh = true;
+	} else {
+		(void)oc_remove_tree(txn->tmp_dir);
+	}
+	return r;
+}
+
+/*! After the warm: publish a fresh cache on success, drop a bad one on failure. */
+static void
+finish_cache(struct coreml_cache_txn *txn, bool ok)
+{
+	if (ok && txn->fresh) {
+		char stamp[1500];
+		cache_stamp_path(txn->tmp_dir, stamp, sizeof(stamp));
+		// The live session keeps its open files across the rename (same inode).
+		if (!oc_touch(stamp) || !oc_rename(txn->tmp_dir, txn->final_dir)) {
+			// Another process published first, or the scratch dir refused:
+			// the sweep removes this temp dir once this process is gone.
+			fprintf(stderr, "[open-conversion] Core ML cache not published (%s)\n", txn->final_dir);
+		}
+	} else if (!ok && txn->fresh) {
+		(void)oc_remove_tree(txn->tmp_dir);
+	} else if (!ok && txn->used_hit) {
+		(void)oc_remove_tree(txn->final_dir); // the next warm compiles afresh
+	}
+	txn->fresh = txn->used_hit = false;
 }
 
 static xrt_result_t
@@ -1011,14 +1110,9 @@ resolve:
 	// 2. Load. The blob path is the host's verified copy.
 	snprintf(why, sizeof(why), "%s: loading (%s)", m->name, c->backend);
 	set_state(p, c, XRT_CONV_STATE_WARMING, XRT_CONV_FAIL_NONE, 0, 0.1f, why);
-	char cache[1200];
-	const struct oc_ep_config epc = {
-	    .dml_device = p->dml_device,
-	    .coreml_units = p->coreml_units,
-	    .coreml_cache_dir = c->ep == OC_EP_COREML ? coreml_cache_dir(p, cache, sizeof(cache)) : NULL,
-	};
+	struct coreml_cache_txn txn;
 	const uint64_t load_t0 = oc_now_ms();
-	r = oc_session_create(p->ort, loc.path, c->ep, &epc, p->threads, p->opt, &c->session, err, sizeof(err));
+	r = create_session(p, c, loc.path, &txn, err, sizeof(err));
 	const uint64_t load_ms = oc_now_ms() - load_t0;
 	uint32_t taken = 0, total = 0, parts = 0;
 	const bool reported = r == OC_RUN_OK && oc_session_ep_nodes(c->session, &taken, &total, &parts);
@@ -1037,6 +1131,7 @@ resolve:
 	}
 	if (r == OC_RUN_OK && is_cancelled(cancel_ctx)) {
 		release_session(p, c);
+		finish_cache(&txn, false);
 		snprintf(why, sizeof(why), "%s: warm cancelled", m->name);
 		set_state(p, c, XRT_CONV_STATE_INSTALLED, XRT_CONV_FAIL_NONE, 0, -1.0f, why);
 		return XRT_TIMEOUT;
@@ -1046,6 +1141,10 @@ resolve:
 		set_state(p, c, XRT_CONV_STATE_WARMING, XRT_CONV_FAIL_NONE, 0, 0.6f, why);
 		r = warm_up_inference(p, c, err, sizeof(err));
 	}
+	if (r != OC_RUN_OK) {
+		release_session(p, c); // before the cache dir it may have mapped is removed
+	}
+	finish_cache(&txn, r == OC_RUN_OK);
 	if (r != OC_RUN_OK && r != OC_RUN_OUT_OF_MEMORY && c->ep != OC_EP_CPU) {
 		// DirectML / Core ML could not start (driver, feature level, an operator,
 		// a Core ML compile failure): the CPU execution provider serves the same model.

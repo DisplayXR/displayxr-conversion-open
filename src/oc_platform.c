@@ -16,9 +16,14 @@
 #include <string.h>
 
 #ifndef _WIN32
+#include <dirent.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <ftw.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 #endif
 
 void
@@ -118,8 +123,61 @@ oc_make_dir(const char *path)
 		return false;
 	}
 	(void)CreateDirectoryW(w, NULL);
+	return oc_dir_exists(path);
+}
+
+bool
+oc_dir_exists(const char *path)
+{
+	wchar_t w[MAX_PATH * 2];
+	if (path == NULL || !to_wide(path, w, (int)(sizeof(w) / sizeof(w[0])))) {
+		return false;
+	}
 	const DWORD a = GetFileAttributesW(w);
 	return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+bool
+oc_remove_tree(const char *path)
+{
+	(void)path;
+	return false;
+}
+
+bool
+oc_rename(const char *from, const char *to)
+{
+	wchar_t wf[MAX_PATH * 2], wt[MAX_PATH * 2];
+	return from != NULL && to != NULL && to_wide(from, wf, (int)(sizeof(wf) / sizeof(wf[0]))) &&
+	       to_wide(to, wt, (int)(sizeof(wt) / sizeof(wt[0]))) && MoveFileExW(wf, wt, 0) != 0;
+}
+
+bool
+oc_touch(const char *path)
+{
+	wchar_t w[MAX_PATH * 2];
+	if (path == NULL || !to_wide(path, w, (int)(sizeof(w) / sizeof(w[0])))) {
+		return false;
+	}
+	HANDLE h = CreateFileW(w, GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (h == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+	CloseHandle(h);
+	return true;
+}
+
+uint64_t
+oc_process_id(void)
+{
+	return (uint64_t)GetCurrentProcessId();
+}
+
+void
+oc_sweep_stale(const char *dir, const char *prefix)
+{
+	(void)dir;
+	(void)prefix;
 }
 
 void *
@@ -220,8 +278,87 @@ oc_make_dir(const char *path)
 		return false;
 	}
 	(void)mkdir(path, 0700);
+	return oc_dir_exists(path);
+}
+
+bool
+oc_dir_exists(const char *path)
+{
 	struct stat st;
-	return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+	return path != NULL && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static int
+remove_entry(const char *path, const struct stat *st, int flag, struct FTW *ftw)
+{
+	(void)st;
+	(void)flag;
+	(void)ftw;
+	return remove(path) == 0 ? 0 : -1;
+}
+
+bool
+oc_remove_tree(const char *path)
+{
+	struct stat st;
+	if (path == NULL || lstat(path, &st) != 0) {
+		return path != NULL; // already gone
+	}
+	if (!S_ISDIR(st.st_mode)) {
+		return remove(path) == 0;
+	}
+	return nftw(path, remove_entry, 16, FTW_DEPTH | FTW_PHYS) == 0;
+}
+
+bool
+oc_rename(const char *from, const char *to)
+{
+	return from != NULL && to != NULL && rename(from, to) == 0;
+}
+
+bool
+oc_touch(const char *path)
+{
+	FILE *f = path != NULL ? fopen(path, "ab") : NULL;
+	if (f == NULL) {
+		return false;
+	}
+	return fclose(f) == 0;
+}
+
+uint64_t
+oc_process_id(void)
+{
+	return (uint64_t)getpid();
+}
+
+void
+oc_sweep_stale(const char *dir, const char *prefix)
+{
+	DIR *d = dir != NULL ? opendir(dir) : NULL;
+	if (d == NULL) {
+		return;
+	}
+	const size_t plen = strlen(prefix);
+	struct dirent *e;
+	while ((e = readdir(d)) != NULL) {
+		if (strncmp(e->d_name, prefix, plen) != 0) {
+			continue;
+		}
+		const char *dash = strrchr(e->d_name, '-');
+		char *end = NULL;
+		const long pid = dash != NULL ? strtol(dash + 1, &end, 10) : 0;
+		if (pid <= 0 || end == NULL || *end != '\0' || (pid_t)pid == getpid()) {
+			continue;
+		}
+		if (kill((pid_t)pid, 0) == 0 || errno != ESRCH) {
+			continue; // alive (or not ours to judge)
+		}
+		char path[2048];
+		snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+		(void)oc_remove_tree(path);
+	}
+	closedir(d);
 }
 
 void *
