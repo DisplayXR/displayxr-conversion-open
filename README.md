@@ -117,7 +117,7 @@ cache works unchanged: Core ML reads and writes CPU memory, so the cache is boun
 Which execution providers a blob is acceptable on is the pack's call (`variants[].ep`): the
 default pack lists `coreml` for the two video-depth models only. Measured on a developer M1 Pro
 (16 GB, macOS 26.3), `--bench 100` after four checked frames, latency of one `stream_convert`
-(min / median), **on a shared machine under heavy unrelated load** (load average 25 to 50): treat
+(min / median), **on a shared machine under heavy unrelated load**: treat
 the minimum as the better estimate of a quiet machine, and the ratios rather than the absolutes
 (the experiment column ran at load 15 to 30).
 
