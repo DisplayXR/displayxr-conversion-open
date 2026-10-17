@@ -28,8 +28,11 @@ provider per task, owns every thread, queue and policy, and calls this one for p
 - **Inference:** ONNX Runtime 1.24.4, loaded at run time by absolute path from the provider's
   own directory. On Windows the DirectML execution provider runs on the adapter
   `host->get_adapter_hint` names (the first hardware adapter otherwise); when DirectML cannot
-  start, the capability moves to the CPU execution provider and re-describes itself. Linux and
-  macOS use the CPU execution provider.
+  start, the capability moves to the CPU execution provider and re-describes itself. On macOS
+  the Core ML execution provider (part of the official osx-arm64 ONNX Runtime build) runs the
+  video-depth model on the GPU, with the same fallback; the still-depth model stays on the CPU
+  execution provider there (see [macOS: Core ML](#macos-core-ml)). Linux uses the CPU
+  execution provider.
 - **Transport:** every capability imports `XRT_CONV_MEM_CPU` (RGBA8 / BGRA8, UNORM or SRGB) and
   writes a CPU R32F target; the runtime copies GPU images for it. The temporal cache stays on
   the inference device between frames.
@@ -74,7 +77,9 @@ never pre-fetch one); `--verify-store DIR` checks a model store against it.
 `commercial` = the AND over the model, every dependency, the pack's flag and the inference
 runtime. A commercial-clean model on the CPU execution provider is `PERMISSIVE` (ONNX Runtime is
 MIT); on DirectML it is `COMMERCIAL`, because DirectML ships under Microsoft's redistributable
-licence (commercial use allowed, not an open licence). Anything else is `RESEARCH_ONLY`
+licence (commercial use allowed, not an open licence). On the Core ML execution provider it stays
+`PERMISSIVE`: the execution provider is part of ONNX Runtime (MIT) and drives the operating
+system's own Core ML framework, which nothing redistributes. Anything else is `RESEARCH_ONLY`
 (`commercial_ok = 0`) and is selected only after the user opts in with `AllowResearchOnly`.
 
 ## Build
@@ -96,6 +101,59 @@ the files that ship together, flat in one folder. The provider exports exactly o
 `dxgi` (Windows). `-DOPENCONV_WERROR=ON` turns warnings into errors, as CI does.
 `-DOPENCONV_DOWNLOAD_DIR=<dir>` keeps the fetched archives across build trees.
 
+### macOS: Core ML
+
+The pinned `onnxruntime-osx-arm64-1.24.4.tgz` already carries the Core ML execution provider, so
+macOS needs no other archive. The provider creates it with the ML Program format, compute units
+from `COREML_UNITS` (default CPU + GPU), low-precision GPU accumulation allowed, and keeps the
+compiled model under the host's scratch directory (`get_path(XRT_CONV_PATH_SCRATCH)`, in
+`coreml-ort-<version>/`) when the host provides one. Core ML partitions the graph: what it cannot
+take runs on the CPU execution provider inside the same session. A session that fails to start,
+or of which Core ML takes no node, moves the capability to the CPU execution provider and
+re-describes it; a Core ML run that fails drops the session, moves the capability to the CPU and
+reports `FAILED(DEVICE_LOST, retryable)`, so the runtime re-warms it on the CPU. The temporal
+cache works unchanged: Core ML reads and writes CPU memory, so the cache is bound there.
+
+Which execution providers a blob is acceptable on is the pack's call (`variants[].ep`): the
+default pack lists `coreml` for the two video-depth models only. Measured on a developer M1 Pro
+(16 GB, macOS 26.3), `--bench 100` after four checked frames, latency of one `stream_convert`
+(min / median), **on a shared machine under heavy unrelated load** (load average 25 to 50): treat
+the minimum as the better estimate of a quiet machine, and the ratios rather than the absolutes
+(the experiment column ran at load 15 to 30).
+
+| Model | CPU EP (4 threads) | Core ML EP (CPU + GPU) | Core ML, attention `Gather` rewritten (experiment) |
+|---|---|---|---|
+| `vda-small-stream-518x294` | 384 / 760 ms | 141 / 266 ms | 79 / 95 ms (10.5 fps) |
+| `vda-small-stream-364x210` | 178 / 296 ms | 71 / 89 ms | 41 / 46 ms (21.8 fps) |
+| `da2-small` (518 × 294 grid) | 320 / 578 ms | 374 / 431 ms | — |
+
+| Model | CPU EP warm | Core ML warm, cached | Core ML warm, first (compile) | Peak RSS CPU / Core ML |
+|---|---|---|---|---|
+| `vda-small-stream-518x294` | 2.4 s | 10 – 17 s | 86 – 93 s (cache 415 MB) | 2.4 / 2.5 GB |
+| `vda-small-stream-364x210` | 0.5 s | 11 – 12 s | 62 – 67 s | 1.3 / 1.5 GB |
+| `da2-small` | 0.5 s | 5 – 16 s | 11 s | 0.5 / 2.6 GB |
+
+- **Why not the 20 – 40 ms class with the shipped blobs:** Core ML takes 783 of the video model's
+  827 nodes but in 13 partitions. Each ViT block splits q / k / v with a `Gather` on a scalar
+  index, which the Core ML EP rejects ("Gather does not support scalar 'indices'"), so every
+  block returns to the CPU. Rewriting those 37 nodes as `Slice` + `Squeeze` (same maths) gives
+  one partition (869 of 876 nodes) and the third column; shipping that is a new model version and
+  blob, not done here. The rest of a frame is the 160 MB (518 px) temporal cache Core ML copies in
+  and out of CPU memory.
+- **The still-depth model stays on the CPU:** Core ML takes 719 of 836 nodes in 60 partitions
+  (scalar `Gather`, dynamic `Reshape` and `Slice`, bicubic `Resize` are refused), it is no faster
+  than the CPU EP, and it costs five times the memory.
+- **Output difference vs the CPU EP** (four frames each, raw R32F, resampled to the request):
+  video models max |Δ| 1.2e-5 (518 px) and 5.2e-5 (364 px) on a range of about 12, median
+  ≤ 1.2e-6 — the GPU path computes in fp32, so there is no fp16 drift. The fp16 still-depth model
+  on Core ML: max |Δ| 0.064 (0.7 % of range), median 0.0014 (0.015 %).
+- **Not measured:** the Neural Engine (`COREML_UNITS=all` / `ane`). On the measuring machine the
+  system's Neural Engine compiler service was busy with other work for hours and the first
+  session never finished loading; such a load blocks `warm` and cannot be cancelled, which is why
+  the default is CPU + GPU.
+- **Without a scratch directory** every warm is a first warm (ONNX Runtime converts into a
+  temporary directory and deletes it with the session).
+
 ## Tests
 
 `open-conversion-fakehost` loads the provider by absolute path, negotiates against a stub host
@@ -114,7 +172,7 @@ protocol, without network.
 | `download-ready-mono` | `DOWNLOADING` (host progress) → `WARMING` → `READY`, then a CPU-EP stream and job on a synthetic scene | yes |
 | `download-ready-video` | the same for the video model, four frames with a reset mid-stream | yes |
 | `check-model-pack`, `check-model-pack-research` | the pack validator on both packs | no (Python) |
-| `default-ep` (`-DOPENCONV_TEST_GPU=ON`) | both capabilities on the default execution provider (DirectML on Windows) | yes |
+| `default-ep` (`-DOPENCONV_TEST_GPU=ON`) | both capabilities on the default execution provider (DirectML on Windows, Core ML on macOS) | yes |
 
 The synthetic scene is a perspective checkerboard floor under a sky. The checks are statistics,
 not bytes (execution providers differ in the last bits): every texel finite, the reported range
@@ -130,6 +188,10 @@ cmake -S . -B build -DOPENCONV_TEST_MODELS_DIR=$PWD/models-cache
 
 Without them those two tests report *skipped*.
 
+For measurements the fake host takes `--scratch DIR` (served as the host's scratch directory),
+`--bench N` (N more timed frames per stream after the checked ones: min / median / p90 / mean /
+max) and `--dump DIR` (every checked depth map as raw R32F, to diff two execution providers).
+
 ## Settings
 
 Read with `host->get_setting(KEY)`: `DXR_CONV_OPEN_CONVERSION_<KEY>` in the hosting process's
@@ -140,7 +202,10 @@ environment, else `Settings\<KEY>` under the registry row (Windows) or the manif
 |---|---|---|
 | `ENABLE` | `0` | `probe` declines |
 | `QUALITY` | `low`, `medium` (default), `high` | which model `defaults[task]` names (low = the 364-px video model) |
-| `EP` | `auto` (default), `cpu` | `cpu` forces the CPU execution provider |
+| `EP` | `auto` (default), `cpu`, `dml`, `coreml` | `cpu` forces the CPU execution provider; `auto` = DirectML on Windows, Core ML on macOS (each falls back to the CPU) |
+| `COREML_UNITS` | `gpu` (default), `all`, `ane`, `cpu` | macOS: the Core ML compute units (CPU + GPU, + the Neural Engine, CPU + Neural Engine, CPU only) |
+| `COREML_CACHE` | `0` | macOS: no compiled-model cache, even when the host provides a scratch directory |
+| `ORT_LOG` | `warning` (default), `info`, `verbose` | how much of ONNX Runtime's log is printed (`verbose` shows the Core ML node assignment) |
 | `THREADS` | integer (default 4) | CPU intra-op threads; 0 = ONNX Runtime's default (every core) |
 | `GRAPH_OPT` | `basic`, `extended` (default), `all` | ONNX Runtime graph optimisation (`all` fails to load the fp16 still-depth model on the CPU execution provider of 1.24.4) |
 | `PACK` | absolute path | another pack manifest (default: `dxr-open-default.models.json` next to the binary) |

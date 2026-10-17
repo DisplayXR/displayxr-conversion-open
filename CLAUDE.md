@@ -8,8 +8,9 @@ The **DisplayXR open-model conversion provider** (`DisplayXR-OpenConversion`, id
 `open-conversion`, ProbeOrder 200): the conversion provider every DisplayXR box gets without a
 vendor module (ADR-053, runtime roadmap `docs/roadmap/conversion-providers.md` §9 P4). Two
 depth capabilities — `DEPTH_VIDEO` (temporal, a small streaming video-depth model) and
-`DEPTH_MONO` (a small still-depth model) — run through ONNX Runtime (DirectML on Windows, CPU
-everywhere). The runtime composes views from them; this repo never declares `VIEWS_*`.
+`DEPTH_MONO` (a small still-depth model) — run through ONNX Runtime (DirectML on Windows, Core ML
+on macOS for the models whose pack variant lists `coreml`, CPU everywhere). The runtime composes
+views from them; this repo never declares `VIEWS_*`.
 
 **Public repository.** No internal data anywhere (code, comments, commit messages, docs): no
 dataset names or paths, no internal measurements, no vendor-module internals, no product or
@@ -23,7 +24,7 @@ committed. Never commit a model blob.
 
 - `src/open_conversion.c` — negotiate + the vtable: probe (settings, ONNX Runtime, the pack,
   the execution provider), describe, readiness, warm (store resolve / request → session →
-  warm-up inference, DirectML → CPU fallback), the stream lane and the `DEPTH_MONO` job lane.
+  warm-up inference, DirectML / Core ML → CPU fallback), the stream lane and the `DEPTH_MONO` job lane.
 - `src/oc_ort.{c,h}` — ONNX Runtime loaded at run time by absolute path (`OrtGetApiBase` only),
   sessions, the single-image run and the temporal run (IoBinding; the cache stays on device).
 - `src/oc_pack.{c,h}`, `src/oc_json.{c,h}` — the schema-2 pack reader and a strict JSON parser.
