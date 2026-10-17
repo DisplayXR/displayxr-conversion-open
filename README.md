@@ -152,7 +152,8 @@ the minimum as the better estimate of a quiet machine, and the ratios rather tha
   session never finished loading; such a load blocks `warm` and cannot be cancelled, which is why
   the default is CPU + GPU.
 - **Without a scratch directory** every warm is a first warm (ONNX Runtime converts into a
-  temporary directory and deletes it with the session).
+  temporary directory and deletes it with the session). The runtime's hosts do not provide one
+  yet: [displayxr-runtime#2194](https://github.com/DisplayXR/displayxr-runtime/issues/2194).
 - **The cache is a transaction**, per the scratch-directory rule: a cold warm compiles into
   `coreml-ort-<version>/.tmp-<blob>-<pid>/`; once the warm-up inference succeeds a `.complete`
   stamp is written and the directory is renamed to `coreml-ort-<version>/<blob>/`. Only a stamped
