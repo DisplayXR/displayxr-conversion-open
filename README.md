@@ -137,9 +137,9 @@ the minimum as the better estimate of a quiet machine, and the ratios rather tha
   827 nodes but in 13 partitions. Each ViT block splits q / k / v with a `Gather` on a scalar
   index, which the Core ML EP rejects ("Gather does not support scalar 'indices'"), so every
   block returns to the CPU. Rewriting those 37 nodes as `Slice` + `Squeeze` (same maths) gives
-  one partition (869 of 876 nodes) and the third column; shipping that is a new model version and
-  blob, not done here. The rest of a frame is the 160 MB (518 px) temporal cache Core ML copies in
-  and out of CPU memory.
+  one partition (869 of 876 nodes) and the third column — see
+  [the follow-up](#follow-up-core-ml-friendly-video-depth-variants). The rest of a frame is the
+  160 MB (518 px) temporal cache Core ML copies in and out of CPU memory.
 - **The still-depth model stays on the CPU:** Core ML takes 719 of 836 nodes in 60 partitions
   (scalar `Gather`, dynamic `Reshape` and `Slice`, bicubic `Resize` are refused), it is no faster
   than the CPU EP, and it costs five times the memory.
@@ -153,6 +153,46 @@ the minimum as the better estimate of a quiet machine, and the ratios rather tha
   the default is CPU + GPU.
 - **Without a scratch directory** every warm is a first warm (ONNX Runtime converts into a
   temporary directory and deletes it with the session).
+- **The cache is a transaction**, per the scratch-directory rule: a cold warm compiles into
+  `coreml-ort-<version>/.tmp-<blob>-<pid>/`; once the warm-up inference succeeds a `.complete`
+  stamp is written and the directory is renamed to `coreml-ort-<version>/<blob>/`. Only a stamped
+  cache is loaded; one that fails to load is deleted and compiled afresh (the capability stays on
+  Core ML), and temp directories of processes that died mid-compile are swept. Core ML keys its
+  own device compile by path, so the first warm after a publish compiles once more; later warms
+  take the cached time.
+
+#### Follow-up: Core ML-friendly video-depth variants
+
+Prepared, **not published**: `scripts/rewrite_video_depth_coreml.py` rebuilds the two
+video-depth blobs with every scalar-index `Gather` replaced by `Slice` + `Squeeze`. It reads the
+upstream blobs by sha256 from the pack, refuses any other bytes, changes nothing else (weights,
+tensor names, shapes, the temporal cache) and with `--check` proves on the CPU execution provider
+that the outputs are identical (bit-exact on both models, first and continued frame). The output
+is deterministic for one `onnx` version; with onnx 1.19.1:
+
+```
+python3 scripts/fetch_models.py packs/dxr-open-default.models.json models-cache --models vda-small-stream-518x294,vda-small-stream-364x210
+python3 scripts/rewrite_video_depth_coreml.py packs/dxr-open-default.models.json models-cache rewritten --check
+```
+
+| New model | From | Blob sha256 | Size |
+|---|---|---|---|
+| `vda-small-stream-coreml-518x294` 1.0.0 | `vda-small-stream-518x294` | `db51cb27484fcd302eba5ccc901c98a3fa7204b7a5b9979dafe839dd111386e7` | 57 819 066 |
+| `vda-small-stream-coreml-364x210` 1.0.0 | `vda-small-stream-364x210` | `c76b9097897e9efc5021ff5010cc0292a10d0495eef89170a5a16061a7405b3b` | 57 521 756 |
+
+Once the blobs are on the models repository's `blobs` release, the pack gains two entries, each a
+copy of its source model with the new `name`, `version` 1.0.0, `provenance.converted_by` naming
+the rewrite, and one variant `w16` with `ep` `["dml", "coreml", "cpu"]` and the blob above; and
+`defaults.depth-video` points at them (the graph is the same maths, so every execution provider
+can run it). The old entries stay, with `coreml` removed from their `ep`, so an older store keeps
+working. Run `check_model_pack.py --verify-blobs DIR` before merging.
+
+A further step, not prepared: the temporal cache is fp32 (`cache_dtype float32`, 160 MB at
+518 px) and Core ML copies it in and out of CPU memory every frame. An export with an fp16 cache
+halves that copy and the memory. It needs a new export (not a graph rewrite), the pack's
+`cache_dtype` set to `float16`, and the provider's temporal run taught to create and bind
+`FLOAT16` cache tensors (today it assumes `FLOAT`); its drift has to be measured over long
+streams, since the error feeds back frame to frame.
 
 ## Tests
 

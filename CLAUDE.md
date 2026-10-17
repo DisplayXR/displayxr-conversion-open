@@ -35,7 +35,9 @@ committed. Never commit a model blob.
   `CMakeLists.txt`.
 - `packs/dxr-open-default.models.json` — the default pack. `tests/packs/` — test packs.
 - `scripts/check_model_pack.py` — pack validator (also the CI guard that no `prefetch` blob is
-  non-commercial); `scripts/fetch_models.py` — dev / CI blob download with hash check.
+  non-commercial); `scripts/fetch_models.py` — dev / CI blob download with hash check;
+  `scripts/rewrite_video_depth_coreml.py` — rebuilds the video-depth blobs for Core ML (scalar
+  `Gather` → `Slice` + `Squeeze`), from the pack's blobs by sha256 (needs `onnx`).
 - `cmake/OnnxRuntime.cmake` — the pinned archives and their SHA-256.
 - `include/xrt/` — vendored **verbatim** from the runtime (tag in `README.md`). Never edit.
 
