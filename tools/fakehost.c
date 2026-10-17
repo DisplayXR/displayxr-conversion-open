@@ -23,6 +23,9 @@
  *       --expect-licence permissive|commercial|research
  *       --expect-download      the provider must report DOWNLOADING before READY
  *       --warm-timeout-ms N
+ *       --scratch DIR          the per-provider scratch dir (get_path SCRATCH; Core ML model cache)
+ *       --bench N              after the checked frames, time N more frames per stream (latency stats)
+ *       --dump DIR             write every checked depth map as DIR/<task>-f<N>-<w>x<h>.f32 (raw R32F)
  *
  * Exit code: 0 = every check passed, 1 = a check failed, 2 = usage / load
  * error, 77 = skipped (a model blob the test needs is not available).
@@ -48,6 +51,7 @@
 #else
 #include <pthread.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -552,6 +556,10 @@ static int g_setting_count = 0;
 static char g_env_prefix[96] = "";
 static volatile int g_notifications = 0;
 
+static const char *g_scratch = NULL; //!< --scratch
+static uint32_t g_bench = 0;         //!< --bench
+static const char *g_dump = NULL;    //!< --dump
+
 static bool
 host_get_path(uint32_t kind, char *buf, uint32_t buf_size)
 {
@@ -560,6 +568,10 @@ host_get_path(uint32_t kind, char *buf, uint32_t buf_size)
 	}
 	if (kind == XRT_CONV_PATH_MODEL_STORE && g_store.enabled) {
 		snprintf(buf, buf_size, "%s", g_store.root);
+		return true;
+	}
+	if (kind == XRT_CONV_PATH_SCRATCH && g_scratch != NULL) {
+		snprintf(buf, buf_size, "%s", g_scratch);
 		return true;
 	}
 	return false;
@@ -841,6 +853,70 @@ check_depth_map(const char *what, const float *d, uint32_t w, uint32_t h, const 
 
 /*
  *
+ * Timing (--bench) and dumps (--dump).
+ *
+ */
+
+static double
+now_us(void)
+{
+#ifdef _WIN32
+	LARGE_INTEGER f, c;
+	QueryPerformanceFrequency(&f);
+	QueryPerformanceCounter(&c);
+	return (double)c.QuadPart * 1e6 / (double)f.QuadPart;
+#else
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec * 1e6 + (double)ts.tv_nsec / 1e3;
+#endif
+}
+
+static int
+cmp_double(const void *a, const void *b)
+{
+	const double x = *(const double *)a, y = *(const double *)b;
+	return x < y ? -1 : x > y ? 1 : 0;
+}
+
+static void
+report_bench(const char *what, double *ms, uint32_t n)
+{
+	if (n == 0) {
+		return;
+	}
+	double sum = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		sum += ms[i];
+	}
+	qsort(ms, n, sizeof(double), cmp_double);
+	info(
+	    "BENCH %s: %u frames, min %.1f ms, median %.1f ms, p90 %.1f ms, mean %.1f ms, max %.1f ms "
+	    "(%.1f fps at the median)",
+	    what, n, ms[0], ms[n / 2], ms[(n * 9) / 10 < n ? (n * 9) / 10 : n - 1], sum / n, ms[n - 1],
+	    1000.0 / ms[n / 2]);
+}
+
+static void
+dump_map(const char *what, uint32_t f, const float *d, uint32_t w, uint32_t h)
+{
+	if (g_dump == NULL) {
+		return;
+	}
+	char path[1200];
+	snprintf(path, sizeof(path), "%s/%s-f%u-%ux%u.f32", g_dump, what, f, w, h);
+	FILE *fp = fopen_utf8(path, "wb");
+	if (fp == NULL || fwrite(d, sizeof(float), (size_t)w * h, fp) != (size_t)w * h) {
+		info("cannot write %s", path);
+	}
+	if (fp != NULL) {
+		fclose(fp);
+	}
+}
+
+
+/*
+ *
  * Lanes.
  *
  */
@@ -929,9 +1005,53 @@ run_stream(struct xrt_conversion_plugin_iface *iface,
 			char what[64];
 			snprintf(what, sizeof(what), "%s frame %u", task_name(cap->task), f);
 			check_depth_map(what, dst, od.depth_width, od.depth_height, di);
+			dump_map(task_name(cap->task), f, dst, od.depth_width, od.depth_height);
 		}
 		free(src);
 	}
+	// --bench: N more frames on the same stream (a moving scene, no reset),
+	// timed around stream_convert only.
+	double *ms = g_bench > 0 ? (double *)calloc(g_bench, sizeof(double)) : NULL;
+	uint32_t timed = 0;
+	for (uint32_t f = 0; f < g_bench && ms != NULL && dst != NULL; f++) {
+		uint8_t *src = make_scene(W, H, 0.05f * (float)(frames + f));
+		if (src == NULL) {
+			break;
+		}
+		struct xrt_conv_frame_in in;
+		memset(&in, 0, sizeof(in));
+		in.struct_size = (uint32_t)sizeof(in);
+		in.image_count = 1;
+		in.image_role[0] = XRT_CONV_IMG_COLOR;
+		cpu_image(&in.images[0], src, W, H, XRT_CONV_FMT_RGBA8_SRGB, 4, 1);
+		struct xrt_conv_params params;
+		memset(&params, 0, sizeof(params));
+		params.struct_size = (uint32_t)sizeof(params);
+		params.source_time_ns = 1000000ull * (frames + f + 1);
+		params.frame_id = frames + f + 1;
+		params.strength = 1.0f;
+		params.content_hint = si.content_hint;
+		params.input_scale = 1.0f;
+		struct xrt_conv_frame_out out;
+		memset(&out, 0, sizeof(out));
+		out.struct_size = (uint32_t)sizeof(out);
+		cpu_image(&out.depth, dst, od.depth_width, od.depth_height, XRT_CONV_FMT_R32_FLOAT, 4, 2);
+		const double t0 = now_us();
+		r = iface->stream_convert(inst, stream, &in, &params, &out);
+		const double t1 = now_us();
+		free(src);
+		if (r != XRT_SUCCESS) {
+			check(false, "bench frame %u (result %d)", f, (int)r);
+			break;
+		}
+		ms[timed++] = (t1 - t0) / 1000.0;
+	}
+	if (timed > 0) {
+		char what[96];
+		snprintf(what, sizeof(what), "%s '%s' on '%s'", task_name(cap->task), cap->model_id, cap->backend);
+		report_bench(what, ms, timed);
+	}
+	free(ms);
 	free(dst);
 	iface->stream_destroy(inst, stream);
 }
@@ -1038,6 +1158,7 @@ run_job(struct xrt_conversion_plugin_iface *iface,
 		      (unsigned long long)sc.bytes);
 		if (sc.data != NULL && sc.bytes == (uint64_t)bw * bh * 4u) {
 			check_depth_map("depth-mono job", (const float *)sc.data, bw, bh, &out.depth_info);
+			dump_map("depth-mono-job", 0, (const float *)sc.data, bw, bh);
 		}
 	}
 	free(sc.data);
@@ -1060,7 +1181,7 @@ usage(void)
 	    "         [--store DIR] [--clean-store] [--no-download] [--chunk-ms N] [--caps video,mono] [--frames N]\n"
 	    "         [--no-warm] [--expect ready|absent|version|policy]\n"
 	    "         [--expect-licence permissive|commercial|research] [--expect-download]\n"
-	    "         [--warm-timeout-ms N]\n");
+	    "         [--warm-timeout-ms N] [--scratch DIR] [--bench N] [--dump DIR]\n");
 }
 
 static bool
@@ -1135,6 +1256,14 @@ main(int argc, char **argv)
 			expect_download = true;
 		} else if (strcmp(a, "--warm-timeout-ms") == 0 && more) {
 			warm_timeout_ms = (uint32_t)strtoul(argv[++i], NULL, 10);
+		} else if (strcmp(a, "--scratch") == 0 && more) {
+			g_scratch = argv[++i];
+			mkdir_utf8(g_scratch);
+		} else if (strcmp(a, "--bench") == 0 && more) {
+			g_bench = (uint32_t)strtoul(argv[++i], NULL, 10);
+		} else if (strcmp(a, "--dump") == 0 && more) {
+			g_dump = argv[++i];
+			mkdir_utf8(g_dump);
 		} else if (path == NULL && a[0] != '-') {
 			path = a;
 		} else {
