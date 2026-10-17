@@ -110,6 +110,18 @@ oc_file_exists(const char *path)
 	return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
+bool
+oc_make_dir(const char *path)
+{
+	wchar_t w[MAX_PATH * 2];
+	if (path == NULL || !to_wide(path, w, (int)(sizeof(w) / sizeof(w[0])))) {
+		return false;
+	}
+	(void)CreateDirectoryW(w, NULL);
+	const DWORD a = GetFileAttributesW(w);
+	return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
 void *
 oc_lib_open(const char *path, char *err, size_t err_size)
 {
@@ -199,6 +211,17 @@ oc_file_exists(const char *path)
 {
 	struct stat st;
 	return path != NULL && stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+bool
+oc_make_dir(const char *path)
+{
+	if (path == NULL) {
+		return false;
+	}
+	(void)mkdir(path, 0700);
+	struct stat st;
+	return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 void *

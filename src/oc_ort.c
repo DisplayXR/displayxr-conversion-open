@@ -21,6 +21,13 @@
 #include <dml_provider_factory.h>
 #endif
 
+//! What ONNX Runtime said about the last Core ML partitioning (written by the log callback).
+struct oc_ep_report
+{
+	bool valid;
+	uint32_t taken, total, partitions;
+};
+
 struct oc_ort
 {
 	void *lib;
@@ -28,6 +35,10 @@ struct oc_ort
 	OrtEnv *env;
 	char version[32];
 	bool has_dml;
+	bool has_coreml;
+	OrtLoggingLevel print_level;
+	//! Session creation is one [S] call at a time, so one slot suffices.
+	struct oc_ep_report report;
 };
 
 struct oc_session
@@ -37,6 +48,7 @@ struct oc_session
 	OrtMemoryInfo *cpu_mem;
 	OrtMemoryInfo *device_mem; //!< where a temporal cache lives between frames
 	enum oc_ep ep;
+	struct oc_ep_report report;
 };
 
 struct oc_temporal
@@ -65,6 +77,23 @@ oc_ort_api_floor(void)
 	return ORT_API_VERSION;
 }
 
+//! The unsigned number after @p key in @p msg; false when absent.
+static bool
+number_after(const char *msg, const char *key, uint32_t *out)
+{
+	const char *at = strstr(msg, key);
+	if (at == NULL) {
+		return false;
+	}
+	char *end = NULL;
+	const unsigned long v = strtoul(at + strlen(key), &end, 10);
+	if (end == at + strlen(key)) {
+		return false;
+	}
+	*out = (uint32_t)v;
+	return true;
+}
+
 static void ORT_API_CALL
 ort_log(void *param,
         OrtLoggingLevel severity,
@@ -73,12 +102,26 @@ ort_log(void *param,
         const char *code_location,
         const char *message)
 {
-	(void)param;
 	(void)category;
 	(void)logid;
 	(void)code_location;
-	if (severity >= ORT_LOGGING_LEVEL_WARNING) {
-		fprintf(stderr, "[open-conversion] onnxruntime: %s\n", message != NULL ? message : "");
+	struct oc_ort *o = (struct oc_ort *)param;
+	if (message == NULL) {
+		message = "";
+	}
+	// The Core ML EP's partitioning summary (INFO for one partition, WARNING for
+	// several): how much of the graph Core ML took.
+	if (o != NULL && strstr(message, "CoreMLExecutionProvider::GetCapability") != NULL) {
+		struct oc_ep_report r = {0};
+		r.valid = number_after(message, "number of partitions supported by CoreML: ", &r.partitions) &&
+		          number_after(message, "number of nodes in the graph: ", &r.total) &&
+		          number_after(message, "number of nodes supported by CoreML: ", &r.taken);
+		if (r.valid) {
+			o->report = r;
+		}
+	}
+	if (o == NULL || severity >= o->print_level) {
+		fprintf(stderr, "[open-conversion] onnxruntime: %s\n", message);
 	}
 }
 
@@ -140,7 +183,7 @@ classify(const char *msg)
 	} while (0)
 
 enum oc_ort_status
-oc_ort_load(const char *lib_path, struct oc_ort **out, char *detail, size_t detail_size)
+oc_ort_load(const char *lib_path, enum oc_ort_log log, struct oc_ort **out, char *detail, size_t detail_size)
 {
 	*out = NULL;
 	if (!oc_file_exists(lib_path)) {
@@ -175,8 +218,14 @@ oc_ort_load(const char *lib_path, struct oc_ort **out, char *detail, size_t deta
 	o->lib = lib;
 	o->api = api;
 	oc_copy_str(o->version, sizeof(o->version), ver);
-	OrtStatus *st =
-	    api->CreateEnvWithCustomLogger(ort_log, NULL, ORT_LOGGING_LEVEL_WARNING, "open-conversion", &o->env);
+	o->print_level = log == OC_ORT_LOG_VERBOSE ? ORT_LOGGING_LEVEL_VERBOSE
+	                 : log == OC_ORT_LOG_INFO  ? ORT_LOGGING_LEVEL_INFO
+	                                           : ORT_LOGGING_LEVEL_WARNING;
+	// At least INFO, so the Core ML partitioning summary reaches ort_log; only
+	// print_level and above is printed. ONNX Runtime logs nothing per run at INFO.
+	const OrtLoggingLevel env_level =
+	    o->print_level < ORT_LOGGING_LEVEL_INFO ? o->print_level : ORT_LOGGING_LEVEL_INFO;
+	OrtStatus *st = api->CreateEnvWithCustomLogger(ort_log, o, env_level, "open-conversion", &o->env);
 	if (!status_ok(api, st, err, sizeof(err))) {
 		snprintf(detail, detail_size, "ONNX Runtime %s: environment failed: %s", ver, err);
 		free(o);
@@ -189,10 +238,16 @@ oc_ort_load(const char *lib_path, struct oc_ort **out, char *detail, size_t deta
 			if (strcmp(providers[i], "DmlExecutionProvider") == 0) {
 				o->has_dml = true;
 			}
+			if (strcmp(providers[i], "CoreMLExecutionProvider") == 0) {
+				o->has_coreml = true;
+			}
 		}
 		(void)status_ok(api, api->ReleaseAvailableProviders(providers, count), NULL, 0);
 	}
-	snprintf(detail, detail_size, "ONNX Runtime %s%s", ver, o->has_dml ? " (DirectML)" : "");
+	snprintf(detail, detail_size, "ONNX Runtime %s%s", ver,
+	         o->has_dml      ? " (DirectML)"
+	         : o->has_coreml ? " (Core ML)"
+	                         : "");
 	*out = o;
 	return OC_ORT_OK;
 }
@@ -207,6 +262,12 @@ bool
 oc_ort_has_dml(const struct oc_ort *ort)
 {
 	return ort != NULL && ort->has_dml;
+}
+
+bool
+oc_ort_has_coreml(const struct oc_ort *ort)
+{
+	return ort != NULL && ort->has_coreml;
 }
 
 bool
@@ -263,7 +324,7 @@ enum oc_run_status
 oc_session_create(struct oc_ort *ort,
                   const char *path,
                   enum oc_ep ep,
-                  int dml_device,
+                  const struct oc_ep_config *epc,
                   int threads,
                   enum oc_graph_opt opt,
                   struct oc_session **out,
@@ -299,11 +360,36 @@ oc_session_create(struct oc_ort *ort,
 			snprintf(err, err_size, "no DirectML API in this ONNX Runtime");
 			goto fail;
 		}
-		TRY(dml->SessionOptionsAppendExecutionProvider_DML(opts, dml_device));
-		TRY(api->CreateMemoryInfo("DML", OrtDeviceAllocator, dml_device, OrtMemTypeDefault, &s->device_mem));
+		TRY(dml->SessionOptionsAppendExecutionProvider_DML(opts, epc->dml_device));
+		TRY(api->CreateMemoryInfo("DML", OrtDeviceAllocator, epc->dml_device, OrtMemTypeDefault,
+		                          &s->device_mem));
 #else
-		(void)dml_device;
 		snprintf(err, err_size, "DirectML is Windows-only");
+		goto fail;
+#endif
+	}
+	if (ep == OC_EP_COREML) {
+#ifdef __APPLE__
+		// The ML Program format (Core ML 5+: fp16 / fp32 typed ops, the GPU and the
+		// Neural Engine); the NeuralNetwork default is the legacy format. Inputs and
+		// outputs stay in CPU memory: Core ML copies them, so a temporal cache is
+		// bound to CPU memory (device_mem stays NULL).
+		static const char *const units[] = {"ALL", "CPUAndGPU", "CPUAndNeuralEngine", "CPUOnly"};
+		const char *keys[4], *vals[4];
+		size_t n = 0;
+		keys[n] = "ModelFormat";
+		vals[n++] = "MLProgram";
+		keys[n] = "MLComputeUnits";
+		vals[n++] = units[(unsigned)epc->coreml_units < 4u ? (unsigned)epc->coreml_units : 0u];
+		keys[n] = "AllowLowPrecisionAccumulationOnGPU";
+		vals[n++] = "1";
+		if (epc->coreml_cache_dir != NULL && epc->coreml_cache_dir[0] != '\0') {
+			keys[n] = "ModelCacheDirectory";
+			vals[n++] = epc->coreml_cache_dir;
+		}
+		TRY(api->SessionOptionsAppendExecutionProvider(opts, "CoreML", keys, vals, n));
+#else
+		snprintf(err, err_size, "Core ML is macOS-only");
 		goto fail;
 #endif
 	}
@@ -318,7 +404,11 @@ oc_session_create(struct oc_ort *ort,
 		TRY(api->CreateSession(ort->env, wpath, opts, &s->session));
 	}
 #else
+	memset(&ort->report, 0, sizeof(ort->report));
 	TRY(api->CreateSession(ort->env, path, opts, &s->session));
+	if (ep == OC_EP_COREML) {
+		s->report = ort->report;
+	}
 #endif
 	api->ReleaseSessionOptions(opts);
 	*out = s;
@@ -349,6 +439,18 @@ oc_session_destroy(struct oc_session *s)
 		api->ReleaseMemoryInfo(s->device_mem);
 	}
 	free(s);
+}
+
+bool
+oc_session_ep_nodes(const struct oc_session *s, uint32_t *taken, uint32_t *total, uint32_t *partitions)
+{
+	if (s == NULL || !s->report.valid) {
+		return false;
+	}
+	*taken = s->report.taken;
+	*total = s->report.total;
+	*partitions = s->report.partitions;
+	return true;
 }
 
 //! The last two dims of a float tensor; false unless it is [..., h, w] with leading 1s.

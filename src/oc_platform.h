@@ -55,6 +55,11 @@ oc_module_dir(char *buf, size_t buf_size);
 bool
 oc_file_exists(const char *path);
 
+/*! Create the directory @p path (its parent must exist; owner-only on POSIX).
+ *  True when it exists afterwards. */
+bool
+oc_make_dir(const char *path);
+
 /*! Load a shared library by ABSOLUTE path; its own dependencies resolve from
  *  its directory first (Windows: LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, with
  *  backslashes). Never via PATH. */

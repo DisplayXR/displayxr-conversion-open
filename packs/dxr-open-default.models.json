@@ -55,7 +55,7 @@
         {
           "id": "w16",
           "backend": "onnxruntime",
-          "ep": ["dml", "cpu"],
+          "ep": ["dml", "coreml", "cpu"],
           "precision": "fp16-weights",
           "os": ["windows>=10.0.19041", "linux", "macos"],
           "files": [
@@ -118,7 +118,7 @@
         {
           "id": "w16",
           "backend": "onnxruntime",
-          "ep": ["dml", "cpu"],
+          "ep": ["dml", "coreml", "cpu"],
           "precision": "fp16-weights",
           "os": ["windows>=10.0.19041", "linux", "macos"],
           "files": [
@@ -175,7 +175,7 @@
         {
           "id": "fp16",
           "backend": "onnxruntime",
-          "ep": ["dml", "cpu"],
+          "ep": ["dml", "coreml", "cpu"],
           "precision": "fp16",
           "os": ["windows>=10.0.19041", "linux", "macos"],
           "files": [
