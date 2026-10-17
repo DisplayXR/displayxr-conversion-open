@@ -37,7 +37,35 @@ enum oc_ort_status
 enum oc_ep
 {
 	OC_EP_CPU = 0,
-	OC_EP_DML = 1,
+	OC_EP_DML = 1,    //!< Windows
+	OC_EP_COREML = 2, //!< macOS (Apple silicon)
+};
+
+/*! Core ML compute units (MLComputeUnits): where Core ML may place the graph. */
+enum oc_coreml_units
+{
+	OC_COREML_ALL = 0, //!< CPU + GPU + Neural Engine (Core ML decides per segment)
+	OC_COREML_GPU = 1, //!< CPU + GPU
+	OC_COREML_ANE = 2, //!< CPU + Neural Engine
+	OC_COREML_CPU = 3, //!< CPU only (a reference, never faster than the CPU EP)
+};
+
+/*! Execution-provider configuration for oc_session_create. */
+struct oc_ep_config
+{
+	int dml_device;                    //!< DirectML: the DXGI adapter index
+	enum oc_coreml_units coreml_units; //!< Core ML: compute units
+	const char *coreml_cache_dir;      //!< Core ML: compiled-model cache directory; NULL = none
+};
+
+/*! What the provider prints of ONNX Runtime's log (stderr). The environment
+ *  itself always logs at least INFO, so the Core ML partitioning summary is
+ *  captured whatever is printed. */
+enum oc_ort_log
+{
+	OC_ORT_LOG_WARNING = 0, //!< default
+	OC_ORT_LOG_INFO = 1,    //!< + session-level info
+	OC_ORT_LOG_VERBOSE = 2, //!< everything ONNX Runtime says; diagnostics only
 };
 
 /*! Graph optimisation level (ONNX Runtime's basic / extended / all). */
@@ -61,9 +89,10 @@ const char *
 oc_ort_library_name(void);
 
 /*! Load ONNX Runtime from @p lib_path (absolute). @p detail gets a sentence
- *  for a human in every case. */
+ *  for a human in every case. @p log is what is printed (fixed for the
+ *  process: the environment is never re-created). */
 enum oc_ort_status
-oc_ort_load(const char *lib_path, struct oc_ort **out, char *detail, size_t detail_size);
+oc_ort_load(const char *lib_path, enum oc_ort_log log, struct oc_ort **out, char *detail, size_t detail_size);
 
 /*! The runtime's own version string ("1.24.4"). */
 const char *
@@ -77,6 +106,10 @@ oc_ort_api_floor(void);
 bool
 oc_ort_has_dml(const struct oc_ort *ort);
 
+/*! True when this ONNX Runtime build carries the Core ML execution provider. */
+bool
+oc_ort_has_coreml(const struct oc_ort *ort);
+
 /*! Windows: the DXGI adapter index (DirectML device id) for @p preferred_luid
  *  (0 = the first hardware adapter), skipping @p avoid_luid and software
  *  adapters. false = no hardware adapter. Other OSes: always false. */
@@ -84,12 +117,15 @@ bool
 oc_dml_pick_adapter(uint64_t preferred_luid, uint64_t avoid_luid, int *out_index, uint64_t *out_luid);
 
 /*! Create a session for the model file at @p path (UTF-8, absolute; the
- *  verified blob the host resolved). @p threads 0 = ONNX Runtime's default. */
+ *  verified blob the host resolved). @p threads 0 = ONNX Runtime's default.
+ *  Core ML partitions the graph: what it cannot take runs on the CPU EP in
+ *  the same session, so a Core ML session always runs. oc_session_ep_nodes
+ *  says how much of it Core ML took. */
 enum oc_run_status
 oc_session_create(struct oc_ort *ort,
                   const char *path,
                   enum oc_ep ep,
-                  int dml_device,
+                  const struct oc_ep_config *epc,
                   int threads,
                   enum oc_graph_opt opt,
                   struct oc_session **out,
@@ -98,6 +134,12 @@ oc_session_create(struct oc_ort *ort,
 
 void
 oc_session_destroy(struct oc_session *s);
+
+/*! Core ML only: the graph nodes Core ML took, the graph's node count and the
+ *  number of Core ML partitions, as ONNX Runtime reported them while
+ *  partitioning. false when not reported. */
+bool
+oc_session_ep_nodes(const struct oc_session *s, uint32_t *taken, uint32_t *total, uint32_t *partitions);
 
 /*! One image → one map. @p chw is [1,3,h,w] float; @p out receives the first
  *  output's out_w × out_h floats (the caller checked the model's output

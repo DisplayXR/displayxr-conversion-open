@@ -13,8 +13,9 @@
  *
  * Inference runs through ONNX Runtime, loaded at run time from the provider's
  * own directory: the DirectML execution provider on Windows when a hardware
- * adapter is there, the CPU execution provider everywhere else (and as the
- * fallback when DirectML cannot start). Both models report affine disparity
+ * adapter is there, the Core ML execution provider on macOS, the CPU
+ * execution provider everywhere else (and as the fallback when DirectML or
+ * Core ML cannot start or a Core ML run fails). Both models report affine disparity
  * (larger = nearer, unknown scale and shift), never an invented metric depth.
  *
  * Models come from the provider's model pack (schema 2,
@@ -145,6 +146,9 @@ struct oc_provider
 	char ep_setting[16];
 	int threads;
 	enum oc_graph_opt opt;
+	enum oc_ort_log ort_log;
+	enum oc_coreml_units coreml_units;
+	char coreml_cache[1100]; //!< under the host's scratch dir; empty = no compiled-model cache
 
 	/* Dependencies. */
 	struct oc_pack *pack; //!< NULL: missing / invalid
@@ -154,6 +158,7 @@ struct oc_provider
 	char ort_detail[128];
 	int dml_device;
 	uint64_t dml_luid;
+	bool coreml_cache_ready; //!< the cache directory exists (created on first use)
 
 	/* [S]-only scratch, grown on demand. */
 	float *chw;
@@ -202,6 +207,16 @@ notify(uint32_t cap_id)
 	if (HOST_HAS(notify_changed)) {
 		g_host->notify_changed(cap_id);
 	}
+}
+
+static bool
+host_path(uint32_t kind, char *buf, uint32_t size)
+{
+	if (!HOST_HAS(get_path)) {
+		return false;
+	}
+	buf[0] = '\0';
+	return g_host->get_path(kind, buf, size) && buf[0] != '\0';
 }
 
 static bool
@@ -355,6 +370,18 @@ inference_grid(const struct oc_pack_model *m, uint32_t w, uint32_t h, uint32_t *
 	oc_fit_long_edge(w, h, output_long_edge(m), m->multiple_of, false, gw, gh);
 }
 
+static const char *
+ep_pack_name(enum oc_ep ep)
+{
+	return ep == OC_EP_DML ? "dml" : ep == OC_EP_COREML ? "coreml" : "cpu";
+}
+
+static const char *
+ep_display_name(enum oc_ep ep)
+{
+	return ep == OC_EP_DML ? "DirectML" : ep == OC_EP_COREML ? "Core ML" : "CPU";
+}
+
 /*! Describe-time fields for a cap on an EP, from its pack model. Caller holds `lock` or is in probe. */
 static void
 bind_cap_locked(struct oc_provider *p, struct oc_cap *c, enum oc_ep ep)
@@ -366,14 +393,19 @@ bind_cap_locked(struct oc_provider *p, struct oc_cap *c, enum oc_ep ep)
 	    p->pack != NULL ? oc_pack_default_model(p->pack, c->task_name, p->quality) : NULL;
 	const struct oc_pack_variant *v = NULL;
 	if (m != NULL) {
-		v = oc_pack_variant_for_ep(m, ep == OC_EP_DML ? "dml" : "cpu");
-		if (v == NULL && ep == OC_EP_DML) {
-			ep = OC_EP_CPU; // no DirectML variant: this cap runs on the CPU
+		v = oc_pack_variant_for_ep(m, ep_pack_name(ep));
+		if (v == NULL && ep != OC_EP_CPU) {
+			// No variant for the accelerator (the pack decides, per model, which
+			// execution providers a blob is acceptable on): this cap runs on the CPU.
+			ep = OC_EP_CPU;
 			v = oc_pack_variant_for_ep(m, "cpu");
 		}
 	}
 	c->ep = ep;
-	oc_copy_str(c->backend, sizeof(c->backend), ep == OC_EP_DML ? "onnxruntime-dml" : "onnxruntime-cpu");
+	oc_copy_str(c->backend, sizeof(c->backend),
+	            ep == OC_EP_DML      ? "onnxruntime-dml"
+	            : ep == OC_EP_COREML ? "onnxruntime-coreml"
+	                                 : "onnxruntime-cpu");
 	c->device_luid = ep == OC_EP_DML ? p->dml_luid : 0;
 	if (m == NULL || v == NULL) {
 		c->licence_class = XRT_CONV_LICENCE_UNKNOWN;
@@ -391,6 +423,9 @@ bind_cap_locked(struct oc_provider *p, struct oc_cap *c, enum oc_ep ep)
 	// the inference runtime (ONNX Runtime: MIT). DirectML ships under Microsoft's
 	// redistributable licence: commercial use is allowed, but it is not an open
 	// licence, so a DirectML-backed capability is COMMERCIAL, a CPU one PERMISSIVE.
+	// The Core ML execution provider is part of ONNX Runtime (MIT) and drives the
+	// operating system's own Core ML framework, which nothing redistributes: a
+	// Core ML-backed capability stays PERMISSIVE.
 	const bool commercial = p->pack->commercial && m->commercial;
 	c->commercial_ok = commercial ? 1u : 0u;
 	c->licence_class = !commercial       ? XRT_CONV_LICENCE_RESEARCH_ONLY
@@ -475,7 +510,7 @@ load_runtime(struct oc_provider *p)
 	}
 	struct oc_ort *ort = NULL;
 	char detail[128];
-	const enum oc_ort_status s = oc_ort_load(p->ort_path, &ort, detail, sizeof(detail));
+	const enum oc_ort_status s = oc_ort_load(p->ort_path, p->ort_log, &ort, detail, sizeof(detail));
 	oc_lock(&p->lock);
 	p->ort_status = s;
 	oc_copy_str(p->ort_detail, sizeof(p->ort_detail), detail);
@@ -486,7 +521,13 @@ load_runtime(struct oc_provider *p)
 static enum oc_ep
 choose_ep(struct oc_provider *p)
 {
-	if (strcmp(p->ep_setting, "cpu") == 0 || !oc_ort_has_dml(p->ort)) {
+	if (strcmp(p->ep_setting, "cpu") == 0) {
+		return OC_EP_CPU;
+	}
+	if (oc_ort_has_coreml(p->ort) && strcmp(p->ep_setting, "dml") != 0) {
+		return OC_EP_COREML; // macOS: the Core ML EP is in the official osx-arm64 build
+	}
+	if (!oc_ort_has_dml(p->ort) || strcmp(p->ep_setting, "coreml") == 0) {
 		return OC_EP_CPU;
 	}
 	struct xrt_conv_adapter_hint hint;
@@ -567,8 +608,30 @@ oc_probe(struct xrt_conversion_plugin_instance **out_inst)
 		oc_copy_str(p->quality, sizeof(p->quality), buf);
 	}
 	oc_copy_str(p->ep_setting, sizeof(p->ep_setting), "auto");
-	if (setting("EP", buf, sizeof(buf)) && (strcmp(buf, "cpu") == 0 || strcmp(buf, "dml") == 0)) {
+	if (setting("EP", buf, sizeof(buf)) &&
+	    (strcmp(buf, "cpu") == 0 || strcmp(buf, "dml") == 0 || strcmp(buf, "coreml") == 0)) {
 		oc_copy_str(p->ep_setting, sizeof(p->ep_setting), buf);
+	}
+	p->coreml_units = OC_COREML_ALL;
+	if (setting("COREML_UNITS", buf, sizeof(buf))) {
+		p->coreml_units = strcmp(buf, "gpu") == 0   ? OC_COREML_GPU
+		                  : strcmp(buf, "ane") == 0 ? OC_COREML_ANE
+		                  : strcmp(buf, "cpu") == 0 ? OC_COREML_CPU
+		                                            : OC_COREML_ALL;
+	}
+	// Core ML compiles the model on the first session; the compiled model is kept
+	// in the host's per-provider scratch directory (never the model store), keyed
+	// by the ONNX Runtime version below it. No scratch directory = no cache.
+	p->coreml_cache[0] = '\0';
+	if (!(setting("COREML_CACHE", buf, sizeof(buf)) && strtoul(buf, NULL, 10) == 0) &&
+	    host_path(XRT_CONV_PATH_SCRATCH, buf, sizeof(buf))) {
+		oc_copy_str(p->coreml_cache, sizeof(p->coreml_cache), buf);
+	}
+	p->ort_log = OC_ORT_LOG_WARNING;
+	if (setting("ORT_LOG", buf, sizeof(buf))) {
+		p->ort_log = strcmp(buf, "verbose") == 0 ? OC_ORT_LOG_VERBOSE
+		             : strcmp(buf, "info") == 0  ? OC_ORT_LOG_INFO
+		                                         : OC_ORT_LOG_WARNING;
 	}
 	p->threads = 4; // a background service: never take every core
 	if (setting("THREADS", buf, sizeof(buf))) {
@@ -811,16 +874,44 @@ release_session(struct oc_provider *p, struct oc_cap *c)
 	}
 }
 
-/*! Move a cap to the CPU execution provider after DirectML could not start. */
+/*! Move a cap to the CPU execution provider after DirectML / Core ML could not
+ *  start or a Core ML run failed. Sticky for the process: later warms stay on
+ *  the CPU. */
 static void
 fall_back_to_cpu(struct oc_provider *p, struct oc_cap *c, const char *why)
 {
+	const enum oc_ep from = c->ep;
 	oc_lock(&p->lock);
 	bind_cap_locked(p, c, OC_EP_CPU);
 	p->generation++; // backend, device and licence class changed: re-describe
 	oc_unlock(&p->lock);
-	fprintf(stderr, "[open-conversion] %s: DirectML unavailable (%s); using the CPU\n", c->task_name, why);
+	fprintf(stderr, "[open-conversion] %s: %s unavailable (%s); using the CPU\n", c->task_name,
+	        ep_display_name(from), why);
 	notify(0);
+}
+
+/*! The Core ML compiled-model cache directory for this ONNX Runtime, created
+ *  on first use under the host's scratch directory; NULL = no cache. */
+static const char *
+coreml_cache_dir(struct oc_provider *p, char *buf, size_t size)
+{
+	if (p->coreml_cache[0] == '\0') {
+		return NULL;
+	}
+	// Keyed by the ONNX Runtime version: the Core ML EP does not detect a cache
+	// written by another version. Blob paths are content-addressed (sha256), so
+	// a changed model is a new cache key on its own.
+	snprintf(buf, size, "%s%ccoreml-ort-%s", p->coreml_cache, OC_PATH_SEP, oc_ort_version(p->ort));
+	if (!p->coreml_cache_ready) {
+		p->coreml_cache_ready = oc_make_dir(buf);
+		if (!p->coreml_cache_ready) {
+			fprintf(stderr, "[open-conversion] cannot create the Core ML cache %s; compiling every warm\n",
+			        buf);
+			p->coreml_cache[0] = '\0';
+			return NULL;
+		}
+	}
+	return buf;
 }
 
 static xrt_result_t
@@ -917,8 +1008,30 @@ resolve:
 	// 2. Load. The blob path is the host's verified copy.
 	snprintf(why, sizeof(why), "%s: loading (%s)", m->name, c->backend);
 	set_state(p, c, XRT_CONV_STATE_WARMING, XRT_CONV_FAIL_NONE, 0, 0.1f, why);
-	r = oc_session_create(p->ort, loc.path, c->ep, p->dml_device, p->threads, p->opt, &c->session, err,
-	                      sizeof(err));
+	char cache[1200];
+	const struct oc_ep_config epc = {
+	    .dml_device = p->dml_device,
+	    .coreml_units = p->coreml_units,
+	    .coreml_cache_dir = c->ep == OC_EP_COREML ? coreml_cache_dir(p, cache, sizeof(cache)) : NULL,
+	};
+	const uint64_t load_t0 = oc_now_ms();
+	r = oc_session_create(p->ort, loc.path, c->ep, &epc, p->threads, p->opt, &c->session, err, sizeof(err));
+	const uint64_t load_ms = oc_now_ms() - load_t0;
+	uint32_t taken = 0, total = 0, parts = 0;
+	const bool reported = r == OC_RUN_OK && oc_session_ep_nodes(c->session, &taken, &total, &parts);
+	if (r == OC_RUN_OK && c->ep == OC_EP_COREML) {
+		if (reported) {
+			fprintf(stderr,
+			        "[open-conversion] %s: Core ML takes %u of %u nodes in %u partition(s); load %llu ms\n",
+			        m->name, taken, total, parts, (unsigned long long)load_ms);
+		}
+		if (reported && taken == 0) {
+			// Nothing ran on Core ML: the session is a CPU session in disguise.
+			// Say so honestly (backend, licence) by moving to the CPU EP.
+			snprintf(err, sizeof(err), "Core ML supports none of the model's operators");
+			r = OC_RUN_FAILED;
+		}
+	}
 	if (r == OC_RUN_OK && is_cancelled(cancel_ctx)) {
 		release_session(p, c);
 		snprintf(why, sizeof(why), "%s: warm cancelled", m->name);
@@ -930,9 +1043,9 @@ resolve:
 		set_state(p, c, XRT_CONV_STATE_WARMING, XRT_CONV_FAIL_NONE, 0, 0.6f, why);
 		r = warm_up_inference(p, c, err, sizeof(err));
 	}
-	if (r != OC_RUN_OK && r != OC_RUN_OUT_OF_MEMORY && c->ep == OC_EP_DML) {
-		// DirectML could not start (driver, feature level, an operator): the
-		// CPU execution provider serves the same model.
+	if (r != OC_RUN_OK && r != OC_RUN_OUT_OF_MEMORY && c->ep != OC_EP_CPU) {
+		// DirectML / Core ML could not start (driver, feature level, an operator,
+		// a Core ML compile failure): the CPU execution provider serves the same model.
 		release_session(p, c);
 		fall_back_to_cpu(p, c, err);
 		m = c->model;
@@ -959,7 +1072,11 @@ resolve:
 	// 24 + 1 + 8 + 5 + 9 + NUL fits version[48].
 	snprintf(c->version, sizeof(c->version), "%.24s@%.8s ort %.9s", m->name, m->version, oc_ort_version(p->ort));
 	oc_unlock(&p->lock);
-	snprintf(why, sizeof(why), "%s: ready (%s)", m->name, c->backend);
+	if (c->ep == OC_EP_COREML && reported) {
+		snprintf(why, sizeof(why), "%s: ready (%s, %u/%u nodes)", m->name, c->backend, taken, total);
+	} else {
+		snprintf(why, sizeof(why), "%s: ready (%s)", m->name, c->backend);
+	}
 	set_state(p, c, XRT_CONV_STATE_READY, XRT_CONV_FAIL_NONE, 0, 1.0f, why);
 	return XRT_SUCCESS;
 }
@@ -1031,6 +1148,19 @@ infer(struct oc_provider *p,
 		// The runtime reads FAILED(DEVICE_LOST, retryable) and re-warms on its thread.
 		char why[XRT_CONV_DETAIL_MAX];
 		snprintf(why, sizeof(why), "%.40s: device lost: %.70s", m->name, err);
+		set_state(p, c, XRT_CONV_STATE_FAILED, XRT_CONV_FAIL_DEVICE_LOST, 1, -1.0f, why);
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	if (r != OC_RUN_OK && r != OC_RUN_OUT_OF_MEMORY && c->ep == OC_EP_COREML) {
+		// A Core ML run failed after a good warm: drop the session, move the cap
+		// to the CPU EP (re-describe) and report the accelerator gone, as for GPU
+		// loss: the runtime re-warms, and the re-warm builds a CPU session. No
+		// silent retry inside a convert (discovery spec §2.4).
+		char why[XRT_CONV_DETAIL_MAX];
+		fprintf(stderr, "[open-conversion] %s: Core ML inference failed: %s\n", m->name, err);
+		release_session(p, c);
+		fall_back_to_cpu(p, c, err);
+		snprintf(why, sizeof(why), "%.40s: Core ML run failed; re-warms on the CPU", m->name);
 		set_state(p, c, XRT_CONV_STATE_FAILED, XRT_CONV_FAIL_DEVICE_LOST, 1, -1.0f, why);
 		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
 	}
