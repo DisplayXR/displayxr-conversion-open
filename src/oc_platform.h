@@ -60,6 +60,34 @@ oc_file_exists(const char *path);
 bool
 oc_make_dir(const char *path);
 
+/*! True when @p path is a directory. */
+bool
+oc_dir_exists(const char *path);
+
+/*! Remove a file or a directory tree (no symlink is followed). POSIX only;
+ *  Windows returns false (only the macOS Core ML cache uses it). */
+bool
+oc_remove_tree(const char *path);
+
+/*! Rename @p from to @p to (atomic on one file system; fails if @p to is a
+ *  non-empty directory). */
+bool
+oc_rename(const char *from, const char *to);
+
+/*! Create an empty file (or keep an existing one). */
+bool
+oc_touch(const char *path);
+
+/*! This process's id. */
+uint64_t
+oc_process_id(void);
+
+/*! In @p dir, remove every entry named "<prefix><anything>-<pid>" whose
+ *  process no longer exists (debris of a process killed mid-write). POSIX
+ *  only; Windows does nothing. */
+void
+oc_sweep_stale(const char *dir, const char *prefix);
+
 /*! Load a shared library by ABSOLUTE path; its own dependencies resolve from
  *  its directory first (Windows: LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, with
  *  backslashes). Never via PATH. */
