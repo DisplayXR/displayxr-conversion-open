@@ -13,7 +13,11 @@ on macOS for the models whose pack variant lists `coreml`, CPU everywhere). The 
 views from them; this repo never declares `VIEWS_*`. A third, `SPLATS_MONO` (ADR-057, job lane:
 photo → 3DGS PLY), serves whatever model a pack names for `splats-mono` (none in the default
 pack; a research-only model is its own pack) on OpenVINO (GPU, else CPU; Linux x86_64 and
-Windows x64), else ONNX Runtime's CPU EP.
+Windows x64), else ONNX Runtime's CPU EP. Setting `MODEL` (`auto` | `full` | `int4`) picks
+between the pack's full model (`defaults["splats-mono"].high`) and its small one (`.low`):
+`auto` = full when the bound backend is a GPU (OpenVINO GPU, DirectML, Core ML) and the OS
+reports ≥ 15 GiB of RAM (a "16 GB" machine), else int4 — and only among the models whose blobs
+are in the store (`pick_splat_model_locked`, re-picked at every warm).
 
 **Public repository.** No internal data anywhere (code, comments, commit messages, docs): no
 dataset names or paths, no internal measurements, no vendor-module internals, no product or
@@ -37,25 +41,33 @@ re-upload of a model (exports are built from the official checkpoint by our own 
   model's grid, the unprojection + covariance re-diagonalisation, the 3DGS PLY writer, the focus
   suggestion. `src/oc_tensor.h` — the named-tensor I/O both back ends share.
 - `src/oc_pack.{c,h}`, `src/oc_json.{c,h}` — the schema-2 pack reader (every `*.models.json` next
-  to the binary; a capability's licence class is its own model's) and a strict JSON parser.
+  to the binary; a capability's licence class is its own model's) and a strict JSON parser. A
+  variant may list `data` files beside its one `model` file (ONNX external weights); the provider
+  never opens them — the store hands a variant out only when all are verified, side by side.
 - `src/oc_image.{c,h}` — resampling, normalisation, range statistics.
 - `src/oc_platform.{c,h}` — mutex, sleep, clock, module directory, library loading.
 - `tools/fakehost.c` (+ `tools/sha256.c`) — the fake host: drives the provider and plays the
   model store (file:// downloads, `.part` → verify → rename → `.ok` stamp last). CTest cases in
   `CMakeLists.txt`.
 - `packs/dxr-open-default.models.json` — the default pack. `packs/dxr-open-sharp.models.json` — the
-  research-only SHARP splat model, `local_build` (never downloaded: the user builds the blob with
-  `scripts/export_sharp.py` from the official checkpoint). `tests/packs/` — test packs.
+  research-only SHARP splat models, `local_build` (never downloaded: the user builds the blobs with
+  `scripts/export_sharp.py` from the official checkpoint): `sharp-int4-1536` (one 0.58 GB file,
+  `defaults.low`/`.medium`) and `sharp-full-1536` (fp32: a 6 MB graph + one 2.6 GB external-data
+  file the graph names by its sha256, `defaults.high`). `tests/packs/` — test packs.
 - `scripts/check_model_pack.py` — pack validator (also the CI guard that no `prefetch` blob is
   non-commercial); `scripts/fetch_models.py` — dev / CI blob download with hash check;
   `scripts/rewrite_video_depth_coreml.py` — rebuilds the video-depth blobs for Core ML (scalar
   `Gather` → `Slice` + `Squeeze`), from the pack's blobs by sha256 (needs `onnx`).
 - `scripts/export_sharp.py` (+ `scripts/requirements-export-sharp.txt`, pinned) — builds the SHARP
-  int4 ONNX blob from Apple's official checkpoint (hash-pinned, refuses any other) and writes it
-  into the model store. Never commit or publish its output: the weights are research-only.
+  blobs (`--variant int4|full|both`; default = what this machine's `MODEL=auto` would pick) from
+  Apple's official checkpoint (hash-pinned, refuses any other) and writes them into the model
+  store. Both outputs are byte-deterministic. The version written into a blob's metadata is its
+  recipe's (`VARIANTS`), not `SCRIPT_VERSION`, so an unrelated script change never moves a pinned
+  hash. Never commit or publish its output: the weights are research-only.
 - `cmake/OnnxRuntime.cmake`, `cmake/OpenVINO.cmake` — the pinned archives and their SHA-256.
 - `tests/make_tiny_splat_model.py` — a synthetic splat model with the real I/O contract and its
-  expected output (the splat CTests; needs `onnx`).
+  expected output (the splat CTests; needs `onnx`), plus a two-model pack (`tiny-full` stored as
+  graph + external data by sha256, `tiny-int4` single-file) for the `splats-pick-*` tests.
 - `include/xrt/` — vendored **verbatim** from the runtime (tag in `README.md`). Never edit.
 
 ## The contract (source of truth: the runtime repository)

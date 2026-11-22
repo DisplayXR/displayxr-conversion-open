@@ -13,7 +13,7 @@ provider per task, owns every thread, queue and policy, and calls this one for p
 |---|---|---|---|---|
 | `cap_id` 1 | `DEPTH_VIDEO`, `TEMPORAL` | stream | Video Depth Anything **Small**, streaming export with an explicit per-stream temporal cache | R32F affine disparity |
 | `cap_id` 2 | `DEPTH_MONO` | stream + job | Depth Anything V2 **Small** | R32F affine disparity |
-| `cap_id` 3 | `SPLATS_MONO` | job | none in the default pack: a separate, research-only splat pack (e.g. SHARP) | 3DGS PLY ([below](#photo-to-splats-splats_mono-adr-057)) |
+| `cap_id` 3 | `SPLATS_MONO` | job | none in the default pack: a separate, research-only splat pack (e.g. SHARP, full or 4-bit, picked per machine) | 3DGS PLY ([below](#photo-to-splats-splats_mono-adr-057)) |
 
 - **No views.** The provider declares no `VIEWS_*` capability: the runtime composes
   `VIEWS_MONO` from a depth capability and its reference view synthesis (discovery spec §1.1,
@@ -77,36 +77,59 @@ never pre-fetch one); `--verify-store DIR` checks a model store against it.
 
 ### SHARP (image → Gaussian splats), built on your machine
 
-`packs/dxr-open-sharp.models.json` lists `sharp-int4-1536` (task `splats-mono`): Apple's SHARP
-single-image splat model, exported to ONNX and quantized to 4-bit MatMul weights. SHARP's
-weights are licensed **for research only** (Apple Machine Learning Research Model licence,
-`apple-amlr`), and the licence follows every derivative, so this repository never ships,
-mirrors or links a weight file. The pack has no download URL; you build the blob yourself from
-the official checkpoint:
+`packs/dxr-open-sharp.models.json` lists two builds of Apple's SHARP single-image splat model
+(task `splats-mono`), both exported to ONNX from the same official checkpoint:
+
+- **`sharp-full-1536`** — the fp32 export as it comes out of PyTorch (numerically the PyTorch
+  model: on ONNX Runtime's CPU every output is within 2e-4 relative L2 of PyTorch's and the median
+  depth error is below 1e-4, `export_sharp.py --check`). 2.6 GB of weights, so it is
+  **two files**: a 6 MB graph and one external-data file. The graph names that data file by
+  the data's own SHA-256, which is exactly the name the model store gives it (`blobs/<sha256>`),
+  so the two sit side by side in the store and the inference runtime finds the weights next to
+  the graph; the pack lists both (roles `model` and `data`) and the store hands the model out
+  only when both are present and verified. (ONNX's protobuf cannot hold 2.6 GB in one file.)
+- **`sharp-int4-1536`** — the same export with its MatMul weights quantized to 4 bits; one
+  0.58 GB file.
+
+The provider picks between them per machine (setting `MODEL`, [below](#which-sharp-build-model)).
+SHARP's weights are licensed **for research only** (Apple Machine Learning Research Model
+licence, `apple-amlr`), and the licence follows every derivative, so this repository never
+ships, mirrors or links a weight file. The pack has no download URL; you build the blobs
+yourself from the official checkpoint:
 
 ```
 python3.12 -m venv sharp-venv
 sharp-venv/bin/pip install -r scripts/requirements-export-sharp.txt
-sharp-venv/bin/python scripts/export_sharp.py --accept-research-license
+sharp-venv/bin/python scripts/export_sharp.py --accept-research-license [--variant int4|full|both]
 ```
+
+`--variant` defaults to the build this machine's provider will pick by itself (the `MODEL=auto`
+rule below) and says which and why; `both` builds both from one export (one checkpoint download
+serves both).
 
 The script downloads `sharp_2572gikvuh.pt` from the official `apple/Sharp` Hugging Face
 repository at a pinned revision (or takes `--checkpoint FILE`), refuses any file whose size and
 SHA-256 are not the official ones, checks out Apple's reference code `apple/ml-sharp` at a
 pinned commit, exports the fp32 predictor (opset 18, standard operators, fixed 1536×1536
-input), quantizes the MatMul weights with ONNX Runtime's `MatMulNBitsQuantizer` (4-bit, block
-32, symmetric; Conv weights and all activations stay fp32), and writes the result into the
-model store (`blobs/<sha256>` + `.ok` stamp, the store's own protocol). It takes a few minutes
-and about 8 GB of memory. With the pinned package versions the output is byte-identical from
-run to run, so the pack lists its SHA-256 like any other blob; the script compares what it
+input); for `full` it re-saves that export as the graph + one data file, for `int4` it quantizes
+the MatMul weights with ONNX Runtime's `MatMulNBitsQuantizer` (4-bit, block 32, symmetric; Conv
+weights and all activations stay fp32); then it writes the result into the model store
+(`blobs/<sha256>` + `.ok` stamp, the store's own protocol; the data file before the graph). It
+takes about two minutes for both and about 8 GB of memory (7.3 GB peak here). With the pinned
+package versions both outputs are byte-identical from run to run (checked by building each
+twice), so the pack lists their SHA-256 like any other blob; the script compares what it
 produced against the pack and says so if they differ.
 
-| Model | Task | Blob sha256 | Size | Prefetch |
-|---|---|---|---|---|
-| `sharp-int4-1536` | splats-mono | `01202f427e5f83ece061a5438e5b6670fbe9ffb26d30f8100bb285eb69f753f9` | 583 477 535 | never (built locally) |
+| Model | Task | File | Blob sha256 | Size | Prefetch |
+|---|---|---|---|---|---|
+| `sharp-full-1536` | splats-mono | graph (`model`) | `cbe7db8a32a5e1d3af96fbd64841d0e77b8db79f3efba92fda3891e3edc75326` | 6 226 171 | never (built locally) |
+| | | weights (`data`) | `95912399a850769c894d780c1761604ced31ce30e2464a8c3138e796f26e15d0` | 2 615 734 016 | |
+| `sharp-int4-1536` | splats-mono | `model` | `01202f427e5f83ece061a5438e5b6670fbe9ffb26d30f8100bb285eb69f753f9` | 583 477 535 | never (built locally) |
 
-The model's `local_build` block names the script, its version and whether it is deterministic;
-`provenance` pins the parent checkpoint (`parent_sha256`, `parent_size`). The capability is
+Each model's `local_build` block names the script, the version that introduced its recipe and
+whether it is deterministic; `provenance` pins the parent checkpoint (`parent_sha256`,
+`parent_size`). The version written into a blob's metadata is its recipe's, not the script's, so
+an unrelated script change never moves a pinned hash (the int4 bytes are unchanged). The capability is
 `RESEARCH_ONLY` and is selected only with `AllowResearchOnly`. The model's tensors, shapes and
 coordinate convention (projective means, unnormalised `wxyz` quaternions, linear-RGB colours)
 are in the pack's `io` block.
@@ -136,14 +159,38 @@ The default pack names none: a splat model is a separate, research-only pack (Ap
 `ABSENT` and costs nothing. It is job-only and never prewarmed (the runtime's default `Prewarm`
 tasks do not include it, and its warm runs no warm-up inference).
 
+### Which SHARP build (`MODEL`)
+
+When a pack names two splat models, `defaults["splats-mono"].high` (the full one) and `.low`
+(the small one), setting **`MODEL`** picks between them:
+
+| `MODEL` | Model |
+|---|---|
+| `auto` (default) | **full** when the backend the capability is bound to is a GPU (OpenVINO's GPU device; DirectML or Core ML where a pack lists them) **and** the OS reports at least 15 GiB of memory (a "16 GB" machine: firmware and an integrated GPU keep a little); otherwise **int4**. |
+| `full` | always the full model |
+| `int4` | always the small model |
+
+`auto` chooses only among the models whose blobs are in the model store: when the preferred one
+is absent and the other is present it uses the other and says so (an INFO line and the
+capability's ready detail, `… is not in the store; using …`); when neither is present it names
+the preferred one, which reports that it needs its local build (`ABSENT`, as before). A forced
+`MODEL` whose blob is absent fails with that reason (`MODEL=full, but it is not in the model
+store …; not switching`) and never switches. The pick is made at probe and again at every warm,
+so a build that finishes later (or a backend fallback, GPU → CPU) changes it on the next warm,
+which re-describes the capability (`model_id` changes; a loaded session of the other model is
+dropped). The build stamp of every result names the model that answered
+(`<pack>/<model>@<version>` and its sha256). The rule is the same on every platform; memory comes
+from `oc_system_ram_mb()` (`sysconf` / `sysctl hw.memsize` / `GlobalMemoryStatusEx`).
+
 **The model contract** (pack `io` block, `splat_format: "sharp-projective"`): input `image`
 `[1,3,H,W]` float in `[0,1]` (sRGB values; the whole picture resampled to the model's fixed grid,
 aspect not kept) and `disparity_factor` `[1]` = focal px / input width; outputs `means`
 `[1,N,3]` in the projective frame (`x_ndc·z, y_ndc·z, z`), `scales` `[1,N,3]`, `rotations`
 `[1,N,4]` (w x y z, unnormalised), `colors` `[1,N,3]` (linear RGB) and `opacities` `[1,N]`. The
 tensor names come from `io.tensors`, the grid from `io.input.resolution`, the count from
-`io.output.count`. The model file must be **one** `.onnx` (no external-data side file): the
-model store keeps each blob under its sha256, where a side file could not be found.
+`io.output.count`. The model is one `.onnx` file, or a graph plus external-data files that the
+graph names by their **sha256** (the store keeps every blob as `blobs/<sha256>`, side by side, so
+only that name is found; the pack lists them as `data` files of the same variant).
 
 **What a job does:**
 
@@ -210,34 +257,53 @@ needs it: `probe` checks that the files are there, nothing more.
   killed process is replaced rather than trusted; the scratch directory may be deleted at any time.
 - **macOS** builds carry no OpenVINO: the splat capability runs on ONNX Runtime there.
 
-Measured on a developer laptop with an Intel Panther Lake iGPU (Ubuntu 26.04, OpenVINO 2026.4.1),
-a 4-bit SHARP export, one 6016 × 4000 photo, focal given, through the provider (fake host, the
-model store played per protocol). **The GPU was shared with a desktop browser using ~75 % of its
-render engine during these runs**, which also slows OpenVINO's compute: compare ratios, and
-expect an idle GPU to be several times faster (the same reference script measured 2.4 s per
-inference on this machine when the GPU was idle; under the same load it measured 10.9 – 12.4 s).
+Measured on a developer laptop with an Intel Panther Lake iGPU (Ubuntu 26.04, 30 GB, OpenVINO
+2026.4.1), both SHARP builds, through the provider (fake host, the model store played per
+protocol, blobs already in the store), two photos (6016 × 4000 and 4896 × 3264), focal given.
+The GPU was otherwise idle: during the GPU runs its render engine was 52 – 78 % busy, all of it the
+provider; every other client stayed under 1 %. Each configuration starts with an empty scratch
+directory (first photo = first compile, second photo = cached compile). OpenVINO's CPU device runs
+with the provider's default 4 threads (`THREADS`).
 
-| | OpenVINO GPU |
-|---|---|
-| warm, first (no cache; includes the fake store's copy) | 13.5 – 16.0 s (compile 11 – 14 s) |
-| warm, cached compile | 3.5 s (import 3.2 s) |
-| one job (preprocess + inference + PLY), median of 3 | 13.1 s (inference 12.4 – 13.4 s, PLY 0.35 – 0.39 s) |
-| reference script, same model, same load | 10.9 – 12.4 s (inference only) |
-| peak RSS, cached / first compile | 0.59 / 1.64 GB |
-| result | 1 179 648 Gaussians, 66 MB PLY |
+| OpenVINO | Model | Warm, first compile / cached | First job | Warm job (median) | Inference | Peak RSS, first / cached |
+|---|---|---|---|---|---|---|
+| GPU | `sharp-full-1536` | 10.6 s / 2.3 s | 2.9 s | 2.8 – 2.9 s | 2.4 s | 0.92 / 0.56 GB |
+| GPU | `sharp-int4-1536` | 5.5 s / 1.9 s | 2.9 s | 2.9 – 3.1 s | 2.4 – 2.5 s | 1.63 / 0.60 GB |
+| CPU | `sharp-full-1536` | 6.3 s / 3.0 s | 69 – 77 s | 59 – 64 s | 59 – 64 s | 9.8 / 8.8 GB |
+| CPU | `sharp-int4-1536` | 4.4 s / 1.9 s | 51 – 53 s | 43 s | 43 s | 5.3 / 4.8 GB |
 
-Geometry against the same model run by the reference script on the same device: median depth
-difference 0.17 % (95th percentile 2.8 %), means relative L2 2.3 %, the same splat count; the
-reference script's own CPU-vs-GPU difference is 1.1 % / 3.3 %, so the provider is within that
-noise. Against the PyTorch fp32 checkpoint: median depth difference 1.2 %, the same as the
-reference script's int4 run (1.1 %).
+A job is preprocess + inference + PLY (the PLY write is 0.35 – 0.41 s); every result is
+1 179 648 Gaussians, a 66 MB PLY. Blob sizes: full 2.62 GB (6 MB graph + 2.616 GB weights), int4
+0.58 GB. On the iGPU the two builds run at the same speed: OpenVINO's GPU device computes in fp16
+by default whatever the weights' precision, and the full build compiles with less process memory
+(nothing to unpack). On the CPU the full build costs ~40 % more time and ~2× the memory.
+
+Accuracy against the PyTorch fp32 checkpoint (Apple's reference code, same photos, same focal),
+with the provider's PLY turned back into the model's projective tensors: depth = median / 95th
+percentile relative error of every Gaussian's depth; views = PSNR / SSIM of a splat render from
+the input camera and from a camera moved sideways by 10 % of the median depth.
+
+| OpenVINO | Model | Depth, photo 1 | Depth, photo 2 | Input view, photo 1 / 2 | Side view, photo 1 / 2 |
+|---|---|---|---|---|---|
+| CPU | full | 0.04 % / 0.47 % | 0.05 % / 0.37 % | 53.7 dB 0.999 / 48.4 dB 0.998 | 46.5 dB 0.995 / 45.0 dB 0.994 |
+| GPU | full | 0.16 % / 3.1 % | 0.31 % / 2.2 % | 38.0 dB 0.977 / 27.8 dB 0.900 | 38.3 dB 0.977 / 25.6 dB 0.853 |
+| CPU | int4 | 1.0 % / 7.0 % | 1.1 % / 4.1 % | 46.3 dB 0.996 / 37.0 dB 0.981 | 29.0 dB 0.860 / 25.5 dB 0.755 |
+| GPU | int4 | 1.2 % / 7.6 % | 1.4 % / 4.8 % | 37.7 dB 0.975 / 27.9 dB 0.891 | 28.5 dB 0.847 / 24.3 dB 0.693 |
+
+The full build on the CPU is the reference model; its remaining 0.04 % is the provider's
+antialiased resample into the 1536 × 1536 grid, not the model (the export itself matches PyTorch
+to better than 1e-4 in depth). The GPU's fp16 compute costs the full build 0.2 – 0.3 % in depth; 4-bit weights cost
+~1 %, and most visibly in views away from the input camera (side view SSIM 0.69 – 0.86 against
+0.85 – 0.98 for full on the same device). Hence `MODEL=auto`: on a GPU the full build is as fast
+and better, so it is the default there; on the CPU the int4 build is the faster, smaller one.
 
 ## Getting a splat model (`conv models fetch`, the export script)
 
 Research-only weights are **never bundled, mirrored or pre-fetched** (ADR-057 §5), and the
 installers download no model. A SHARP pack's blob is built on the user's machine from Apple's
 official checkpoint by `scripts/export_sharp.py` (it downloads the checkpoint, verifies its
-SHA-256, exports and 4-bit-quantises it, and writes the bytes the pack pins into the model store);
+SHA-256, exports it, keeps it fp32 and / or 4-bit-quantises it, and writes the bytes the pack
+pins into the model store);
 see that script for its requirements and the licence it asks you to accept. A pack whose model has
 a downloadable source is fetched the usual way, `displayxr-cli conv models fetch <pack>
 --model <name>` (the same action as the Dashboard's Download button). Either way the runtime
@@ -385,6 +451,11 @@ protocol, without network.
 | `splats-tiny-model` | writes a tiny synthetic splat model with the real I/O contract, its pack and the expected output (`tests/make_tiny_splat_model.py`; needs the `onnx` Python package, skipped without it) | no |
 | `splats-cpu` | the splat lane on ONNX Runtime's CPU EP: download → `READY`, three jobs (focal given: every sampled Gaussian equals an independent numpy unprojection; no focal: `ASSUMED` 30 mm equivalent; a SOG request: refused, the cap stays `READY`), PLY header + count, facts, build stamp | no |
 | `splats-openvino-cpu` | the same on OpenVINO's CPU device (no GPU needed), backend `openvino-cpu` | no |
+| `splats-pick-auto-cpu` | a two-model pack (`tiny-full` = high, `tiny-int4` = low) on the CPU: `MODEL=auto` picks `tiny-int4` | no |
+| `splats-pick-full-external-data` | `MODEL=full`: `tiny-full`, stored as a graph + an external-data file named by its sha256, downloads both files and runs (the full SHARP layout) | no |
+| `splats-pick-fallback` | the store holds only `tiny-full`, downloads off: `auto` (int4 on a CPU) takes `tiny-full` and says so | no |
+| `splats-pick-forced-absent` | the same store, `MODEL=int4`: `ABSENT` with the reason, never switched to `tiny-full` | no |
+| `splats-pick-full-openvino-cpu` | `MODEL=full` on OpenVINO's CPU device: OpenVINO finds the external data the same way | no |
 | `splats-default-ep` (`-DOPENCONV_TEST_GPU=ON -DOPENCONV_TEST_SPLAT_MODEL=<.onnx> [-DOPENCONV_TEST_SPLAT_IMAGE=<.ppm>]`) | a real splat model you built yourself, on the default backend (OpenVINO GPU where there is one); nothing is fetched | yes (yours) |
 
 The synthetic scene is a perspective checkerboard floor under a sky. The checks are statistics,
@@ -414,10 +485,11 @@ environment, else `Settings\<KEY>` under the registry row (Windows) or the manif
 | Key | Values | Effect |
 |---|---|---|
 | `ENABLE` | `0` | `probe` declines |
-| `QUALITY` | `low`, `medium` (default), `high` | which model `defaults[task]` names (low = the 364-px video model) |
+| `QUALITY` | `low`, `medium` (default), `high` | which model `defaults[task]` names for the depth capabilities (low = the 364-px video model); the splat capability uses `MODEL` instead |
 | `EP` | `auto` (default), `cpu`, `dml`, `coreml`, `openvino` | `cpu` forces the CPU execution provider; `auto` = DirectML on Windows, Core ML on macOS (each falls back to the CPU), and OpenVINO for the splat capability where it ships (`openvino` is the same for it; the depth capabilities never use OpenVINO) |
 | `OV_DEVICE` | `auto` (default), `gpu`, `cpu` | the OpenVINO device of the splat capability (`auto` = the GPU when OpenVINO reports one) |
 | `OV_CACHE` | `0` | no OpenVINO compiled-model cache, even when the host provides a scratch directory |
+| `MODEL` | `auto` (default), `full`, `int4` | the splat model when a pack names two: `full` = `defaults["splats-mono"].high`, `int4` = `.low`; `auto` = full on a GPU backend with ≥ 16 GB of memory, else int4, among the models in the store ([details](#which-sharp-build-model)) |
 | `OPENVINO` | absolute path | another OpenVINO runtime folder (default: `openvino/` next to the binary) |
 | `COREML_UNITS` | `gpu` (default), `all`, `ane`, `cpu` | macOS: the Core ML compute units (CPU + GPU, + the Neural Engine, CPU + Neural Engine, CPU only) |
 | `COREML_CACHE` | `0` | macOS: no compiled-model cache, even when the host provides a scratch directory |
