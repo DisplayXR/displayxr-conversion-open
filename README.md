@@ -75,6 +75,42 @@ verifies the sha256 on first load (discovery spec §5.3).
 pack flag, `defaults`, and that no `prefetch` blob is non-commercial — a signed installer must
 never pre-fetch one); `--verify-store DIR` checks a model store against it.
 
+### SHARP (image → Gaussian splats), built on your machine
+
+`packs/dxr-open-sharp.models.json` lists `sharp-int4-1536` (task `splats-mono`): Apple's SHARP
+single-image splat model, exported to ONNX and quantized to 4-bit MatMul weights. SHARP's
+weights are licensed **for research only** (Apple Machine Learning Research Model licence,
+`apple-amlr`), and the licence follows every derivative, so this repository never ships,
+mirrors or links a weight file. The pack has no download URL; you build the blob yourself from
+the official checkpoint:
+
+```
+python3.12 -m venv sharp-venv
+sharp-venv/bin/pip install -r scripts/requirements-export-sharp.txt
+sharp-venv/bin/python scripts/export_sharp.py --accept-research-license
+```
+
+The script downloads `sharp_2572gikvuh.pt` from the official `apple/Sharp` Hugging Face
+repository at a pinned revision (or takes `--checkpoint FILE`), refuses any file whose size and
+SHA-256 are not the official ones, checks out Apple's reference code `apple/ml-sharp` at a
+pinned commit, exports the fp32 predictor (opset 18, standard operators, fixed 1536×1536
+input), quantizes the MatMul weights with ONNX Runtime's `MatMulNBitsQuantizer` (4-bit, block
+32, symmetric; Conv weights and all activations stay fp32), and writes the result into the
+model store (`blobs/<sha256>` + `.ok` stamp, the store's own protocol). It takes a few minutes
+and about 8 GB of memory. With the pinned package versions the output is byte-identical from
+run to run, so the pack lists its SHA-256 like any other blob; the script compares what it
+produced against the pack and says so if they differ.
+
+| Model | Task | Blob sha256 | Size | Prefetch |
+|---|---|---|---|---|
+| `sharp-int4-1536` | splats-mono | `01202f427e5f83ece061a5438e5b6670fbe9ffb26d30f8100bb285eb69f753f9` | 583 477 535 | never (built locally) |
+
+The model's `local_build` block names the script, its version and whether it is deterministic;
+`provenance` pins the parent checkpoint (`parent_sha256`, `parent_size`). The capability is
+`RESEARCH_ONLY` and is selected only with `AllowResearchOnly`. The model's tensors, shapes and
+coordinate convention (projective means, unnormalised `wxyz` quaternions, linear-RGB colours)
+are in the pack's `io` block.
+
 ## Licence classes
 
 `commercial` = the AND over the model, every dependency and the inference runtime. It is decided

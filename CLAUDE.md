@@ -43,11 +43,16 @@ re-upload of a model (exports are built from the official checkpoint by our own 
 - `tools/fakehost.c` (+ `tools/sha256.c`) — the fake host: drives the provider and plays the
   model store (file:// downloads, `.part` → verify → rename → `.ok` stamp last). CTest cases in
   `CMakeLists.txt`.
-- `packs/dxr-open-default.models.json` — the default pack. `tests/packs/` — test packs.
+- `packs/dxr-open-default.models.json` — the default pack. `packs/dxr-open-sharp.models.json` — the
+  research-only SHARP splat model, `local_build` (never downloaded: the user builds the blob with
+  `scripts/export_sharp.py` from the official checkpoint). `tests/packs/` — test packs.
 - `scripts/check_model_pack.py` — pack validator (also the CI guard that no `prefetch` blob is
   non-commercial); `scripts/fetch_models.py` — dev / CI blob download with hash check;
   `scripts/rewrite_video_depth_coreml.py` — rebuilds the video-depth blobs for Core ML (scalar
   `Gather` → `Slice` + `Squeeze`), from the pack's blobs by sha256 (needs `onnx`).
+- `scripts/export_sharp.py` (+ `scripts/requirements-export-sharp.txt`, pinned) — builds the SHARP
+  int4 ONNX blob from Apple's official checkpoint (hash-pinned, refuses any other) and writes it
+  into the model store. Never commit or publish its output: the weights are research-only.
 - `cmake/OnnxRuntime.cmake`, `cmake/OpenVINO.cmake` — the pinned archives and their SHA-256.
 - `tests/make_tiny_splat_model.py` — a synthetic splat model with the real I/O contract and its
   expected output (the splat CTests; needs `onnx`).
