@@ -261,5 +261,8 @@ if(OPENCONV_BUILD_TESTS)
 		add_test(NAME check-model-pack-research COMMAND Python3::Interpreter -I
 			${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_model_pack.py --allow-research
 			${CMAKE_CURRENT_SOURCE_DIR}/tests/packs/research.models.json)
+		add_test(NAME check-model-pack-sharp COMMAND Python3::Interpreter -I
+			${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_model_pack.py --allow-research
+			${CMAKE_CURRENT_SOURCE_DIR}/packs/dxr-open-sharp.models.json)
 	endif()
 endif()

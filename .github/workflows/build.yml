@@ -29,6 +29,10 @@ jobs:
         run: python3 -I scripts/check_model_pack.py packs/dxr-open-default.models.json
       - name: Validate the research test pack
         run: python3 -I scripts/check_model_pack.py --allow-research tests/packs/research.models.json
+      - name: Validate the SHARP pack (research only, built locally, never downloaded)
+        run: python3 -I scripts/check_model_pack.py --allow-research packs/dxr-open-sharp.models.json
+      - name: Byte-compile the SHARP export script
+        run: python3 -I -m py_compile scripts/export_sharp.py
 
   build:
     name: ${{ matrix.os }}

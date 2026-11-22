@@ -11,6 +11,12 @@ own `commercial` flag equals the AND over its models, that `defaults` name
 existing models of the right task, and that no blob marked `prefetch` is
 non-commercial (a signed installer must never pre-fetch one).
 
+A model with a `local_build` block is built on the user's machine by a script in
+this repository (a licence that forbids redistributing derivatives): it must name
+the script and its version, pin the upstream parent by provenance.parent_sha256 +
+parent_size, carry no url / auth and never be pre-fetched. A pack whose every
+model is local_build may omit blobBaseUrl.
+
 Without --allow-research a pack must be commercial-clean as a whole (the
 default pack is). --verify-store checks a model store (blobs/<sha256> plus its
 .ok stamp, size and hash); --verify-blobs checks a flat directory of
@@ -59,6 +65,36 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+def check_local_build(m, mw, pack_dir, rep):
+    """A model the user builds locally from an upstream file (e.g. a research-only licence that
+    forbids redistributing derivatives): no download source, a script in this repository, and
+    the parent file pinned by hash."""
+    lb = m["local_build"]
+    if not isinstance(lb, dict):
+        rep.fail(mw, "local_build must be an object")
+        return
+    script = lb.get("script")
+    if not isinstance(script, str) or not script:
+        rep.fail(mw, "local_build.script missing")
+    elif not os.path.isfile(os.path.join(pack_dir, "..", script)):
+        rep.fail(mw, f"local_build.script '{script}' is not a file in this repository")
+    if not isinstance(lb.get("script_version"), str) or not lb["script_version"]:
+        rep.fail(mw, "local_build.script_version missing")
+    if not isinstance(lb.get("deterministic"), bool):
+        rep.fail(mw, "local_build.deterministic must be true or false")
+    if "url" in m or "auth" in m:
+        rep.fail(mw, "a local_build model has no url or auth: it is never downloaded")
+    if m.get("prefetch") is True:
+        rep.fail(mw, "a local_build model cannot be pre-fetched")
+    prov = m.get("provenance", {})
+    if not SHA256.match(prov.get("parent_sha256") or ""):
+        rep.fail(mw, "local_build needs provenance.parent_sha256 (the pinned upstream file)")
+    if not isinstance(prov.get("parent_size"), int) or prov["parent_size"] <= 0:
+        rep.fail(mw, "local_build needs provenance.parent_size")
+    if not isinstance(prov.get("converter"), str) or not prov["converter"]:
+        rep.fail(mw, "local_build needs provenance.converter (the script and its version)")
+
+
 def check_pack(path, args, rep):
     try:
         with open(path, encoding="utf-8") as f:
@@ -72,9 +108,15 @@ def check_pack(path, args, rep):
     pid = pack.get("pack")
     if not isinstance(pid, str) or not pid or "/" in pid:
         rep.fail(where, "pack id missing or contains '/'")
-    base = pack.get("blobBaseUrl", "")
-    if not (isinstance(base, str) and (base.startswith("https://") or base.startswith("file://"))):
-        rep.fail(where, "blobBaseUrl must be https:// (or file:// for tests)")
+    base = pack.get("blobBaseUrl")
+    local_only = isinstance(pack.get("models"), list) and all(
+        isinstance(m, dict) and "local_build" in m for m in pack["models"]
+    )
+    if base is None and local_only:
+        pass  # every blob is built on the user's machine; nothing is ever downloaded
+    elif not (isinstance(base, str) and (base.startswith("https://") or base.startswith("file://"))):
+        rep.fail(where, "blobBaseUrl must be https:// (or file:// for tests); only a pack whose every model "
+                 "is local_build may omit it")
     if "compat" in pack or "schema1" in pack:
         rep.fail(where, "schema 2 carries no schema-1 compatibility block")
 
@@ -134,6 +176,8 @@ def check_pack(path, args, rep):
         if not isinstance(prov.get("source_url"), str) or not prov["source_url"].startswith("https://"):
             rep.fail(mw, "provenance.source_url (https) is required")
         prefetch = m.get("prefetch") is True
+        if "local_build" in m:
+            check_local_build(m, mw, os.path.dirname(os.path.abspath(path)), rep)
         if prefetch and not effective:
             rep.fail(mw, "prefetch is set on a non-commercial model: a signed installer must never pre-fetch it")
         variants = m.get("variants")
