@@ -109,7 +109,8 @@ struct thread_start
 };
 
 #ifdef _WIN32
-static unsigned __stdcall thread_tramp(void *p)
+static unsigned __stdcall
+thread_tramp(void *p)
 {
 	struct thread_start s = *(struct thread_start *)p;
 	free(p);
@@ -263,6 +264,7 @@ static struct
 	uint32_t chunk_ms;
 	char root[384]; //!< short enough that root/blobs/<sha256>.ok fits xrt_conv_model_location::path
 	char blob_base[1024];
+	char pack_id[64]; //!< the --pack's id (refs are "<pack>/<model>")
 	struct blob blobs[OC_PACK_MAX_MODELS];
 	uint32_t blob_count;
 	uint32_t requests;
@@ -476,6 +478,7 @@ store_setup(const char *pack_path, const char *blob_base, const char *root)
 	}
 	snprintf(g_store.blob_base, sizeof(g_store.blob_base), "%s",
 	         blob_base != NULL ? blob_base : pack->blob_base_url);
+	oc_copy_str(g_store.pack_id, sizeof(g_store.pack_id), pack->pack);
 	if (strlen(root) >= sizeof(g_store.root)) {
 		fprintf(stderr, "store: root path longer than %u bytes\n", (unsigned)sizeof(g_store.root) - 1);
 		free(pack);
@@ -661,9 +664,33 @@ state_name(uint32_t s)
 }
 
 static void
+validate_splat_cap(const struct xrt_conv_capability *c, uint32_t index)
+{
+	check(c->lanes == XRT_CONV_LANE_JOB, "cap %u: SPLATS_MONO is job-only (0x%x)", index, c->lanes);
+	check(c->outputs == XRT_CONV_OUT_SPLAT_BLOB, "cap %u: outputs SPLAT_BLOB only (0x%x)", index, c->outputs);
+	check(c->input_kinds == XRT_CONV_INPUT_MONO, "cap %u: one photo in", index);
+	check(c->splat_formats == (1u << XRT_CONV_BLOB_PLY_3DGS), "cap %u: declares PLY 3DGS (0x%x)", index,
+	      c->splat_formats);
+	check(c->max_streams == 0 && c->max_views == 0, "cap %u: no streams, no views", index);
+	check((c->flags & XRT_CONV_CAP_USES_MODEL_STORE) != 0, "cap %u: USES_MODEL_STORE", index);
+	check((c->import_memory_kinds & XRT_CONV_MEM_CPU) != 0, "cap %u: imports XRT_CONV_MEM_CPU", index);
+	check(c->intrinsics_source == XRT_CONV_INTRINSICS_ASSUMED, "cap %u: intrinsics are labelled ASSUMED", index);
+	check(c->model_id[0] == '\0' || c->licence_class == XRT_CONV_LICENCE_RESEARCH_ONLY ||
+	          c->licence_class == XRT_CONV_LICENCE_PERMISSIVE || c->licence_class == XRT_CONV_LICENCE_COMMERCIAL,
+	      "cap %u: licence class known (%u)", index, c->licence_class);
+	info("cap %u: id %u, %s, model '%s' v%s, backend '%s', licence %s (class %u), commercial_ok %u", index,
+	     c->cap_id, task_name(c->task), c->model_id, c->model_version, c->backend, c->licence_spdx,
+	     c->licence_class, c->commercial_ok);
+}
+
+static void
 validate_cap(const struct xrt_conv_capability *c, uint32_t index)
 {
 	check(c->cap_id != 0, "cap %u: cap_id is non-zero (%u)", index, c->cap_id);
+	if (c->task == XRT_CONV_TASK_SPLATS_MONO) {
+		validate_splat_cap(c, index);
+		return;
+	}
 	check(c->task == XRT_CONV_TASK_DEPTH_MONO || c->task == XRT_CONV_TASK_DEPTH_VIDEO,
 	      "cap %u: a depth task (%u = %s); views are composed by the runtime", index, c->task, task_name(c->task));
 	check(c->outputs == XRT_CONV_OUT_DEPTH, "cap %u: outputs DEPTH only (0x%x)", index, c->outputs);
@@ -1168,6 +1195,412 @@ run_job(struct xrt_conversion_plugin_iface *iface,
 
 /*
  *
+ * The splat lane: SPLATS_MONO jobs, the PLY they write and the facts.
+ *
+ */
+
+static const char *g_splat_check = NULL; //!< --splat-check: expected values (tests/make_tiny_splat_model.py)
+static const char *g_splat_image = NULL; //!< --splat-image: a binary PPM (P6) photo
+static float g_splat_focal = 0.0f;       //!< --splat-focal: a GIVEN focal for the first job
+static const char *g_splat_out = NULL;   //!< --splat-out: write the first job's PLY here
+
+struct mem_sink
+{
+	uint32_t format;
+	bool begun;
+	uint8_t *data;
+	size_t size, cap;
+	bool failed;
+};
+
+static bool
+mem_begin(void *ctx, uint32_t blob_format, uint64_t size_hint)
+{
+	struct mem_sink *s = (struct mem_sink *)ctx;
+	s->format = blob_format;
+	s->begun = true;
+	s->size = 0;
+	if (size_hint > 0 && size_hint > s->cap) {
+		uint8_t *n = (uint8_t *)realloc(s->data, (size_t)size_hint);
+		if (n != NULL) {
+			s->data = n;
+			s->cap = (size_t)size_hint;
+		}
+	}
+	return true;
+}
+
+static bool
+mem_write(void *ctx, const void *bytes, uint64_t count)
+{
+	struct mem_sink *s = (struct mem_sink *)ctx;
+	if (s->size + count > s->cap) {
+		size_t want = s->cap * 2 > s->size + count ? s->cap * 2 : (size_t)(s->size + count);
+		uint8_t *n = (uint8_t *)realloc(s->data, want);
+		if (n == NULL) {
+			s->failed = true;
+			return false;
+		}
+		s->data = n;
+		s->cap = want;
+	}
+	memcpy(s->data + s->size, bytes, (size_t)count);
+	s->size += (size_t)count;
+	return true;
+}
+
+//! A binary PPM (P6, maxval 255) as RGBA8.
+static uint8_t *
+read_ppm(const char *path, uint32_t *w, uint32_t *h)
+{
+	FILE *f = fopen_utf8(path, "rb");
+	if (f == NULL) {
+		return NULL;
+	}
+	unsigned W = 0, H = 0, maxv = 0;
+	char magic[3] = {0};
+	if (fscanf(f, "%2s %u %u %u", magic, &W, &H, &maxv) != 4 || strcmp(magic, "P6") != 0 || maxv != 255 || W == 0 ||
+	    H == 0 || W > 16384 || H > 16384) {
+		fclose(f);
+		return NULL;
+	}
+	(void)fgetc(f); // the one whitespace after maxval
+	uint8_t *rgb = (uint8_t *)malloc((size_t)W * H * 3u);
+	uint8_t *rgba = (uint8_t *)malloc((size_t)W * H * 4u);
+	const bool ok = rgb != NULL && rgba != NULL && fread(rgb, 1, (size_t)W * H * 3u, f) == (size_t)W * H * 3u;
+	fclose(f);
+	if (!ok) {
+		free(rgb);
+		free(rgba);
+		return NULL;
+	}
+	for (size_t i = 0; i < (size_t)W * H; i++) {
+		rgba[i * 4 + 0] = rgb[i * 3 + 0];
+		rgba[i * 4 + 1] = rgb[i * 3 + 1];
+		rgba[i * 4 + 2] = rgb[i * 3 + 2];
+		rgba[i * 4 + 3] = 255;
+	}
+	free(rgb);
+	*w = W;
+	*h = H;
+	return rgba;
+}
+
+//! Parse a 3DGS PLY header: vertex count, property count, body offset.
+static bool
+ply_header(const uint8_t *d, size_t n, uint64_t *vertices, uint32_t *props, size_t *body)
+{
+	const char *end = NULL;
+	for (size_t i = 0; i + 11 <= n && i < 4096; i++) {
+		if (memcmp(d + i, "end_header\n", 11) == 0) {
+			end = (const char *)d + i + 11;
+			break;
+		}
+	}
+	if (end == NULL || n < 10 || memcmp(d, "ply\nformat binary_little_endian 1.0\n", 36) != 0) {
+		return false;
+	}
+	const char *v = strstr((const char *)d, "element vertex ");
+	if (v == NULL || v > end) {
+		return false;
+	}
+	*vertices = strtoull(v + 15, NULL, 10);
+	uint32_t pc = 0;
+	for (const char *p = (const char *)d; p != NULL && p < end; p = strstr(p + 1, "property float ")) {
+		if (strncmp(p, "property float ", 15) == 0) {
+			pc++;
+		}
+	}
+	*props = pc;
+	*body = (size_t)(end - (const char *)d);
+	return true;
+}
+
+static void
+quat_rot(const float *q, double R[3][3])
+{
+	double w = q[0], x = q[1], y = q[2], z = q[3];
+	const double n = sqrt(w * w + x * x + y * y + z * z);
+	w /= n;
+	x /= n;
+	y /= n;
+	z /= n;
+	R[0][0] = 1 - 2 * (y * y + z * z);
+	R[0][1] = 2 * (x * y - w * z);
+	R[0][2] = 2 * (x * z + w * y);
+	R[1][0] = 2 * (x * y + w * z);
+	R[1][1] = 1 - 2 * (x * x + z * z);
+	R[1][2] = 2 * (y * z - w * x);
+	R[2][0] = 2 * (x * z - w * y);
+	R[2][1] = 2 * (y * z + w * x);
+	R[2][2] = 1 - 2 * (x * x + y * y);
+}
+
+//! The covariance a PLY row encodes (xx xy xz yy yz zz).
+static void
+row_cov(const float *row, double cov[6])
+{
+	double R[3][3];
+	quat_rot(row + 10, R);
+	const double s2[3] = {exp(2.0 * row[7]), exp(2.0 * row[8]), exp(2.0 * row[9])};
+	const int idx[6][2] = {{0, 0}, {0, 1}, {0, 2}, {1, 1}, {1, 2}, {2, 2}};
+	for (int k = 0; k < 6; k++) {
+		const int a = idx[k][0], b = idx[k][1];
+		cov[k] = R[a][0] * s2[0] * R[b][0] + R[a][1] * s2[1] * R[b][1] + R[a][2] * s2[2] * R[b][2];
+	}
+}
+
+static double
+rel_err(double got, double want)
+{
+	const double d = fabs(got - want), m = fabs(want);
+	return m > 1e-6 ? d / m : d;
+}
+
+//! Compare the PLY against expect.json (written by tests/make_tiny_splat_model.py).
+static void
+check_expectations(const float *rows, uint64_t count, const struct oc_json *ex)
+{
+	check((double)count == oc_json_num(ex, "count", -1.0), "PLY holds %llu Gaussians (expected %.0f)",
+	      (unsigned long long)count, oc_json_num(ex, "count", -1.0));
+	const double tol = oc_json_num(ex, "tol", 1e-4);
+	const struct oc_json *samples = oc_json_get(ex, "samples");
+	uint32_t checked = 0, bad = 0;
+	for (const struct oc_json *s = samples != NULL ? samples->child : NULL; s != NULL; s = s->next) {
+		const uint64_t i = (uint64_t)oc_json_num(s, "i", -1.0);
+		if (i >= count) {
+			bad++;
+			continue;
+		}
+		const float *row = rows + i * 14u;
+		double worst = 0.0;
+		for (size_t k = 0; k < 3; k++) {
+			const struct oc_json *xyz = oc_json_at(oc_json_get(s, "xyz"), k);
+			const struct oc_json *dc = oc_json_at(oc_json_get(s, "f_dc"), k);
+			worst = fmax(worst, xyz != NULL ? rel_err(row[k], xyz->number) : 1.0);
+			worst = fmax(worst, dc != NULL ? rel_err(row[3 + k], dc->number) : 1.0);
+		}
+		worst = fmax(worst, rel_err(row[6], oc_json_num(s, "opacity", 1e9)));
+		double cov[6];
+		row_cov(row, cov);
+		for (size_t k = 0; k < 6; k++) {
+			const struct oc_json *c = oc_json_at(oc_json_get(s, "cov"), k);
+			// Off-diagonal terms can be ~0: compare against the diagonal's scale.
+			const double scale = fmax(fabs(cov[0]), fmax(fabs(cov[3]), fabs(cov[5])));
+			worst = fmax(worst, c != NULL ? fabs(cov[k] - c->number) / scale : 1.0);
+		}
+		if (worst > tol) {
+			bad++;
+			info("splat %llu: worst relative error %.3g > %.3g", (unsigned long long)i, worst, tol);
+		}
+		checked++;
+	}
+	check(checked > 0 && bad == 0, "%u sampled Gaussians match the reference unprojection (%u off)", checked, bad);
+}
+
+static xrt_result_t
+splat_job_once(struct xrt_conversion_plugin_iface *iface,
+               struct xrt_conversion_plugin_instance *inst,
+               const struct xrt_conv_capability *cap,
+               uint8_t *rgba,
+               uint32_t W,
+               uint32_t H,
+               float focal,
+               uint32_t format,
+               struct mem_sink *ms,
+               struct xrt_conv_job_out *out,
+               struct xrt_conv_splat_result *sr,
+               double *ms_taken)
+{
+	struct xrt_conv_job_in in;
+	memset(&in, 0, sizeof(in));
+	in.struct_size = (uint32_t)sizeof(in);
+	in.input_kind = XRT_CONV_INPUT_MONO;
+	in.image_count = 1;
+	in.image_role[0] = XRT_CONV_IMG_COLOR;
+	cpu_image(&in.images[0], rgba, W, H, XRT_CONV_FMT_RGBA8_SRGB, 4, 7);
+	in.requested_blob_format = format;
+	in.job_flags = focal > 0.0f ? XRT_CONV_JOB_FOCAL_GIVEN : 0u;
+	struct xrt_conv_params params;
+	memset(&params, 0, sizeof(params));
+	params.struct_size = (uint32_t)sizeof(params);
+	params.content_hint = XRT_CONV_CONTENT_PHOTO;
+	params.focal_px = focal;
+	struct xrt_conv_blob_sink sink;
+	memset(&sink, 0, sizeof(sink));
+	sink.struct_size = (uint32_t)sizeof(sink);
+	sink.role = XRT_CONV_OUT_SPLAT_BLOB;
+	sink.ctx = ms;
+	sink.begin = mem_begin;
+	sink.write = mem_write;
+	struct xrt_conv_job_control ctl;
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.struct_size = (uint32_t)sizeof(ctl);
+	ctl.sink_count = 1;
+	ctl.sinks = &sink;
+	ctl.progress = job_progress;
+	ctl.is_cancelled = never_cancelled;
+	memset(out, 0, sizeof(*out));
+	out->struct_size = (uint32_t)sizeof(*out);
+	memset(sr, 0, sizeof(*sr));
+	sr->struct_size = (uint32_t)sizeof(*sr);
+	out->splat_result = sr;
+	ms->begun = false;
+	ms->size = 0;
+	const double t0 = now_us();
+	const xrt_result_t r = iface->job_execute(inst, cap->cap_id, &in, &params, &ctl, out);
+	*ms_taken = (now_us() - t0) / 1000.0;
+	return r;
+}
+
+static void
+run_splat_jobs(struct xrt_conversion_plugin_iface *iface,
+               struct xrt_conversion_plugin_instance *inst,
+               const struct xrt_conv_capability *cap)
+{
+	struct oc_json *ex = NULL;
+	if (g_splat_check != NULL) {
+		char err[160] = "";
+		ex = oc_json_parse_file(g_splat_check, err, sizeof(err));
+		check(ex != NULL, "read %s (%s)", g_splat_check, err);
+		if (ex == NULL) {
+			return;
+		}
+	}
+	uint32_t W = ex != NULL ? (uint32_t)oc_json_num(ex, "width", 400) : 400u;
+	uint32_t H = ex != NULL ? (uint32_t)oc_json_num(ex, "height", 300) : 300u;
+	float focal = ex != NULL ? (float)oc_json_num(ex, "focal", 0.0) : g_splat_focal;
+	uint8_t *rgba = NULL;
+	if (g_splat_image != NULL && g_splat_image[0] != '\0') {
+		rgba = read_ppm(g_splat_image, &W, &H);
+		check(rgba != NULL, "read the photo %s (binary PPM)", g_splat_image);
+	} else if (ex != NULL) {
+		// The tiny model's reference assumes a uniform grey picture.
+		rgba = (uint8_t *)malloc((size_t)W * H * 4u);
+		if (rgba != NULL) {
+			memset(rgba, 128, (size_t)W * H * 4u);
+		}
+	} else {
+		rgba = make_scene(W, H, 0.0f);
+	}
+	if (rgba == NULL) {
+		oc_json_free(ex);
+		return;
+	}
+	struct mem_sink ms;
+	memset(&ms, 0, sizeof(ms));
+	struct xrt_conv_job_out out;
+	struct xrt_conv_splat_result sr;
+	double t = 0.0;
+
+	// 1. Focal given (or not, with neither --splat-focal nor expect.json).
+	xrt_result_t r = splat_job_once(iface, inst, cap, rgba, W, H, focal, 0, &ms, &out, &sr, &t);
+	check(r == XRT_SUCCESS, "splat job (focal %s, result %d, %.0f ms)", focal > 0.0f ? "given" : "absent", (int)r,
+	      t);
+	if (r == XRT_SUCCESS) {
+		const struct xrt_conv_splat_info *si = &out.splat_info;
+		uint64_t verts = 0;
+		uint32_t props = 0;
+		size_t body = 0;
+		check(ms.begun && ms.format == XRT_CONV_BLOB_PLY_3DGS && !ms.failed, "job wrote a PLY blob (format %u)",
+		      ms.format);
+		check((out.written & XRT_CONV_OUT_SPLAT_BLOB) != 0, "job written has SPLAT_BLOB");
+		const bool hdr = ply_header(ms.data, ms.size, &verts, &props, &body);
+		check(hdr && props == 14 && verts == si->splat_count && body + verts * 56u == ms.size,
+		      "PLY header: %llu vertices x %u floats, %zu bytes (splat_count %llu)", (unsigned long long)verts,
+		      props, ms.size, (unsigned long long)si->splat_count);
+		if (hdr && body + verts * 56u == ms.size) {
+			const float *rows = (const float *)(const void *)(ms.data + body);
+			size_t bad = 0;
+			double zmin = INFINITY, zmax = -INFINITY;
+			for (size_t i = 0; i < verts * 14u; i++) {
+				bad += isfinite(rows[i]) ? 0u : 1u;
+			}
+			for (size_t i = 0; i < verts; i++) {
+				zmin = fmin(zmin, rows[i * 14 + 2]);
+				zmax = fmax(zmax, rows[i * 14 + 2]);
+			}
+			check(bad == 0, "every PLY value is finite (%zu bad)", bad);
+			info("splat cloud: %llu Gaussians, z %.3f .. %.3f", (unsigned long long)verts, zmin, zmax);
+			if (ex != NULL) {
+				check_expectations(rows, verts, ex);
+			}
+		}
+		check(si->coords == XRT_CONV_COORDS_OPENCV && si->metric == 0 && si->baseline_m == 0.0f,
+		      "facts: OpenCV axes, not metric, no baseline");
+		check(si->grid_width == W && si->grid_height == H && si->cx == W * 0.5f && si->cy == H * 0.5f,
+		      "facts: intrinsics of the %ux%u input (grid %ux%u, c %.1f,%.1f)", W, H, si->grid_width,
+		      si->grid_height, (double)si->cx, (double)si->cy);
+		if (focal > 0.0f) {
+			check(si->intrinsics_source == XRT_CONV_INTRINSICS_GIVEN && si->fx == focal && si->fy == focal,
+			      "facts: the given focal is echoed (fx %.2f, source %u)", (double)si->fx,
+			      si->intrinsics_source);
+		}
+		check((sr.valid & XRT_CONV_SPLAT_VALID_BUILD) != 0 &&
+		          strncmp(sr.build_provider, "open-conversion", 15) == 0 &&
+		          strlen(sr.build_model_sha256) == 64 && sr.host_kind == XRT_CONV_HOST_KIND_LOCAL &&
+		          strcmp(sr.build_runtime, cap->backend) == 0 && sr.build_runtime_version[0] != '\0',
+		      "build stamp: '%s' / '%s' / %s / %s %s", sr.build_provider, sr.build_model_id,
+		      sr.build_model_sha256, sr.build_runtime, sr.build_runtime_version);
+		check(sr.refusal_code == XRT_CONV_REFUSAL_NONE, "no refusal (%u)", sr.refusal_code);
+		info("focus suggestion: %s (%.3f, %.3f, %.3f)",
+		     (sr.valid & XRT_CONV_SPLAT_VALID_FOCUS) ? "yes" : "none", (double)sr.focus_point[0],
+		     (double)sr.focus_point[1], (double)sr.focus_point[2]);
+		if (g_splat_out != NULL) {
+			FILE *f = fopen_utf8(g_splat_out, "wb");
+			check(f != NULL && fwrite(ms.data, 1, ms.size, f) == ms.size && fclose(f) == 0, "wrote %s",
+			      g_splat_out);
+		}
+	}
+	// --bench: the same job N more times (warm), timed around job_execute.
+	double *times = g_bench > 0 ? (double *)calloc(g_bench, sizeof(double)) : NULL;
+	uint32_t timed = 0;
+	for (uint32_t b = 0; b < g_bench && times != NULL; b++) {
+		if (splat_job_once(iface, inst, cap, rgba, W, H, focal, 0, &ms, &out, &sr, &times[timed]) !=
+		    XRT_SUCCESS) {
+			check(false, "bench job %u", b);
+			break;
+		}
+		timed++;
+	}
+	if (timed > 0) {
+		char what[200];
+		snprintf(what, sizeof(what), "splats-mono '%s' on '%s'", cap->model_id, cap->backend);
+		report_bench(what, times, timed);
+	}
+	free(times);
+
+	// 2. No focal: a labelled assumption (30 mm full-frame equivalent), never EXIF.
+	r = splat_job_once(iface, inst, cap, rgba, W, H, 0.0f, 0, &ms, &out, &sr, &t);
+	check(r == XRT_SUCCESS, "splat job without a focal (result %d)", (int)r);
+	if (r == XRT_SUCCESS) {
+		const double want = 30.0 * sqrt((double)W * W + (double)H * H) / sqrt(36.0 * 36.0 + 24.0 * 24.0);
+		check(out.splat_info.intrinsics_source == XRT_CONV_INTRINSICS_ASSUMED &&
+		          fabs(out.splat_info.fx - want) < 1e-3 * want,
+		      "facts: no focal -> ASSUMED 30 mm equivalent (fx %.2f, expected %.2f)", (double)out.splat_info.fx,
+		      want);
+	}
+
+	// 3. A format it does not write: refused (job fails, no blob), the cap stays READY.
+	r = splat_job_once(iface, inst, cap, rgba, W, H, focal, XRT_CONV_BLOB_SOG, &ms, &out, &sr, &t);
+	check(r != XRT_SUCCESS && !ms.begun && sr.refusal_code == XRT_CONV_REFUSAL_UNSUPPORTED_INPUT &&
+	          sr.refusal_reason[0] != '\0',
+	      "a SOG request is refused with a reason (result %d, refusal %u '%s')", (int)r, sr.refusal_code,
+	      sr.refusal_reason);
+	struct xrt_conv_state st;
+	memset(&st, 0, sizeof(st));
+	st.struct_size = (uint32_t)sizeof(st);
+	(void)iface->get_state(inst, cap->cap_id, &st);
+	check(st.state == XRT_CONV_STATE_READY, "the cap stays READY after a refused input (%s)", state_name(st.state));
+
+	free(ms.data);
+	free(rgba);
+	oc_json_free(ex);
+}
+
+
+/*
+ *
  * main.
  *
  */
@@ -1181,7 +1614,9 @@ usage(void)
 	    "         [--store DIR] [--clean-store] [--no-download] [--chunk-ms N] [--caps video,mono] [--frames N]\n"
 	    "         [--no-warm] [--expect ready|absent|version|policy]\n"
 	    "         [--expect-licence permissive|commercial|research] [--expect-download]\n"
-	    "         [--warm-timeout-ms N] [--scratch DIR] [--bench N] [--dump DIR]\n");
+	    "         [--warm-timeout-ms N] [--scratch DIR] [--bench N] [--dump DIR]\n"
+	    "         [--caps splats] [--splat-check expect.json] [--splat-image photo.ppm] [--splat-focal PX]\n"
+	    "         [--splat-out out.ply] [--expect-backend NAME] [--allow-research]\n");
 }
 
 static bool
@@ -1203,14 +1638,15 @@ cap_selected(const char *caps, uint32_t task)
 		return true;
 	}
 	return (task == XRT_CONV_TASK_DEPTH_VIDEO && strstr(caps, "video") != NULL) ||
-	       (task == XRT_CONV_TASK_DEPTH_MONO && strstr(caps, "mono") != NULL);
+	       (task == XRT_CONV_TASK_DEPTH_MONO && strstr(caps, "mono") != NULL) ||
+	       (task == XRT_CONV_TASK_SPLATS_MONO && strstr(caps, "splats") != NULL);
 }
 
 int
 main(int argc, char **argv)
 {
 	const char *path = NULL, *expect = "ready", *expect_licence = NULL, *pack = NULL, *blob_base = NULL;
-	const char *store = NULL, *caps_sel = NULL;
+	const char *store = NULL, *caps_sel = NULL, *expect_backend = NULL;
 	bool no_warm = false, expect_download = false;
 	uint32_t warm_timeout_ms = 120000, frames = 3;
 	oc_mutex_init(&g_store.lock);
@@ -1264,6 +1700,19 @@ main(int argc, char **argv)
 		} else if (strcmp(a, "--dump") == 0 && more) {
 			g_dump = argv[++i];
 			mkdir_utf8(g_dump);
+		} else if (strcmp(a, "--splat-check") == 0 && more) {
+			g_splat_check = argv[++i];
+		} else if (strcmp(a, "--splat-image") == 0 && more) {
+			g_splat_image = argv[++i];
+		} else if (strcmp(a, "--splat-focal") == 0 && more) {
+			g_splat_focal = strtof(argv[++i], NULL);
+		} else if (strcmp(a, "--splat-out") == 0 && more) {
+			g_splat_out = argv[++i];
+		} else if (strcmp(a, "--expect-backend") == 0 && more) {
+			expect_backend = argv[++i];
+		} else if (strcmp(a, "--allow-research") == 0) {
+			// The provider does not gate on licence (selection does); accepted so a
+			// test reads like the runtime's opt-in.
 		} else if (path == NULL && a[0] != '-') {
 			path = a;
 		} else {
@@ -1373,7 +1822,8 @@ main(int argc, char **argv)
 
 	uint32_t count = 0;
 	r = iface->describe_cap(inst, 0, NULL, &count);
-	check(r == XRT_SUCCESS && count == 2, "describe_cap count = %u (DEPTH_VIDEO + DEPTH_MONO)", count);
+	check(r == XRT_SUCCESS && count == 3, "describe_cap count = %u (DEPTH_VIDEO + DEPTH_MONO + SPLATS_MONO)",
+	      count);
 	if (r != XRT_SUCCESS || count == 0 || count > XRT_CONV_MAX_CAPABILITIES) {
 		return 1;
 	}
@@ -1415,7 +1865,7 @@ main(int argc, char **argv)
 		                      : strcmp(expect_licence, "commercial") == 0 ? XRT_CONV_LICENCE_COMMERCIAL
 		                                                                  : XRT_CONV_LICENCE_PERMISSIVE;
 		for (uint32_t i = 0; i < count; i++) {
-			if (!cap_selected(caps_sel, caps[i].task)) {
+			if (!cap_selected(caps_sel, caps[i].task) || caps[i].model_id[0] == '\0') {
 				continue;
 			}
 			// DirectML-backed caps are COMMERCIAL (proprietary runtime, commercial use
@@ -1438,7 +1888,11 @@ main(int argc, char **argv)
 		check(r == XRT_SUCCESS && st.state <= XRT_CONV_STATE_EVICTED,
 		      "cap %u cold state: %s (reason %u, retryable %u) '%s'", caps[i].cap_id, state_name(st.state),
 		      st.failure_reason, st.retryable, st.detail);
-		if (strcmp(expect, "absent") == 0) {
+		if (caps[i].model_id[0] == '\0') {
+			// No pack names a model for the task (the default pack has no splat model).
+			check(st.state == XRT_CONV_STATE_ABSENT, "cap %u: no model for %s -> ABSENT", caps[i].cap_id,
+			      task_name(caps[i].task));
+		} else if (strcmp(expect, "absent") == 0) {
 			check(st.state == XRT_CONV_STATE_ABSENT, "cap %u: expected ABSENT", caps[i].cap_id);
 		} else if (strcmp(expect, "version") == 0) {
 			check(st.state == XRT_CONV_STATE_FAILED && st.failure_reason == XRT_CONV_FAIL_VERSION,
@@ -1458,11 +1912,11 @@ main(int argc, char **argv)
 	// Tests that need a real blob are skipped (77) when the source is not reachable.
 	if (g_store.enabled && !g_store.no_download) {
 		for (uint32_t i = 0; i < count; i++) {
-			if (!cap_selected(caps_sel, caps[i].task)) {
+			if (!cap_selected(caps_sel, caps[i].task) || caps[i].model_id[0] == '\0') {
 				continue;
 			}
 			char ref[192];
-			snprintf(ref, sizeof(ref), "dxr-open-default/%s", caps[i].model_id);
+			snprintf(ref, sizeof(ref), "%s/%s", g_store.pack_id, caps[i].model_id);
 			oc_lock(&g_store.lock);
 			const struct blob *b = find_blob(ref);
 			const bool reachable = b != NULL && (blob_present(b) || source_available(b));
@@ -1477,7 +1931,7 @@ main(int argc, char **argv)
 	}
 
 	for (uint32_t i = 0; i < count; i++) {
-		if (!cap_selected(caps_sel, caps[i].task)) {
+		if (!cap_selected(caps_sel, caps[i].task) || caps[i].model_id[0] == '\0') {
 			continue;
 		}
 		g_watch.iface = iface;
@@ -1540,10 +1994,16 @@ main(int argc, char **argv)
 		caps[i].struct_size = (uint32_t)sizeof(caps[i]);
 		(void)iface->describe_cap(inst, i, &caps[i], NULL);
 		info("cap %u runs on '%s'", caps[i].cap_id, caps[i].backend);
-		if ((caps[i].lanes & XRT_CONV_LANE_STREAM) != 0) {
+		if (expect_backend != NULL) {
+			check(strcmp(caps[i].backend, expect_backend) == 0, "cap %u backend '%s' (expected '%s')",
+			      caps[i].cap_id, caps[i].backend, expect_backend);
+		}
+		if (caps[i].task == XRT_CONV_TASK_SPLATS_MONO) {
+			run_splat_jobs(iface, inst, &caps[i]);
+		} else if ((caps[i].lanes & XRT_CONV_LANE_STREAM) != 0) {
 			run_stream(iface, inst, &caps[i], caps[i].task == XRT_CONV_TASK_DEPTH_VIDEO ? frames : 1u);
 		}
-		if ((caps[i].lanes & XRT_CONV_LANE_JOB) != 0) {
+		if ((caps[i].lanes & XRT_CONV_LANE_JOB) != 0 && caps[i].task != XRT_CONV_TASK_SPLATS_MONO) {
 			run_job(iface, inst, &caps[i]);
 		}
 		check(iface->evict(inst, caps[i].cap_id) == XRT_SUCCESS, "evict cap %u", caps[i].cap_id);

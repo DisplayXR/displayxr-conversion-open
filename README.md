@@ -13,10 +13,11 @@ provider per task, owns every thread, queue and policy, and calls this one for p
 |---|---|---|---|---|
 | `cap_id` 1 | `DEPTH_VIDEO`, `TEMPORAL` | stream | Video Depth Anything **Small**, streaming export with an explicit per-stream temporal cache | R32F affine disparity |
 | `cap_id` 2 | `DEPTH_MONO` | stream + job | Depth Anything V2 **Small** | R32F affine disparity |
+| `cap_id` 3 | `SPLATS_MONO` | job | none in the default pack: a separate, research-only splat pack (e.g. SHARP) | 3DGS PLY ([below](#photo-to-splats-splats_mono-adr-057)) |
 
-- **Depth only.** The provider declares no `VIEWS_*` capability: the runtime composes
+- **No views.** The provider declares no `VIEWS_*` capability: the runtime composes
   `VIEWS_MONO` from a depth capability and its reference view synthesis (discovery spec §1.1,
-  §6.2).
+  §6.2). The splat capability is a separate job-lane task.
 - **Honest units.** Both models produce relative disparity — larger is nearer, unknown scale and
   shift — reported as `XRT_CONV_DEPTH_AFFINE_DISPARITY`, `PLANAR`, intrinsics `NONE`, with the
   per-frame range and 5th / 95th percentiles before any normalisation. No metric depth, focal
@@ -32,7 +33,9 @@ provider per task, owns every thread, queue and policy, and calls this one for p
   the Core ML execution provider (part of the official osx-arm64 ONNX Runtime build) runs the
   video-depth model on the GPU, with the same fallback; the still-depth model stays on the CPU
   execution provider there (see [macOS: Core ML](#macos-core-ml)). Linux uses the CPU
-  execution provider.
+  execution provider for depth. The splat capability runs on **OpenVINO** where the provider
+  ships it (Linux x86_64, Windows x64: its GPU device, else its CPU device), else on ONNX
+  Runtime ([OpenVINO](#openvino-the-splat-capabilitys-gpu-path)).
 - **Transport:** every capability imports `XRT_CONV_MEM_CPU` (RGBA8 / BGRA8, UNORM or SRGB) and
   writes a CPU R32F target; the runtime copies GPU images for it. The temporal cache stays on
   the inference device between frames.
@@ -74,18 +77,122 @@ never pre-fetch one); `--verify-store DIR` checks a model store against it.
 
 ## Licence classes
 
-`commercial` = the AND over the model, every dependency, the pack's flag and the inference
-runtime. A commercial-clean model on the CPU execution provider is `PERMISSIVE` (ONNX Runtime is
-MIT); on DirectML it is `COMMERCIAL`, because DirectML ships under Microsoft's redistributable
-licence (commercial use allowed, not an open licence). On the Core ML execution provider it stays
-`PERMISSIVE`: the execution provider is part of ONNX Runtime (MIT) and drives the operating
-system's own Core ML framework, which nothing redistributes. Anything else is `RESEARCH_ONLY`
-(`commercial_ok = 0`) and is selected only after the user opts in with `AllowResearchOnly`.
+`commercial` = the AND over the model, every dependency and the inference runtime. It is decided
+**per capability, from its own model**: the pack's `commercial` flag is the AND over all its
+models, a summary `check_model_pack.py` verifies, and a research-only model lives in its own pack,
+so it never changes another pack's class. A commercial-clean model on the CPU execution provider is
+`PERMISSIVE` (ONNX Runtime is MIT); on DirectML it is `COMMERCIAL`, because DirectML ships under
+Microsoft's redistributable licence (commercial use allowed, not an open licence). On the Core ML
+execution provider it stays `PERMISSIVE`: the execution provider is part of ONNX Runtime (MIT) and
+drives the operating system's own Core ML framework, which nothing redistributes. On OpenVINO it
+stays `PERMISSIVE` too: OpenVINO and oneTBB are Apache-2.0 (hwloc, which oneTBB's NUMA binding
+loads, is BSD-3-Clause), and the GPU device drives the system's own OpenCL driver, which nothing
+redistributes. Anything else is `RESEARCH_ONLY` (`commercial_ok = 0`) and is selected only after
+the user opts in with `AllowResearchOnly`: a SHARP pack (Apple's research-only model licence,
+which follows derivatives) is `RESEARCH_ONLY` on every backend.
+
+## Photo to splats (`SPLATS_MONO`, ADR-057)
+
+`cap_id` 3 turns one photo into a 3D Gaussian splat on the **job lane** (one photo in, one
+blob out, progress and cancel), for whatever model the packs name under `defaults["splats-mono"]`.
+The default pack names none: a splat model is a separate, research-only pack (Apple's SHARP is
+`packs/dxr-open-sharp.models.json`, model `sharp-int4-1536`), so without it the capability is
+`ABSENT` and costs nothing. It is job-only and never prewarmed (the runtime's default `Prewarm`
+tasks do not include it, and its warm runs no warm-up inference).
+
+**The model contract** (pack `io` block, `splat_format: "sharp-projective"`): input `image`
+`[1,3,H,W]` float in `[0,1]` (sRGB values; the whole picture resampled to the model's fixed grid,
+aspect not kept) and `disparity_factor` `[1]` = focal px / input width; outputs `means`
+`[1,N,3]` in the projective frame (`x_ndc·z, y_ndc·z, z`), `scales` `[1,N,3]`, `rotations`
+`[1,N,4]` (w x y z, unnormalised), `colors` `[1,N,3]` (linear RGB) and `opacities` `[1,N]`. The
+tensor names come from `io.tensors`, the grid from `io.input.resolution`, the count from
+`io.output.count`. The model file must be **one** `.onnx` (no external-data side file): the
+model store keeps each blob under its sha256, where a side file could not be found.
+
+**What a job does:**
+
+1. **Preprocess** — the RGBA8 / BGRA8 photo is resampled into the grid with a separable
+   triangle filter whose support widens with the downscale (an antialiased bilinear, like
+   Pillow's `BILINEAR`), so a 6000-px photo does not alias into 1536 px.
+2. **Focal** — `params.focal_px` when the job says it is given (`XRT_CONV_JOB_FOCAL_GIVEN`; it
+   wins over everything); otherwise the model's own convention, a 30 mm full-frame equivalent
+   (`30 · diag / 43.27` px), **labelled `ASSUMED`**. The provider receives decoded pixels and
+   never reads EXIF.
+3. **Inference** — OpenVINO GPU, else OpenVINO CPU, else ONNX Runtime's CPU execution provider
+   (below). The run is asynchronous and polls `is_cancelled` every 100 ms on OpenVINO.
+4. **Postprocess** — unproject through the input's intrinsics, `D = diag(w/2f, h/2f, 1)`:
+   `mean' = D·mean`, `cov' = D·R·diag(s²)·Rᵀ·D`, re-diagonalised per Gaussian (the scale
+   differs in x and y) into scales and a rotation; linear colours to sRGB degree-0 harmonics,
+   opacity to its logit, scales to logs. Written straight into the sink as a binary
+   little-endian **3DGS PLY** (`x y z f_dc_0..2 opacity scale_0..2 rot_0..3`, 56 bytes per
+   Gaussian), the format every 3DGS viewer and the runtime's spec-3 path read. Any other
+   requested format is refused (`XRT_CONV_REFUSAL_UNSUPPORTED_INPUT`, the job fails, the
+   capability stays `READY`).
+
+**Facts, never intent** (`xrt_conv_splat_info` + `xrt_conv_splat_result`, discovery spec §2.6):
+OpenCV axes; `metric = 0` (a monocular model's scale through a focal that may be assumed is not
+metres) and therefore no baseline, near, far or focus distance in metres; the intrinsics the cloud
+was actually unprojected through (`fx = fy = f`, `cx = w/2`, `cy = h/2`, grid = the input's
+`w × h`, `GIVEN` or `ASSUMED`); the splat count; and a **build stamp** with every result
+(provider version + source revision, `<pack>/<model>@<version>`, the blob's sha256, the backend
+and its version, host `LOCAL`). One **suggestion**, labelled `NEAREST_CLUMP`: the
+opacity-weighted 10th percentile of depth over the central half of the frame, as a point in the
+splat's own units. The provider never writes a camera block; auto-convergence stays runtime
+policy.
+
+## OpenVINO (the splat capability's GPU path)
+
+On Linux x86_64 and Windows x64 the provider ships **OpenVINO 2026.4.1** (Apache-2.0) in an
+`openvino/` folder next to its binary: the core, the C API, the ONNX and IR front ends, the CPU
+and GPU device plug-ins and oneTBB (~140 MB). It is loaded at run time **by absolute path**
+through its C API (`openvino/c/openvino.h`; on Linux each library is mapped in dependency order,
+because the official libraries carry no `RUNPATH`), never linked, and only on the first warm that
+needs it: `probe` checks that the files are there, nothing more.
+
+- **Why the native C API, not ONNX Runtime's OpenVINO execution provider.** OpenVINO reads the
+  4-bit ONNX (ONNX Runtime's `MatMulNBits` contrib operator) directly, so no conversion step is
+  needed, and its own compiled-model cache (`CACHE_DIR`) turns a ~15 s GPU compile into a
+  ~2 s import. The execution provider would add a second inference runtime on top: Microsoft
+  does not ship it in the official ONNX Runtime packages (it comes as Intel's
+  `onnxruntime-openvino` build, which bundles its own OpenVINO), so it would mean replacing the
+  pinned ONNX Runtime with a different, larger build, for no extra coverage. Intel's own
+  archives are versioned, hash-pinnable and redistributable (Apache-2.0), like ONNX Runtime's.
+- **Device:** `OV_DEVICE` `auto` (default) = the GPU device when OpenVINO reports one, else its
+  CPU device; `gpu` / `cpu` force one. The GPU device drives the system's OpenCL driver (Linux:
+  `libOpenCL.so.1` + Intel's compute runtime, e.g. Ubuntu `ocl-icd-libopencl1` +
+  `intel-opencl-icd`); without it OpenVINO reports no GPU and the capability runs on its CPU
+  device.
+- **Fallback, re-described at each step:** OpenVINO GPU → OpenVINO CPU → ONNX Runtime CPU (when
+  OpenVINO is missing, too old, or fails to load). A compile that fails moves the capability on
+  and retries within the same `warm`; a run that fails after a good warm drops the session, moves
+  the capability on and reports `FAILED(DEVICE_LOST, retryable)`, so the runtime re-warms there —
+  the same pattern as DirectML and Core ML. Too old = below 2025.0 (`FAILED` is never claimed for
+  a missing library: `ABSENT` moves to the next backend).
+- **Compiled-model cache:** under the host's scratch directory (`get_path(XRT_CONV_PATH_SCRATCH)`)
+  in `openvino-<version>/` (`OV_CACHE=0` disables it). OpenVINO names each blob by a hash of the
+  model and the device configuration and recompiles when one does not import, so a blob left by a
+  killed process is replaced rather than trusted; the scratch directory may be deleted at any time.
+- **macOS** builds carry no OpenVINO: the splat capability runs on ONNX Runtime there.
+
+## Getting a splat model (`conv models fetch`, the export script)
+
+Research-only weights are **never bundled, mirrored or pre-fetched** (ADR-057 §5), and the
+installers download no model. A SHARP pack's blob is built on the user's machine from Apple's
+official checkpoint by `scripts/export_sharp.py` (it downloads the checkpoint, verifies its
+SHA-256, exports and 4-bit-quantises it, and writes the bytes the pack pins into the model store);
+see that script for its requirements and the licence it asks you to accept. A pack whose model has
+a downloadable source is fetched the usual way, `displayxr-cli conv models fetch <pack>
+--model <name>` (the same action as the Dashboard's Download button). Either way the runtime
+selects the capability only with `AllowResearchOnly` (`displayxr-cli conv run … --allow-research-only`
+for one run).
 
 ## Build
 
-Plain CMake and a C11 compiler; the build fetches ONNX Runtime (and DirectML on Windows) as
-pinned release archives and checks their SHA-256 before extracting.
+Plain CMake and a C11 compiler; the build fetches ONNX Runtime (the official NuGet packages:
+`Microsoft.ML.OnnxRuntime.DirectML` on Windows, `Microsoft.ML.OnnxRuntime` elsewhere), DirectML
+on Windows and OpenVINO on Linux x86_64 / Windows x64 (Intel's release archives) as pinned
+archives and checks their SHA-256 before extracting. `-DOPENCONV_OPENVINO=OFF` builds without
+OpenVINO.
 
 ```
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -95,8 +202,8 @@ ctest --test-dir build --output-on-failure
 
 On Windows, run this from a Visual Studio 2022 developer prompt. Output in `build/`:
 `DisplayXR-OpenConversion.dll` (`.so` / `.dylib`), `onnxruntime.dll` (+ `DirectML.dll`;
-`libonnxruntime.so.1` / `libonnxruntime.dylib` on POSIX) and `dxr-open-default.models.json` —
-the files that ship together, flat in one folder. The provider exports exactly one symbol,
+`libonnxruntime.so.1` / `libonnxruntime.dylib` on POSIX), `openvino/` (Linux x86_64, Windows
+x64) and every `packs/*.models.json` — the files that ship together. The provider exports exactly one symbol,
 `xrtConversionPluginNegotiate`, links the C runtime statically and imports only `KERNEL32` and
 `dxgi` (Windows). `-DOPENCONV_WERROR=ON` turns warnings into errors, as CI does.
 `-DOPENCONV_DOWNLOAD_DIR=<dir>` keeps the fetched archives across build trees.
@@ -214,6 +321,10 @@ protocol, without network.
 | `download-ready-video` | the same for the video model, four frames with a reset mid-stream | yes |
 | `check-model-pack`, `check-model-pack-research` | the pack validator on both packs | no (Python) |
 | `default-ep` (`-DOPENCONV_TEST_GPU=ON`) | both capabilities on the default execution provider (DirectML on Windows, Core ML on macOS) | yes |
+| `splats-tiny-model` | writes a tiny synthetic splat model with the real I/O contract, its pack and the expected output (`tests/make_tiny_splat_model.py`; needs the `onnx` Python package, skipped without it) | no |
+| `splats-cpu` | the splat lane on ONNX Runtime's CPU EP: download → `READY`, three jobs (focal given: every sampled Gaussian equals an independent numpy unprojection; no focal: `ASSUMED` 30 mm equivalent; a SOG request: refused, the cap stays `READY`), PLY header + count, facts, build stamp | no |
+| `splats-openvino-cpu` | the same on OpenVINO's CPU device (no GPU needed), backend `openvino-cpu` | no |
+| `splats-default-ep` (`-DOPENCONV_TEST_GPU=ON -DOPENCONV_TEST_SPLAT_MODEL=<.onnx> [-DOPENCONV_TEST_SPLAT_IMAGE=<.ppm>]`) | a real splat model you built yourself, on the default backend (OpenVINO GPU where there is one); nothing is fetched | yes (yours) |
 
 The synthetic scene is a perspective checkerboard floor under a sky. The checks are statistics,
 not bytes (execution providers differ in the last bits): every texel finite, the reported range
@@ -243,13 +354,16 @@ environment, else `Settings\<KEY>` under the registry row (Windows) or the manif
 |---|---|---|
 | `ENABLE` | `0` | `probe` declines |
 | `QUALITY` | `low`, `medium` (default), `high` | which model `defaults[task]` names (low = the 364-px video model) |
-| `EP` | `auto` (default), `cpu`, `dml`, `coreml` | `cpu` forces the CPU execution provider; `auto` = DirectML on Windows, Core ML on macOS (each falls back to the CPU) |
+| `EP` | `auto` (default), `cpu`, `dml`, `coreml`, `openvino` | `cpu` forces the CPU execution provider; `auto` = DirectML on Windows, Core ML on macOS (each falls back to the CPU), and OpenVINO for the splat capability where it ships (`openvino` is the same for it; the depth capabilities never use OpenVINO) |
+| `OV_DEVICE` | `auto` (default), `gpu`, `cpu` | the OpenVINO device of the splat capability (`auto` = the GPU when OpenVINO reports one) |
+| `OV_CACHE` | `0` | no OpenVINO compiled-model cache, even when the host provides a scratch directory |
+| `OPENVINO` | absolute path | another OpenVINO runtime folder (default: `openvino/` next to the binary) |
 | `COREML_UNITS` | `gpu` (default), `all`, `ane`, `cpu` | macOS: the Core ML compute units (CPU + GPU, + the Neural Engine, CPU + Neural Engine, CPU only) |
 | `COREML_CACHE` | `0` | macOS: no compiled-model cache, even when the host provides a scratch directory |
 | `ORT_LOG` | `warning` (default), `info`, `verbose` | how much of ONNX Runtime's log is printed (`verbose` shows the Core ML node assignment) |
 | `THREADS` | integer (default 4) | CPU intra-op threads; 0 = ONNX Runtime's default (every core) |
 | `GRAPH_OPT` | `basic`, `extended` (default), `all` | ONNX Runtime graph optimisation (`all` fails to load the fp16 still-depth model on the CPU execution provider of 1.24.4) |
-| `PACK` | absolute path | another pack manifest (default: `dxr-open-default.models.json` next to the binary) |
+| `PACK` | absolute paths, `;`-separated | the pack manifests (default: `dxr-open-default.models.json` and every other `*.models.json` next to the binary) |
 | `ONNXRUNTIME` | absolute path | another ONNX Runtime library (default: next to the binary) |
 
 ## Releases and installing
@@ -264,9 +378,18 @@ A `vX.Y.Z` tag builds and attaches (unsigned):
   non-allowlisted component — 0.1.0 shipped without the row and was never loaded). It downloads
   no model; the runtime model store fetches blobs by URL and SHA-256 on first use. The uninstaller
   removes only this provider's row, its allowlist row and files, never the model store.
-- `displayxr-open-conversion-<version>-linux-x86_64.tar.gz` (CPU): `install.sh` copies the payload
-  to `${XDG_DATA_HOME:-~/.local/share}/DisplayXR/OpenConversion` and writes the JSON manifest.
-  `uninstall.sh` removes both.
+- `displayxr-open-conversion-<version>-linux-x86_64.tar.gz` (CPU, + OpenVINO for the splat
+  capability): `install.sh` copies the payload (including `openvino/`) to
+  `${XDG_DATA_HOME:-~/.local/share}/DisplayXR/OpenConversion` and writes the JSON manifest, whose
+  `packs` lists every pack shipped. OpenVINO's runtime is bundled (a pinned, hash-checked Intel
+  archive built on Ubuntu 22.04, so it runs on 22.04 / 24.04 / 26.04), not taken from a distro
+  or Intel apt package: neither Ubuntu nor Debian packages OpenVINO, and Intel's apt repository
+  would make a user-level tarball need root and a third-party repository. What stays a system
+  dependency is the GPU driver, which nothing should bundle: `install.sh` prints a note when no
+  OpenCL loader is present (the capability then runs on OpenVINO's CPU device). `uninstall.sh`
+  removes both.
+- Neither package carries a splat model's weights; the Windows installer lists the splat pack in
+  `Packs` when the build ships it.
 
 ## Registration
 
@@ -294,12 +417,15 @@ flight per provider (no capability opts into overlap); `get_provider_status`, `d
 
 ## The ABI it builds against
 
-`include/xrt/` is vendored **verbatim** from the runtime's `main` at `v2.42.0-68-g6cffa48b3`
-(`src/xrt/include/xrt/xrt_conversion_plugin.h`, `xrt_results.h`, `xrt_conv_wire.h`):
-conversion-provider ABI major `XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT` = **1**,
-binary-identical to the `v2.42.0` release (the difference is comments only). The provider uses
-`xrt_conversion_plugin.h` and `xrt_results.h`; `xrt_conv_wire.h` is the runtime's IPC wire,
-vendored for reference and compile-checked only. Update by copying from a runtime release.
+`include/xrt/` is vendored **verbatim** from the runtime's `v2.69.4` release
+(`src/xrt/include/xrt/xrt_conversion_plugin.h`, `xrt_component_settings.h`,
+`xrt_component_license.h`, `xrt_results.h`, `xrt_conv_wire.h`): conversion-provider ABI major
+`XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT` = **1**, with the ADR-057 splat result
+(`xrt_conv_splat_result`, `XRT_CONVERSION_PLUGIN_HAS_SPLAT_RESULT`) and `describe_settings`
+(`displayxr-cli conv options open-conversion` lists every key above). The provider uses
+`xrt_conversion_plugin.h` (with the two component headers it includes) and `xrt_results.h`;
+`xrt_conv_wire.h` is the runtime's IPC wire, vendored for reference and compile-checked only.
+Update by copying from a runtime release.
 
 ## Licence
 

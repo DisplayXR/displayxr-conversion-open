@@ -536,6 +536,81 @@ fail:
 	return classify(err);
 }
 
+static void
+release_values(const OrtApi *api, OrtValue **v, uint32_t n)
+{
+	for (uint32_t i = 0; i < n; i++) {
+		if (v[i] != NULL) {
+			api->ReleaseValue(v[i]);
+			v[i] = NULL;
+		}
+	}
+}
+
+enum oc_run_status
+oc_session_run_named(struct oc_session *s,
+                     const struct oc_tensor_in *in,
+                     uint32_t in_count,
+                     struct oc_tensor_out *out,
+                     uint32_t out_count,
+                     char *err,
+                     size_t err_size)
+{
+	const OrtApi *api = s->ort->api;
+	enum
+	{
+		MAX_IO = 8
+	};
+	OrtValue *ins[MAX_IO] = {0}, *res[MAX_IO] = {0};
+	const char *in_names[MAX_IO], *out_names[MAX_IO];
+	if (in_count > MAX_IO || out_count > MAX_IO) {
+		snprintf(err, err_size, "too many tensors");
+		return OC_RUN_FAILED;
+	}
+	for (uint32_t i = 0; i < in_count; i++) {
+		size_t n = 1;
+		for (uint32_t d = 0; d < in[i].rank; d++) {
+			n *= (size_t)in[i].shape[d];
+		}
+		in_names[i] = in[i].name;
+		TRY(api->CreateTensorWithDataAsOrtValue(s->cpu_mem, (void *)in[i].data, n * sizeof(float), in[i].shape,
+		                                        in[i].rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &ins[i]));
+	}
+	for (uint32_t i = 0; i < out_count; i++) {
+		out_names[i] = out[i].name;
+	}
+	TRY(api->Run(s->session, NULL, in_names, (const OrtValue *const *)ins, in_count, out_names, out_count, res));
+	for (uint32_t i = 0; i < out_count; i++) {
+		OrtTensorTypeAndShapeInfo *info = NULL;
+		size_t count = 0;
+		ONNXTensorElementDataType type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+		float *data = NULL;
+		TRY(api->GetTensorTypeAndShape(res[i], &info));
+		const bool ok = status_ok(api, api->GetTensorShapeElementCount(info, &count), err, err_size) &&
+		                status_ok(api, api->GetTensorElementType(info, &type), err, err_size);
+		api->ReleaseTensorTypeAndShapeInfo(info);
+		if (!ok) {
+			goto fail;
+		}
+		if (type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || count > out[i].capacity) {
+			snprintf(err, err_size, "output %s: %zu elements of type %d (capacity %zu floats)", out[i].name,
+			         count, (int)type, out[i].capacity);
+			goto fail;
+		}
+		TRY(api->GetTensorMutableData(res[i], (void **)&data));
+		memcpy(out[i].data, data, count * sizeof(float));
+		out[i].count = count;
+	}
+	release_values(api, res, MAX_IO);
+	release_values(api, ins, MAX_IO);
+	return OC_RUN_OK;
+
+fail:
+	release_values(api, res, MAX_IO);
+	release_values(api, ins, MAX_IO);
+	return classify(err);
+}
+
 enum oc_run_status
 oc_temporal_run(struct oc_session *s,
                 struct oc_temporal **state,

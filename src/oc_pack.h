@@ -61,11 +61,18 @@ struct oc_pack_model
 	float mean[3], std[3];
 
 	/* io.output */
-	char depth_kind[32]; //!< "affine-disparity", …
-	char measure[16];    //!< "planar" / "ray"
+	char depth_kind[32];   //!< "affine-disparity", … (depth tasks)
+	char measure[16];      //!< "planar" / "ray"
+	char coords[16];       //!< splat tasks: "opencv" (+x right, +y down, +z forward)
+	char splat_format[32]; //!< splat tasks: the raw output's layout, "sharp-projective" (oc_splat.h)
+	char color_space[16];  //!< splat tasks: "linear" (default) / "srgb": the colors output's encoding
+	uint32_t splat_count;  //!< splat tasks: Gaussians per result (io.output.count); 0 = undeclared
 
 	/* io.tensors */
 	char t_image[64], t_depth[64], t_cache_in[64], t_cache_out[64], t_is_first[64];
+	/* io.tensors, splat tasks: the focal input and the five Gaussian outputs. */
+	char t_disparity_factor[64]; //!< [1] float = focal_px / input width
+	char t_means[64], t_scales[64], t_quats[64], t_colors[64], t_opacities[64];
 
 	/* io.state (temporal models) */
 	int64_t cache_shape[4];

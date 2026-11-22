@@ -18,6 +18,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "oc_tensor.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -39,6 +41,9 @@ enum oc_ep
 	OC_EP_CPU = 0,
 	OC_EP_DML = 1,    //!< Windows
 	OC_EP_COREML = 2, //!< macOS (Apple silicon)
+	//! OpenVINO (oc_ov.h, not ONNX Runtime): the splat capability only, on an
+	//! OpenVINO device (GPU, else CPU).
+	OC_EP_OPENVINO = 3,
 };
 
 /*! Core ML compute units (MLComputeUnits): where Core ML may place the graph. */
@@ -155,6 +160,17 @@ oc_session_run_image(struct oc_session *s,
                      size_t out_capacity,
                      uint32_t *out_w,
                      uint32_t *out_h,
+                     char *err,
+                     size_t err_size);
+
+/*! Named float inputs -> named float outputs (the splat capability's run on
+ *  the ONNX Runtime back end). Outputs are copied into the caller's buffers. */
+enum oc_run_status
+oc_session_run_named(struct oc_session *s,
+                     const struct oc_tensor_in *in,
+                     uint32_t in_count,
+                     struct oc_tensor_out *out,
+                     uint32_t out_count,
                      char *err,
                      size_t err_size);
 

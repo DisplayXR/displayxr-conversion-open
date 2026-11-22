@@ -26,6 +26,20 @@ dest=$data/OpenConversion
 mkdir -p "$dest" "$data/DisplayProcessors"
 cp -a "$here/payload/." "$dest/"
 ver=$(cat "$here/VERSION")
+# Every pack the payload carries (the default pack, and the research-only splat pack when the
+# build ships it: a manifest only, never weights). The runtime's model store serves these.
+packs=""
+for p in "$dest"/*.models.json; do
+	[ -e "$p" ] || continue
+	packs="${packs:+$packs, }\"$p\""
+done
+# OpenVINO's GPU device needs the system's OpenCL loader and the Intel GPU compute driver
+# (Ubuntu: ocl-icd-libopencl1 + intel-opencl-icd). Without them the splat capability runs on
+# OpenVINO's CPU device: say so, never install system packages from a user-level script.
+if [ -d "$dest/openvino" ] && ! /sbin/ldconfig -p 2>/dev/null | grep -q 'libOpenCL\.so\.1'; then
+	echo "note: no OpenCL loader (libOpenCL.so.1): photo-to-splat runs on the CPU." >&2
+	echo "      For the Intel GPU: sudo apt install ocl-icd-libopencl1 intel-opencl-icd" >&2
+fi
 tmp=$(mktemp "$data/DisplayProcessors/.oc.XXXXXX")
 cat > "$tmp" <<JSON
 {
@@ -37,7 +51,7 @@ cat > "$tmp" <<JSON
         "version":      "$ver",
         "binary_path":  "$dest/DisplayXR-OpenConversion.so",
         "probe_order":  200,
-        "packs": [ "$dest/dxr-open-default.models.json" ]
+        "packs": [ $packs ]
     }
 }
 JSON

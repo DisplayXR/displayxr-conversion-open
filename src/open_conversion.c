@@ -4,15 +4,21 @@
  * @file
  * @brief  DisplayXR open-model conversion provider (ADR-053, ProbeOrder 200).
  *
- * Two capabilities, both depth-only; the runtime composes views from them
- * with its reference view synthesis (discovery spec §1.1, §6.2):
+ * Three capabilities. Two are depth-only, and the runtime composes views from
+ * them with its reference view synthesis (discovery spec §1.1, §6.2); the
+ * third turns one photo into a 3D Gaussian splat (ADR-057):
  *
  *   cap 1  DEPTH_VIDEO  stream lane, TEMPORAL: a small streaming video-depth
  *                       model with an explicit per-stream temporal cache.
  *   cap 2  DEPTH_MONO   stream + job lanes: a small still-depth model.
+ *   cap 3  SPLATS_MONO  job lane: photo -> 3DGS PLY, from whatever model the
+ *                       packs name for "splats-mono" (none in the default
+ *                       pack: a splat model is a separate, user-installed pack).
  *
- * Inference runs through ONNX Runtime, loaded at run time from the provider's
- * own directory: the DirectML execution provider on Windows when a hardware
+ * The splat capability runs through OpenVINO when the provider ships it
+ * (oc_ov.h; its GPU device, else its CPU device, else ONNX Runtime's CPU
+ * execution provider). Everything else runs through ONNX Runtime, loaded at
+ * run time from the provider's own directory: the DirectML execution provider on Windows when a hardware
  * adapter is there, the Core ML execution provider on macOS, the CPU
  * execution provider everywhere else (and as the fallback when DirectML or
  * Core ML cannot start or a Core ML run fails). Both models report affine disparity
@@ -39,8 +45,10 @@
 
 #include "oc_image.h"
 #include "oc_ort.h"
+#include "oc_ov.h"
 #include "oc_pack.h"
 #include "oc_platform.h"
+#include "oc_splat.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -55,12 +63,21 @@
  */
 
 #define OC_ID "open-conversion"
-#define OC_VERSION "0.1.0"
+#define OC_VERSION "0.2.0"
+#ifndef OC_BUILD_COMMIT
+#define OC_BUILD_COMMIT "unknown" //!< the build's source revision (CMake passes the git describe)
+#endif
 #define OC_PACK_FILE "dxr-open-default.models.json"
+#define OC_PACK_SUFFIX ".models.json"
+#define OC_MAX_PACKS 4u
+#define OC_PACK_LIST_SEP ';' //!< setting PACK: absolute paths separated by ';'
 
-#define OC_CAP_VIDEO 1u //!< DEPTH_VIDEO
-#define OC_CAP_MONO 2u  //!< DEPTH_MONO
-#define OC_CAP_COUNT 2u
+#define OC_CAP_VIDEO 1u  //!< DEPTH_VIDEO
+#define OC_CAP_MONO 2u   //!< DEPTH_MONO
+#define OC_CAP_SPLATS 3u //!< SPLATS_MONO
+#define OC_CAP_COUNT 3u
+#define OC_MAX_SPLAT_INPUT_EDGE 8192u //!< the runtime downscales above it; the splat model resamples to its grid
+#define OC_ASSUMED_FOCAL_MM 30.0      //!< no focal given: a 30 mm full-frame equivalent, labelled ASSUMED
 
 #define OC_MAX_STREAMS_VIDEO 2u //!< each holds a temporal cache of ~160 MB (518 px model)
 #define OC_MAX_STREAMS_MONO 4u
@@ -100,10 +117,12 @@ struct oc_cap
 	uint32_t max_streams;
 
 	/* Describe fields: written in probe and on an EP fallback, under `lock`. */
-	const struct oc_pack_model *model;     //!< NULL: the pack has no usable model for the task
+	const struct oc_pack *pack;            //!< the pack that names model
+	const struct oc_pack_model *model;     //!< NULL: no pack has a usable model for the task
 	const struct oc_pack_variant *variant; //!< the blob variant for the EP below
 	char ref[192];                         //!< "<pack>/<model>/<variant>"
 	enum oc_ep ep;
+	char ov_device[8]; //!< OC_EP_OPENVINO: "GPU" or "CPU"
 	char backend[32];
 	uint64_t device_luid;
 	uint32_t licence_class;
@@ -118,7 +137,8 @@ struct oc_cap
 	char version[48];
 
 	/* [S]-only. */
-	struct oc_session *session;
+	struct oc_session *session;       //!< ONNX Runtime
+	struct oc_ov_session *ov_session; //!< OpenVINO (the splat capability)
 };
 
 struct oc_stream
@@ -141,30 +161,46 @@ struct oc_provider
 	/* Configuration (probe). */
 	char module_dir[1024];
 	char ort_path[1100];
-	char pack_path[1100];
 	char quality[16];
 	char ep_setting[16];
+	char ov_device_setting[8]; //!< "auto", "gpu", "cpu"
+	char ov_dir[1100];         //!< the OpenVINO runtime folder
+	char scratch[1100];        //!< the host's per-provider scratch dir; "" = none
 	int threads;
 	enum oc_graph_opt opt;
 	enum oc_ort_log ort_log;
 	enum oc_coreml_units coreml_units;
 	char coreml_cache[1100]; //!< under the host's scratch dir; empty = no compiled-model cache
+	bool ov_cache;           //!< keep OpenVINO's compiled models under the scratch dir
 
 	/* Dependencies. */
-	struct oc_pack *pack; //!< NULL: missing / invalid
-	char pack_error[160];
+	struct oc_pack *packs[OC_MAX_PACKS]; //!< the default pack first, then the others by name
+	uint32_t pack_count;                 //!< 0: none usable
+	char pack_error[200];
 	struct oc_ort *ort; //!< NULL until loaded; never unloaded
 	enum oc_ort_status ort_status;
 	char ort_detail[128];
 	int dml_device;
 	uint64_t dml_luid;
 	bool coreml_cache_ready; //!< the cache directory exists and was swept (first use)
+	enum oc_ep default_ep;   //!< the ONNX Runtime EP the depth capabilities use (choose_ep)
+
+	/* OpenVINO: located in probe (a file check), loaded on the first warm that needs it. */
+	bool ov_present;
+	struct oc_ov *ov; //!< NULL until loaded; never unloaded
+	enum oc_ov_status ov_status;
+	char ov_detail[128];
+	bool ov_devices_known;
+	bool ov_has_gpu;
+	char ov_gpu_name[96];
 
 	/* [S]-only scratch, grown on demand. */
 	float *chw;
 	size_t chw_cap;
 	float *map;
 	size_t map_cap;
+	float *gauss; //!< the splat model's five outputs, back to back
+	size_t gauss_cap;
 };
 
 static const struct xrt_conversion_plugin_host_iface *g_host = NULL;
@@ -373,13 +409,43 @@ inference_grid(const struct oc_pack_model *m, uint32_t w, uint32_t h, uint32_t *
 static const char *
 ep_pack_name(enum oc_ep ep)
 {
-	return ep == OC_EP_DML ? "dml" : ep == OC_EP_COREML ? "coreml" : "cpu";
+	return ep == OC_EP_DML ? "dml" : ep == OC_EP_COREML ? "coreml" : ep == OC_EP_OPENVINO ? "openvino" : "cpu";
 }
 
 static const char *
 ep_display_name(enum oc_ep ep)
 {
-	return ep == OC_EP_DML ? "DirectML" : ep == OC_EP_COREML ? "Core ML" : "CPU";
+	return ep == OC_EP_DML        ? "DirectML"
+	       : ep == OC_EP_COREML   ? "Core ML"
+	       : ep == OC_EP_OPENVINO ? "OpenVINO"
+	                              : "CPU";
+}
+
+static bool
+is_splats(const struct oc_cap *c)
+{
+	return c->task == XRT_CONV_TASK_SPLATS_MONO;
+}
+
+static bool
+has_session(const struct oc_cap *c)
+{
+	return c->session != NULL || c->ov_session != NULL;
+}
+
+/*! The model `defaults[task][quality]` names, in the first pack that names one. */
+static const struct oc_pack_model *
+default_model(const struct oc_provider *p, const char *task, const struct oc_pack **out_pack)
+{
+	for (uint32_t i = 0; i < p->pack_count; i++) {
+		const struct oc_pack_model *m = oc_pack_default_model(p->packs[i], task, p->quality);
+		if (m != NULL) {
+			*out_pack = p->packs[i];
+			return m;
+		}
+	}
+	*out_pack = NULL;
+	return NULL;
 }
 
 /*! Describe-time fields for a cap on an EP, from its pack model. Caller holds `lock` or is in probe. */
@@ -388,9 +454,15 @@ bind_cap_locked(struct oc_provider *p, struct oc_cap *c, enum oc_ep ep)
 {
 	c->model = NULL;
 	c->variant = NULL;
+	c->pack = NULL;
 	c->ref[0] = '\0';
-	const struct oc_pack_model *m =
-	    p->pack != NULL ? oc_pack_default_model(p->pack, c->task_name, p->quality) : NULL;
+	if (ep == OC_EP_OPENVINO && (!is_splats(c) || !p->ov_present)) {
+		// OpenVINO serves the splat capability only (the depth capabilities
+		// keep their ONNX Runtime paths, including the temporal binding).
+		ep = p->default_ep;
+	}
+	const struct oc_pack *pk = NULL;
+	const struct oc_pack_model *m = default_model(p, c->task_name, &pk);
 	const struct oc_pack_variant *v = NULL;
 	if (m != NULL) {
 		v = oc_pack_variant_for_ep(m, ep_pack_name(ep));
@@ -402,10 +474,12 @@ bind_cap_locked(struct oc_provider *p, struct oc_cap *c, enum oc_ep ep)
 		}
 	}
 	c->ep = ep;
+	const bool ov_gpu = strcmp(c->ov_device, "GPU") == 0;
 	oc_copy_str(c->backend, sizeof(c->backend),
-	            ep == OC_EP_DML      ? "onnxruntime-dml"
-	            : ep == OC_EP_COREML ? "onnxruntime-coreml"
-	                                 : "onnxruntime-cpu");
+	            ep == OC_EP_DML        ? "onnxruntime-dml"
+	            : ep == OC_EP_COREML   ? "onnxruntime-coreml"
+	            : ep == OC_EP_OPENVINO ? (ov_gpu ? "openvino-gpu" : "openvino-cpu")
+	                                   : "onnxruntime-cpu");
 	c->device_luid = ep == OC_EP_DML ? p->dml_luid : 0;
 	if (m == NULL || v == NULL) {
 		c->licence_class = XRT_CONV_LICENCE_UNKNOWN;
@@ -414,19 +488,24 @@ bind_cap_locked(struct oc_provider *p, struct oc_cap *c, enum oc_ep ep)
 		c->depth_measure = XRT_CONV_MEASURE_PLANAR;
 		return;
 	}
+	c->pack = pk;
 	c->model = m;
 	c->variant = v;
-	oc_pack_ref(p->pack, m, v, c->ref, sizeof(c->ref));
+	oc_pack_ref(pk, m, v, c->ref, sizeof(c->ref));
 	c->depth_kind = depth_kind_from(m->depth_kind);
 	c->depth_measure = strcmp(m->measure, "ray") == 0 ? XRT_CONV_MEASURE_RAY : XRT_CONV_MEASURE_PLANAR;
-	// Commercial = AND over the model, its dependencies, the pack's own flag and
-	// the inference runtime (ONNX Runtime: MIT). DirectML ships under Microsoft's
-	// redistributable licence: commercial use is allowed, but it is not an open
-	// licence, so a DirectML-backed capability is COMMERCIAL, a CPU one PERMISSIVE.
-	// The Core ML execution provider is part of ONNX Runtime (MIT) and drives the
-	// operating system's own Core ML framework, which nothing redistributes: a
-	// Core ML-backed capability stays PERMISSIVE.
-	const bool commercial = p->pack->commercial && m->commercial;
+	// Commercial = AND over the model, its dependencies and the inference runtime
+	// (ONNX Runtime: MIT; OpenVINO: Apache-2.0). The pack's own flag is the AND
+	// over all its models, a summary the validator checks; one capability's
+	// class is its own model's, so a research-only pack never taints another
+	// pack's models. DirectML ships under Microsoft's redistributable licence:
+	// commercial use is allowed, but it is not an open licence, so a
+	// DirectML-backed capability is COMMERCIAL, a CPU one PERMISSIVE. The Core ML
+	// execution provider is part of ONNX Runtime (MIT) and drives the operating
+	// system's own Core ML framework, which nothing redistributes: a Core ML-backed
+	// capability stays PERMISSIVE. OpenVINO's GPU device drives the system's own
+	// OpenCL driver, which nothing redistributes either: PERMISSIVE.
+	const bool commercial = m->commercial;
 	c->commercial_ok = commercial ? 1u : 0u;
 	c->licence_class = !commercial       ? XRT_CONV_LICENCE_RESEARCH_ONLY
 	                   : ep == OC_EP_DML ? XRT_CONV_LICENCE_COMMERCIAL
@@ -439,8 +518,22 @@ model_usable(const struct oc_cap *c, char *why, size_t why_size)
 {
 	const struct oc_pack_model *m = c->model;
 	if (m == NULL) {
-		snprintf(why, why_size, "the model pack has no %s model for this backend", c->task_name);
+		snprintf(why, why_size, "no model pack has a %s model for this backend", c->task_name);
 		return false;
+	}
+	if (is_splats(c)) {
+		if (!m->fixed || m->t_image[0] == '\0' || m->t_disparity_factor[0] == '\0' || m->t_means[0] == '\0' ||
+		    m->t_scales[0] == '\0' || m->t_quats[0] == '\0' || m->t_colors[0] == '\0' ||
+		    m->t_opacities[0] == '\0') {
+			snprintf(why, why_size, "pack model %s lacks a fixed grid or the splat tensor names", m->name);
+			return false;
+		}
+		if (strcmp(m->splat_format, "sharp-projective") != 0 || strcmp(m->coords, "opencv") != 0) {
+			snprintf(why, why_size, "pack model %.40s: only splat_format sharp-projective, coords opencv",
+			         m->name);
+			return false;
+		}
+		return true;
 	}
 	if (depth_kind_from(m->depth_kind) == XRT_CONV_DEPTH_UNKNOWN || m->t_image[0] == '\0' ||
 	    m->t_depth[0] == '\0') {
@@ -546,25 +639,40 @@ choose_ep(struct oc_provider *p)
 	return OC_EP_DML;
 }
 
+/*! The splat capability's backend: OpenVINO when the provider ships it (its
+ *  GPU device unless OV_DEVICE says cpu; warm checks the device is really
+ *  there), else the ONNX Runtime EP the depth capabilities use. */
+static enum oc_ep
+choose_splat_ep(struct oc_provider *p, struct oc_cap *c)
+{
+	oc_copy_str(c->ov_device, sizeof(c->ov_device), strcmp(p->ov_device_setting, "cpu") == 0 ? "CPU" : "GPU");
+	if (strcmp(p->ep_setting, "cpu") == 0 || strcmp(p->ep_setting, "dml") == 0 ||
+	    strcmp(p->ep_setting, "coreml") == 0) {
+		return p->default_ep;
+	}
+	return p->ov_present ? OC_EP_OPENVINO : p->default_ep; // "auto" and "openvino"
+}
+
 /*! Readiness of a cold cap from the store, without loading anything. */
 static void
 initial_state(struct oc_provider *p, struct oc_cap *c)
 {
 	char why[XRT_CONV_DETAIL_MAX];
-	if (p->ort_status == OC_ORT_ABSENT) {
+	if (c->ep == OC_EP_OPENVINO) {
+		// Bound to OpenVINO only while it is there (probe: the files; warm: the
+		// load). A failed load already moved the capability to ONNX Runtime.
+	} else if (p->ort_status == OC_ORT_ABSENT) {
 		set_state(p, c, XRT_CONV_STATE_ABSENT, XRT_CONV_FAIL_NONE, 0, -1.0f, p->ort_detail);
 		return;
-	}
-	if (p->ort_status == OC_ORT_TOO_OLD) {
+	} else if (p->ort_status == OC_ORT_TOO_OLD) {
 		// Present but older than our floor: VERSION, never MODEL ("too old", not "missing").
 		set_state(p, c, XRT_CONV_STATE_FAILED, XRT_CONV_FAIL_VERSION, 1, -1.0f, p->ort_detail);
 		return;
-	}
-	if (p->ort_status != OC_ORT_OK) {
+	} else if (p->ort_status != OC_ORT_OK) {
 		set_state(p, c, XRT_CONV_STATE_FAILED, XRT_CONV_FAIL_LOAD, 0, -1.0f, p->ort_detail);
 		return;
 	}
-	if (p->pack == NULL) {
+	if (p->pack_count == 0) {
 		set_state(p, c, XRT_CONV_STATE_ABSENT, XRT_CONV_FAIL_NONE, 0, -1.0f, p->pack_error);
 		return;
 	}
@@ -581,6 +689,96 @@ initial_state(struct oc_provider *p, struct oc_cap *c)
 	const bool present = loc.state == XRT_CONV_STATE_READY;
 	snprintf(why, sizeof(why), "%s: cold%s", c->model->name, present ? "" : "; the model downloads on first use");
 	set_state(p, c, XRT_CONV_STATE_INSTALLED, XRT_CONV_FAIL_NONE, 0, -1.0f, why);
+}
+
+/*! Load one pack into the next slot; false (and a reason in pack_error) when unusable. */
+static bool
+load_pack(struct oc_provider *p, const char *path)
+{
+	if (p->pack_count >= OC_MAX_PACKS) {
+		return false;
+	}
+	struct oc_pack *pk = (struct oc_pack *)calloc(1, sizeof(*pk));
+	if (pk == NULL) {
+		return false;
+	}
+	char err[160] = "";
+	if (!oc_pack_load(path, pk, err, sizeof(err))) {
+		snprintf(p->pack_error, sizeof(p->pack_error), "model pack unusable: %s", err);
+		fprintf(stderr, "[open-conversion] %s\n", p->pack_error);
+		free(pk);
+		return false;
+	}
+	for (uint32_t i = 0; i < p->pack_count; i++) {
+		if (strcmp(p->packs[i]->pack, pk->pack) == 0) {
+			fprintf(stderr, "[open-conversion] pack %s listed twice (%s); the first wins\n", pk->pack,
+			        path);
+			free(pk);
+			return false;
+		}
+	}
+	p->packs[p->pack_count++] = pk;
+	return true;
+}
+
+/*!
+ * The packs: setting PACK (absolute paths separated by ';'), else every
+ * "*.models.json" next to the binary, the default pack first. A research-only
+ * model (a splat model, say) ships as its own pack, so the default pack stays
+ * commercial-clean; the host's store serves every pack the registration lists.
+ */
+static void
+load_packs(struct oc_provider *p)
+{
+	char buf[OC_MAX_PACKS * 1100];
+	snprintf(p->pack_error, sizeof(p->pack_error), "no model pack found");
+	if (setting("PACK", buf, sizeof(buf))) {
+		char *item = buf;
+		while (item != NULL && *item != '\0') {
+			char *next = strchr(item, OC_PACK_LIST_SEP);
+			if (next != NULL) {
+				*next++ = '\0';
+			}
+			if (*item != '\0') {
+				(void)load_pack(p, item);
+			}
+			item = next;
+		}
+		return;
+	}
+	char path[1200];
+	snprintf(path, sizeof(path), "%.1000s%c%s", p->module_dir, OC_PATH_SEP, OC_PACK_FILE);
+	(void)load_pack(p, path);
+	static char names[16][128];
+	const uint32_t n = oc_list_dir(p->module_dir, OC_PACK_SUFFIX, &names[0][0], sizeof(names[0]), 16);
+	for (uint32_t i = 0; i < n; i++) {
+		if (strcmp(names[i], OC_PACK_FILE) != 0) {
+			snprintf(path, sizeof(path), "%.1000s%c%.127s", p->module_dir, OC_PATH_SEP, names[i]);
+			(void)load_pack(p, path);
+		}
+	}
+}
+
+//! Is the OpenVINO runtime there (its C API library)? A file check only.
+static bool
+ov_located(struct oc_provider *p)
+{
+#if defined(_WIN32)
+	const char *lib = "openvino_c.dll";
+#elif defined(__APPLE__)
+	const char *lib = "libopenvino_c.dylib";
+#else
+	const char *lib = "libopenvino_c.so." OC_OV_SOVERSION;
+#endif
+	char path[1300];
+	snprintf(path, sizeof(path), "%s%c%s", p->ov_dir, OC_PATH_SEP, lib);
+	const bool there = oc_file_exists(path);
+	oc_lock(&p->lock);
+	p->ov_status = there ? OC_OV_OK : OC_OV_ABSENT;
+	snprintf(p->ov_detail, sizeof(p->ov_detail), there ? "OpenVINO present (not loaded yet)" : "no OpenVINO (%s)",
+	         p->ov_dir);
+	oc_unlock(&p->lock);
+	return there;
 }
 
 static xrt_result_t
@@ -608,9 +806,13 @@ oc_probe(struct xrt_conversion_plugin_instance **out_inst)
 		oc_copy_str(p->quality, sizeof(p->quality), buf);
 	}
 	oc_copy_str(p->ep_setting, sizeof(p->ep_setting), "auto");
-	if (setting("EP", buf, sizeof(buf)) &&
-	    (strcmp(buf, "cpu") == 0 || strcmp(buf, "dml") == 0 || strcmp(buf, "coreml") == 0)) {
+	if (setting("EP", buf, sizeof(buf)) && (strcmp(buf, "cpu") == 0 || strcmp(buf, "dml") == 0 ||
+	                                        strcmp(buf, "coreml") == 0 || strcmp(buf, "openvino") == 0)) {
 		oc_copy_str(p->ep_setting, sizeof(p->ep_setting), buf);
+	}
+	oc_copy_str(p->ov_device_setting, sizeof(p->ov_device_setting), "auto");
+	if (setting("OV_DEVICE", buf, sizeof(buf)) && (strcmp(buf, "gpu") == 0 || strcmp(buf, "cpu") == 0)) {
+		oc_copy_str(p->ov_device_setting, sizeof(p->ov_device_setting), buf);
 	}
 	// CPU + GPU by default: the measured configuration. "all" / "ane" let Core ML
 	// use the Neural Engine, whose first-use compile runs in a system service
@@ -626,10 +828,17 @@ oc_probe(struct xrt_conversion_plugin_instance **out_inst)
 	// in the host's per-provider scratch directory (never the model store), keyed
 	// by the ONNX Runtime version below it. No scratch directory = no cache.
 	p->coreml_cache[0] = '\0';
-	if (!(setting("COREML_CACHE", buf, sizeof(buf)) && strtoul(buf, NULL, 10) == 0) &&
-	    host_path(XRT_CONV_PATH_SCRATCH, buf, sizeof(buf))) {
-		oc_copy_str(p->coreml_cache, sizeof(p->coreml_cache), buf);
+	p->scratch[0] = '\0';
+	if (host_path(XRT_CONV_PATH_SCRATCH, buf, sizeof(buf))) {
+		oc_copy_str(p->scratch, sizeof(p->scratch), buf);
 	}
+	if (!(setting("COREML_CACHE", buf, sizeof(buf)) && strtoul(buf, NULL, 10) == 0)) {
+		oc_copy_str(p->coreml_cache, sizeof(p->coreml_cache), p->scratch);
+	}
+	// OpenVINO compiles a model for its device on the first session; the compiled
+	// blob is kept the same way (under the scratch dir, keyed by the OpenVINO
+	// version below it), so a later warm imports it in seconds.
+	p->ov_cache = !(setting("OV_CACHE", buf, sizeof(buf)) && strtoul(buf, NULL, 10) == 0);
 	p->ort_log = OC_ORT_LOG_WARNING;
 	if (setting("ORT_LOG", buf, sizeof(buf))) {
 		p->ort_log = strcmp(buf, "verbose") == 0 ? OC_ORT_LOG_VERBOSE
@@ -654,29 +863,21 @@ oc_probe(struct xrt_conversion_plugin_instance **out_inst)
 	} else {
 		snprintf(p->ort_path, sizeof(p->ort_path), "%s%c%s", p->module_dir, OC_PATH_SEP, oc_ort_library_name());
 	}
-	if (setting("PACK", buf, sizeof(buf))) {
-		oc_copy_str(p->pack_path, sizeof(p->pack_path), buf);
+	if (setting("OPENVINO", buf, sizeof(buf))) {
+		oc_copy_str(p->ov_dir, sizeof(p->ov_dir), buf);
 	} else {
-		snprintf(p->pack_path, sizeof(p->pack_path), "%s%c%s", p->module_dir, OC_PATH_SEP, OC_PACK_FILE);
+		snprintf(p->ov_dir, sizeof(p->ov_dir), "%s%c%s", p->module_dir, OC_PATH_SEP, oc_ov_dir_name());
 	}
 
-	// The pack (a small JSON file, read and closed here).
-	p->pack = (struct oc_pack *)calloc(1, sizeof(*p->pack));
-	if (p->pack == NULL) {
-		free(p);
-		return XRT_ERROR_ALLOCATION;
-	}
-	char err[160] = "";
-	if (!oc_pack_load(p->pack_path, p->pack, err, sizeof(err))) {
-		snprintf(p->pack_error, sizeof(p->pack_error), "model pack unusable: %s", err);
-		free(p->pack);
-		p->pack = NULL;
-	}
+	// The packs (small JSON files, read and closed here).
+	load_packs(p);
 
 	// The inference runtime: mapping it is not a model load, and probe must be
-	// able to say ABSENT / FAILED(VERSION) up front.
+	// able to say ABSENT / FAILED(VERSION) up front. OpenVINO is only located
+	// here (a file check): its first load and device query happen in warm.
 	load_runtime(p);
-	const enum oc_ep ep = p->ort != NULL ? choose_ep(p) : OC_EP_CPU;
+	p->default_ep = p->ort != NULL ? choose_ep(p) : OC_EP_CPU;
+	p->ov_present = ov_located(p);
 
 	struct oc_cap *v = &p->caps[0];
 	v->cap_id = OC_CAP_VIDEO;
@@ -688,11 +889,17 @@ oc_probe(struct xrt_conversion_plugin_instance **out_inst)
 	m->task = XRT_CONV_TASK_DEPTH_MONO;
 	m->task_name = "depth-mono";
 	m->max_streams = OC_MAX_STREAMS_MONO;
+	struct oc_cap *g = &p->caps[2];
+	g->cap_id = OC_CAP_SPLATS;
+	g->task = XRT_CONV_TASK_SPLATS_MONO;
+	g->task_name = "splats-mono";
+	g->max_streams = 0; // job lane only
 	for (uint32_t i = 0; i < OC_CAP_COUNT; i++) {
-		p->caps[i].state = XRT_CONV_STATE_UNKNOWN;
-		p->caps[i].progress = -1.0f;
-		bind_cap_locked(p, &p->caps[i], ep);
-		initial_state(p, &p->caps[i]);
+		struct oc_cap *c = &p->caps[i];
+		c->state = XRT_CONV_STATE_UNKNOWN;
+		c->progress = -1.0f;
+		bind_cap_locked(p, c, is_splats(c) ? choose_splat_ep(p, c) : p->default_ep);
+		initial_state(p, c);
 	}
 
 	oc_lock(&g_global_lock);
@@ -714,6 +921,45 @@ fill_cap(struct oc_provider *p, const struct oc_cap *c, struct xrt_conv_capabili
 	} while (0)
 	oc_lock(&p->lock);
 	const bool video = c->task == XRT_CONV_TASK_DEPTH_VIDEO;
+	if (is_splats(c)) {
+		const struct oc_pack_model *m = c->model;
+		C(cap_id, c->cap_id);
+		C(task, c->task);
+		C(lanes, XRT_CONV_LANE_JOB);
+		C(input_kinds, XRT_CONV_INPUT_MONO);
+		C(outputs, XRT_CONV_OUT_SPLAT_BLOB);
+		C(flags, XRT_CONV_CAP_USES_MODEL_STORE | XRT_CONV_CAP_NEEDS_NETWORK_TO_WARM);
+		C(import_memory_kinds, XRT_CONV_MEM_CPU);
+		C(import_sync_kinds, 1u << XRT_CONV_SYNC_NONE);
+		C(input_formats, (1u << XRT_CONV_FMT_RGBA8_UNORM) | (1u << XRT_CONV_FMT_RGBA8_SRGB) |
+		                     (1u << XRT_CONV_FMT_BGRA8_UNORM) | (1u << XRT_CONV_FMT_BGRA8_SRGB));
+		C(depth_output_format, 0u);
+		C(min_views, 0u);
+		C(max_views, 0u);
+		C(max_streams, 0u);
+		C(max_concurrent, 1u);
+		C(max_input_edge, OC_MAX_SPLAT_INPUT_EDGE);
+		C(preferred_input_edge, m != NULL ? (m->width > m->height ? m->width : m->height) : 0u);
+		C(depth_kind, XRT_CONV_DEPTH_UNKNOWN);
+		C(depth_measure, 0u);
+		// GIVEN when the job carries a focal length, else a labelled 30 mm equivalent.
+		C(intrinsics_source, XRT_CONV_INTRINSICS_ASSUMED);
+		C(splat_formats, 1u << XRT_CONV_BLOB_PLY_3DGS);
+		C(licence_class, c->licence_class);
+		C(commercial_ok, c->commercial_ok);
+		S(licence_spdx, m != NULL ? m->spdx : "");
+		S(model_id, m != NULL ? m->name : "");
+		S(model_version, m != NULL ? m->version : "");
+		S(backend, c->backend);
+		S(display_name, "Open photo to splats");
+		C(device_luid, 0ull);
+		C(est_warmup_ms, 0u);
+		C(est_latency_ms, 0u);
+		C(est_vram_mb, 0u);
+		C(est_ram_mb, 0u);
+		oc_unlock(&p->lock);
+		return;
+	}
 	C(cap_id, c->cap_id);
 	C(task, c->task);
 	C(lanes, video ? XRT_CONV_LANE_STREAM : (XRT_CONV_LANE_STREAM | XRT_CONV_LANE_JOB));
@@ -875,6 +1121,10 @@ release_session(struct oc_provider *p, struct oc_cap *c)
 		oc_session_destroy(c->session);
 		c->session = NULL;
 	}
+	if (c->ov_session != NULL) {
+		oc_ov_session_destroy(c->ov_session);
+		c->ov_session = NULL;
+	}
 }
 
 /*! Move a cap to the CPU execution provider after DirectML / Core ML could not
@@ -891,6 +1141,87 @@ fall_back_to_cpu(struct oc_provider *p, struct oc_cap *c, const char *why)
 	fprintf(stderr, "[open-conversion] %s: %s unavailable (%s); using the CPU\n", c->task_name,
 	        ep_display_name(from), why);
 	notify(0);
+}
+
+/*! The next backend after @p c's current one failed: OpenVINO GPU → OpenVINO
+ *  CPU → ONNX Runtime CPU (re-described each step). Sticky for the process. */
+static void
+fall_back(struct oc_provider *p, struct oc_cap *c, const char *why)
+{
+	if (c->ep == OC_EP_OPENVINO && strcmp(c->ov_device, "GPU") == 0) {
+		oc_lock(&p->lock);
+		oc_copy_str(c->ov_device, sizeof(c->ov_device), "CPU");
+		bind_cap_locked(p, c, OC_EP_OPENVINO);
+		p->generation++;
+		oc_unlock(&p->lock);
+		fprintf(stderr,
+		        "[open-conversion] %s: the OpenVINO GPU device is unavailable (%s); using its CPU device\n",
+		        c->task_name, why);
+		notify(0);
+		return;
+	}
+	fall_back_to_cpu(p, c, why);
+}
+
+//! Is the runtime @p c is bound to loaded?
+static bool
+runtime_ready(const struct oc_provider *p, const struct oc_cap *c)
+{
+	return c->ep == OC_EP_OPENVINO ? p->ov != NULL : p->ort != NULL;
+}
+
+/*! Load OpenVINO and learn its devices (first warm that needs it). A failed
+ *  load moves the capability to ONNX Runtime; no GPU device moves it to
+ *  OpenVINO's CPU device. Both re-describe. */
+static void
+prepare_openvino(struct oc_provider *p, struct oc_cap *c)
+{
+	if (c->ep != OC_EP_OPENVINO) {
+		return;
+	}
+	if (p->ov == NULL) {
+		struct oc_ov *ov = NULL;
+		char detail[128];
+		const enum oc_ov_status s = oc_ov_load(p->ov_dir, &ov, detail, sizeof(detail));
+		oc_lock(&p->lock);
+		p->ov = ov;
+		p->ov_status = s;
+		oc_copy_str(p->ov_detail, sizeof(p->ov_detail), detail);
+		oc_unlock(&p->lock);
+		fprintf(stderr, "[open-conversion] %s\n", detail);
+		if (ov == NULL) {
+			p->ov_present = false; // not usable in this process
+			fall_back_to_cpu(p, c, detail);
+			return;
+		}
+	}
+	if (!p->ov_devices_known) {
+		p->ov_has_gpu = oc_ov_has_device(p->ov, "GPU", p->ov_gpu_name, sizeof(p->ov_gpu_name));
+		p->ov_devices_known = true;
+		if (p->ov_has_gpu) {
+			fprintf(stderr, "[open-conversion] OpenVINO GPU: %s\n", p->ov_gpu_name);
+		}
+	}
+	if (strcmp(c->ov_device, "GPU") == 0 && !p->ov_has_gpu) {
+		fall_back(p, c, "no GPU device");
+	}
+}
+
+//! OpenVINO's compiled-model cache dir (created on first use); NULL = none.
+static const char *
+ov_cache_dir(struct oc_provider *p, char *buf, size_t size)
+{
+	if (!p->ov_cache || p->scratch[0] == '\0' || p->ov == NULL) {
+		return NULL;
+	}
+	// Keyed by the OpenVINO version (a blob from another version is not imported
+	// anyway, but this keeps an upgrade from accumulating dead blobs in one dir).
+	snprintf(buf, size, "%s%copenvino-%s", p->scratch, OC_PATH_SEP, oc_ov_version(p->ov));
+	if (!oc_make_dir(buf)) {
+		fprintf(stderr, "[open-conversion] cannot create the OpenVINO cache %s; compiling every warm\n", buf);
+		return NULL;
+	}
+	return buf;
 }
 
 /*! The Core ML compiled-model cache directory for this ONNX Runtime, created
@@ -949,6 +1280,18 @@ create_session(
     struct oc_provider *p, struct oc_cap *c, const char *path, struct coreml_cache_txn *txn, char *err, size_t err_size)
 {
 	memset(txn, 0, sizeof(*txn));
+	if (c->ep == OC_EP_OPENVINO) {
+		// OpenVINO's cache (CACHE_DIR) names each blob by a hash of the model and
+		// the device configuration, and recompiles when a cached blob does not
+		// import: the transaction the Core ML cache needs is OpenVINO's own.
+		char dir[1300];
+		const char *cache = ov_cache_dir(p, dir, sizeof(dir));
+		const bool cpu = strcmp(c->ov_device, "CPU") == 0;
+		return oc_ov_session_create(p->ov, path, c->ov_device, cache, cpu ? p->threads : 0, &c->ov_session, err,
+		                            err_size)
+		           ? OC_RUN_OK
+		           : OC_RUN_FAILED;
+	}
 	struct oc_ep_config epc = {
 	    .dml_device = p->dml_device,
 	    .coreml_units = p->coreml_units,
@@ -1027,7 +1370,7 @@ oc_warm(struct xrt_conversion_plugin_instance *inst, uint32_t cap_id, bool (*is_
 	if (is_cancelled == NULL) {
 		is_cancelled = never_cancelled;
 	}
-	if (state_of(p, c) == XRT_CONV_STATE_READY && c->session != NULL) {
+	if (state_of(p, c) == XRT_CONV_STATE_READY && has_session(c)) {
 		return XRT_SUCCESS;
 	}
 
@@ -1036,13 +1379,17 @@ oc_warm(struct xrt_conversion_plugin_instance *inst, uint32_t cap_id, bool (*is_
 		load_runtime(p);
 		if (p->ort != NULL) {
 			oc_lock(&p->lock);
-			bind_cap_locked(p, c, choose_ep(p));
+			p->default_ep = choose_ep(p);
+			if (c->ep != OC_EP_OPENVINO) {
+				bind_cap_locked(p, c, p->default_ep);
+			}
 			p->generation++;
 			oc_unlock(&p->lock);
 		}
 	}
+	prepare_openvino(p, c);
 	char why[XRT_CONV_DETAIL_MAX];
-	if (p->ort == NULL || p->pack == NULL || !model_usable(c, why, sizeof(why))) {
+	if (!runtime_ready(p, c) || p->pack_count == 0 || !model_usable(c, why, sizeof(why))) {
 		initial_state(p, c);
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED; // terminal for now; the runtime falls through
 	}
@@ -1136,10 +1483,16 @@ resolve:
 		set_state(p, c, XRT_CONV_STATE_INSTALLED, XRT_CONV_FAIL_NONE, 0, -1.0f, why);
 		return XRT_TIMEOUT;
 	}
-	if (r == OC_RUN_OK) {
+	if (r == OC_RUN_OK && !is_splats(c)) {
+		// The splat capability is job-only and runs seconds per job: its first
+		// job pays the first-inference cost instead of every warm.
 		snprintf(why, sizeof(why), "%s: first inference (%s)", m->name, c->backend);
 		set_state(p, c, XRT_CONV_STATE_WARMING, XRT_CONV_FAIL_NONE, 0, 0.6f, why);
 		r = warm_up_inference(p, c, err, sizeof(err));
+	}
+	if (r == OC_RUN_OK && c->ep == OC_EP_OPENVINO) {
+		fprintf(stderr, "[open-conversion] %s: OpenVINO %s compiled in %llu ms\n", m->name, c->ov_device,
+		        (unsigned long long)load_ms);
 	}
 	if (r != OC_RUN_OK) {
 		release_session(p, c); // before the cache dir it may have mapped is removed
@@ -1149,8 +1502,12 @@ resolve:
 		// DirectML / Core ML could not start (driver, feature level, an operator,
 		// a Core ML compile failure): the CPU execution provider serves the same model.
 		release_session(p, c);
-		fall_back_to_cpu(p, c, err);
+		fall_back(p, c, err);
 		m = c->model;
+		if (!runtime_ready(p, c)) {
+			initial_state(p, c); // e.g. OpenVINO gone and no ONNX Runtime either
+			return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+		}
 		if (m != NULL && c->variant != NULL) {
 			requested = false;
 			absent_since = 0;
@@ -1171,8 +1528,14 @@ resolve:
 	}
 
 	oc_lock(&p->lock);
-	// 24 + 1 + 8 + 5 + 9 + NUL fits version[48].
-	snprintf(c->version, sizeof(c->version), "%.24s@%.8s ort %.9s", m->name, m->version, oc_ort_version(p->ort));
+	// 24 + 1 + 8 + 4 + 9 + NUL fits version[48].
+	if (c->ep == OC_EP_OPENVINO) {
+		snprintf(c->version, sizeof(c->version), "%.24s@%.8s ov %.9s", m->name, m->version,
+		         oc_ov_version(p->ov));
+	} else {
+		snprintf(c->version, sizeof(c->version), "%.24s@%.8s ort %.9s", m->name, m->version,
+		         oc_ort_version(p->ort));
+	}
 	oc_unlock(&p->lock);
 	if (c->ep == OC_EP_COREML && reported) {
 		snprintf(why, sizeof(why), "%s: ready (%s, %u/%u nodes)", m->name, c->backend, taken, total);
@@ -1330,7 +1693,7 @@ oc_stream_create(struct xrt_conversion_plugin_instance *inst,
 	if (c == NULL || info == NULL || out_stream == NULL || !COVERS(info, struct xrt_conv_stream_info, input_kind)) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
-	if (state_of(p, c) != XRT_CONV_STATE_READY || c->session == NULL) {
+	if (state_of(p, c) != XRT_CONV_STATE_READY || c->session == NULL || is_splats(c)) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED; // the runtime creates streams only on a READY cap
 	}
 	if ((info->input_kind & XRT_CONV_INPUT_MONO) == 0) {
@@ -1487,6 +1850,283 @@ oc_stream_destroy(struct xrt_conversion_plugin_instance *inst, uint64_t stream)
  *
  */
 
+/*
+ *
+ * Job lane (SPLATS_MONO): one photo in, one 3DGS PLY blob out, plus the facts.
+ *
+ */
+
+struct splat_sink
+{
+	struct xrt_conv_blob_sink *sink;
+	uint64_t written;
+};
+
+static bool
+splat_sink_write(void *ctx, const void *bytes, uint64_t count)
+{
+	struct splat_sink *s = (struct splat_sink *)ctx;
+	if (!s->sink->write(s->sink->ctx, bytes, count)) {
+		return false;
+	}
+	s->written += count;
+	return true;
+}
+
+//! A refused input: the job fails with no blob, the capability stays READY (ADR-057 §4).
+static xrt_result_t
+splat_refuse(struct xrt_conv_job_out *out, uint32_t code, const char *reason, xrt_result_t r)
+{
+	struct xrt_conv_splat_result *sr =
+	    out != NULL && COVERS(out, struct xrt_conv_job_out, splat_result) ? out->splat_result : NULL;
+	if (sr != NULL) {
+		SET(sr, struct xrt_conv_splat_result, refusal_code, code);
+		if (COVERS(sr, struct xrt_conv_splat_result, refusal_reason)) {
+			oc_copy_str(sr->refusal_reason, sizeof(sr->refusal_reason), reason);
+		}
+	}
+	fprintf(stderr, "[open-conversion] splats-mono: refused: %s\n", reason);
+	return r;
+}
+
+//! The build stamp: which build answered (returned with every result, failed or not).
+static void
+splat_stamp(struct oc_provider *p, const struct oc_cap *c, struct xrt_conv_splat_result *sr)
+{
+	if (sr == NULL) {
+		return;
+	}
+#define STAMP(FIELD, ...)                                                                                              \
+	do {                                                                                                           \
+		if (COVERS(sr, struct xrt_conv_splat_result, FIELD)) {                                                 \
+			snprintf(sr->FIELD, sizeof(sr->FIELD), __VA_ARGS__);                                           \
+		}                                                                                                      \
+	} while (0)
+	STAMP(build_provider, "%s %s %.36s", OC_ID, OC_VERSION, OC_BUILD_COMMIT);
+	if (c->model != NULL && c->pack != NULL) {
+		STAMP(build_model_id, "%.24s/%.24s@%.12s", c->pack->pack, c->model->name, c->model->version);
+	}
+	if (c->variant != NULL) {
+		STAMP(build_model_sha256, "%.64s", c->variant->file.sha256);
+	}
+	STAMP(build_runtime, "%s", c->backend);
+	STAMP(build_runtime_version, "%.30s", c->ep == OC_EP_OPENVINO ? oc_ov_version(p->ov) : oc_ort_version(p->ort));
+	STAMP(build_host_id, "%s", "");
+#undef STAMP
+	SET(sr, struct xrt_conv_splat_result, host_kind, XRT_CONV_HOST_KIND_LOCAL);
+	SET(sr, struct xrt_conv_splat_result, valid, XRT_CONV_SPLAT_VALID_BUILD);
+}
+
+static xrt_result_t
+splat_job(struct oc_provider *p,
+          struct oc_cap *c,
+          const struct xrt_conv_job_in *in,
+          const struct xrt_conv_params *params,
+          const struct xrt_conv_job_control *ctl,
+          struct xrt_conv_job_out *out)
+{
+	if (in == NULL || ctl == NULL || !COVERS(in, struct xrt_conv_job_in, images) ||
+	    !COVERS(ctl, struct xrt_conv_job_control, is_cancelled)) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	struct xrt_conv_splat_result *sr =
+	    out != NULL && COVERS(out, struct xrt_conv_job_out, splat_result) ? out->splat_result : NULL;
+	splat_stamp(p, c, sr);
+	if (state_of(p, c) != XRT_CONV_STATE_READY || !has_session(c) || c->model == NULL) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	const struct oc_pack_model *m = c->model;
+	if (COVERS(in, struct xrt_conv_job_in, input_kind) && (in->input_kind & XRT_CONV_INPUT_MONO) == 0) {
+		return splat_refuse(out, XRT_CONV_REFUSAL_UNSUPPORTED_INPUT, "one photo only (no stereo pair)",
+		                    XRT_ERROR_INPUT_UNSUPPORTED);
+	}
+	const uint32_t requested =
+	    COVERS(in, struct xrt_conv_job_in, requested_blob_format) ? in->requested_blob_format : 0u;
+	if (requested != 0 && requested != XRT_CONV_BLOB_PLY_3DGS) {
+		return splat_refuse(out, XRT_CONV_REFUSAL_UNSUPPORTED_INPUT, "this provider writes 3DGS PLY only",
+		                    XRT_ERROR_OUTPUT_UNSUPPORTED);
+	}
+	const struct xrt_conv_image *color = find_color(
+	    in->images, COVERS(in, struct xrt_conv_job_in, image_role) ? in->image_role : NULL, in->image_count);
+	if (color == NULL) {
+		return splat_refuse(out, XRT_CONV_REFUSAL_UNSUPPORTED_INPUT, "no CPU RGBA8 / BGRA8 colour image",
+		                    XRT_ERROR_INPUT_UNSUPPORTED);
+	}
+	struct xrt_conv_blob_sink *sink = NULL;
+	for (uint32_t i = 0; i < ctl->sink_count && ctl->sinks != NULL; i++) {
+		if (ctl->sinks[i].role == XRT_CONV_OUT_SPLAT_BLOB) {
+			sink = &ctl->sinks[i];
+			break;
+		}
+	}
+	if (sink == NULL || sink->begin == NULL || sink->write == NULL) {
+		return XRT_ERROR_OUTPUT_UNSUPPORTED;
+	}
+	bool (*cancelled)(void *) = ctl->is_cancelled != NULL ? ctl->is_cancelled : never_cancelled;
+
+	// Focal length, in the input's pixels: GIVEN wins; otherwise the model's own
+	// convention (a 30 mm full-frame equivalent), labelled ASSUMED. Never EXIF
+	// here: the provider receives decoded pixels.
+	const uint32_t w = color->width, h = color->height;
+	const uint32_t flags = COVERS(in, struct xrt_conv_job_in, job_flags) ? in->job_flags : 0u;
+	const float given =
+	    params != NULL && COVERS(params, struct xrt_conv_params, focal_px) ? params->focal_px : 0.0f;
+	const bool focal_given =
+	    given > 0.0f && isfinite(given) &&
+	    ((flags & XRT_CONV_JOB_FOCAL_GIVEN) != 0 || !COVERS(in, struct xrt_conv_job_in, job_flags));
+	const float focal =
+	    focal_given
+	        ? given
+	        : (float)(OC_ASSUMED_FOCAL_MM * sqrt((double)w * w + (double)h * h) / sqrt(36.0 * 36.0 + 24.0 * 24.0));
+
+	// 1. Preprocess: the whole picture into the model's grid.
+	if (ctl->progress != NULL) {
+		ctl->progress(ctl->ctx, 0.0f, "preprocess");
+	}
+	const uint32_t gw = m->width, gh = m->height;
+	if (!grow(&p->chw, &p->chw_cap, (size_t)gw * gh * 3u)) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	const uint32_t stride = color->row_stride != 0 ? color->row_stride : w * 4u;
+	if (!oc_resample_rgb_aa((const uint8_t *)color->cpu_ptr, stride, w, h, is_bgr(color->format), gw, gh, p->chw)) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	if (cancelled(ctl->ctx)) {
+		return XRT_SUCCESS; // cancelled: nothing written, the runtime reports it
+	}
+
+	// 2. Inference.
+	const size_t n_max = m->splat_count != 0 ? m->splat_count : (size_t)gw * gh;
+	if (!grow(&p->gauss, &p->gauss_cap, n_max * 14u)) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	const float disparity_factor = focal / (float)w;
+	const int64_t image_shape[4] = {1, 3, (int64_t)gh, (int64_t)gw};
+	const int64_t factor_shape[1] = {1};
+	const struct oc_tensor_in ins[2] = {
+	    {m->t_image, p->chw, image_shape, 4},
+	    {m->t_disparity_factor, &disparity_factor, factor_shape, 1},
+	};
+	float *g = p->gauss;
+	struct oc_tensor_out outs[5] = {
+	    {m->t_means, g, n_max * 3u, 0},
+	    {m->t_scales, g + n_max * 3u, n_max * 3u, 0},
+	    {m->t_quats, g + n_max * 6u, n_max * 4u, 0},
+	    {m->t_colors, g + n_max * 10u, n_max * 3u, 0},
+	    {m->t_opacities, g + n_max * 13u, n_max, 0},
+	};
+	if (ctl->progress != NULL) {
+		ctl->progress(ctl->ctx, 0.05f, "infer");
+	}
+	char err[XRT_CONV_DETAIL_MAX] = "";
+	const uint64_t t0 = oc_now_ms();
+	bool ran = false;
+	if (c->ov_session != NULL) {
+		const enum oc_ov_run r =
+		    oc_ov_run(c->ov_session, ins, 2, outs, 5, cancelled, ctl->ctx, err, sizeof(err));
+		if (r == OC_OV_RUN_CANCELLED) {
+			return XRT_SUCCESS;
+		}
+		ran = r == OC_OV_RUN_OK;
+	} else {
+		const enum oc_run_status r = oc_session_run_named(c->session, ins, 2, outs, 5, err, sizeof(err));
+		if (r == OC_RUN_OUT_OF_MEMORY) {
+			fprintf(stderr, "[open-conversion] %s: inference failed: %s\n", m->name, err);
+			return XRT_ERROR_ALLOCATION;
+		}
+		ran = r == OC_RUN_OK;
+	}
+	const uint64_t infer_ms = oc_now_ms() - t0;
+	if (!ran) {
+		fprintf(stderr, "[open-conversion] %s: inference failed (%s): %s\n", m->name, c->backend, err);
+		if (c->ep != OC_EP_CPU) {
+			// An accelerator run failed after a good warm: drop the session, move the
+			// cap to the next backend (re-describe) and report the accelerator gone;
+			// the runtime re-warms there. No silent retry inside a job (§2.4).
+			char why[XRT_CONV_DETAIL_MAX];
+			release_session(p, c);
+			fall_back(p, c, err);
+			snprintf(why, sizeof(why), "%.40s: run failed; re-warms on %.24s", m->name, c->backend);
+			set_state(p, c, XRT_CONV_STATE_FAILED, XRT_CONV_FAIL_DEVICE_LOST, 1, -1.0f, why);
+		}
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	const size_t n = outs[4].count;
+	if (n == 0 || outs[0].count != n * 3u || outs[1].count != n * 3u || outs[2].count != n * 4u ||
+	    outs[3].count != n * 3u) {
+		fprintf(stderr, "[open-conversion] %s: inconsistent Gaussian outputs (%zu / %zu / %zu / %zu / %zu)\n",
+		        m->name, outs[0].count, outs[1].count, outs[2].count, outs[3].count, outs[4].count);
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	if (cancelled(ctl->ctx)) {
+		return XRT_SUCCESS;
+	}
+
+	// 3. Postprocess straight into the sink.
+	if (ctl->progress != NULL) {
+		ctl->progress(ctl->ctx, 0.8f, "write");
+	}
+	const struct oc_splat_raw raw = {
+	    .means = g,
+	    .scales = g + n_max * 3u,
+	    .quats = g + n_max * 6u,
+	    .colors = g + n_max * 10u,
+	    .opacities = g + n_max * 13u,
+	    .count = n,
+	    .colors_linear = strcmp(m->color_space, "srgb") != 0,
+	};
+	struct splat_sink ss = {sink, 0};
+	struct oc_splat_stats st;
+	const uint64_t t1 = oc_now_ms();
+	if (!sink->begin(sink->ctx, XRT_CONV_BLOB_PLY_3DGS, oc_splat_ply_size(n))) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	if (!oc_splat_write_ply(&raw, w, h, focal, splat_sink_write, &ss, cancelled, ctl->ctx, &st)) {
+		return cancelled(ctl->ctx) ? XRT_SUCCESS : XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	fprintf(stderr,
+	        "[open-conversion] %s: %zu Gaussians from %ux%u (focal %.1f px, %s) on %s: infer %llu ms, write %llu "
+	        "ms%s\n",
+	        m->name, n, w, h, (double)focal, focal_given ? "given" : "assumed", c->backend,
+	        (unsigned long long)infer_ms, (unsigned long long)(oc_now_ms() - t1),
+	        st.non_finite != 0 ? " (non-finite Gaussians made transparent)" : "");
+
+	// 4. Facts (frozen splat_info: every field set) and the focus suggestion.
+	if (out != NULL) {
+		SET(out, struct xrt_conv_job_out, written, XRT_CONV_OUT_SPLAT_BLOB);
+		if (COVERS(out, struct xrt_conv_job_out, splat_info)) {
+			struct xrt_conv_splat_info *si = &out->splat_info;
+			memset(si, 0, sizeof(*si));
+			si->blob_format = XRT_CONV_BLOB_PLY_3DGS;
+			si->coords = XRT_CONV_COORDS_OPENCV;
+			si->color_space = XRT_CONV_CS_SRGB; // f_dc carries sRGB values, as 3DGS viewers expect
+			si->metric = 0; // a monocular model's scale, through a focal that may be assumed: not metres
+			si->intrinsics_source = focal_given ? XRT_CONV_INTRINSICS_GIVEN : XRT_CONV_INTRINSICS_ASSUMED;
+			si->fx = focal;
+			si->fy = focal;
+			si->cx = (float)w * 0.5f;
+			si->cy = (float)h * 0.5f;
+			si->grid_width = w; // the cloud unprojects exactly through these intrinsics of the input
+			si->grid_height = h;
+			si->baseline_m = 0.0f;                         // unknown, never defaulted
+			si->focus_z_m = si->near_m = si->far_m = 0.0f; // not metres: unknown
+			si->splat_count = (uint64_t)n;
+		}
+	}
+	if (sr != NULL && st.focus_valid && COVERS(sr, struct xrt_conv_splat_result, focus_source)) {
+		sr->focus_point[0] = st.focus_point[0];
+		sr->focus_point[1] = st.focus_point[1];
+		sr->focus_point[2] = st.focus_point[2];
+		sr->focus_source = XRT_CONV_FOCUS_SOURCE_NEAREST_CLUMP; // a suggestion, in the splat's own units
+		sr->valid |= XRT_CONV_SPLAT_VALID_FOCUS;
+	}
+	if (ctl->progress != NULL) {
+		ctl->progress(ctl->ctx, 1.0f, "done");
+	}
+	return XRT_SUCCESS;
+}
+
+
 static xrt_result_t
 oc_job_execute(struct xrt_conversion_plugin_instance *inst,
                uint32_t cap_id,
@@ -1497,6 +2137,9 @@ oc_job_execute(struct xrt_conversion_plugin_instance *inst,
 {
 	struct oc_provider *p = (struct oc_provider *)inst;
 	struct oc_cap *c = p != NULL ? cap_get(p, cap_id) : NULL;
+	if (c != NULL && is_splats(c)) {
+		return splat_job(p, c, in, params, ctl, out);
+	}
 	if (c == NULL || c->task != XRT_CONV_TASK_DEPTH_MONO || in == NULL || ctl == NULL ||
 	    !COVERS(in, struct xrt_conv_job_in, images) || !COVERS(ctl, struct xrt_conv_job_control, is_cancelled)) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
@@ -1580,12 +2223,16 @@ oc_destroy(struct xrt_conversion_plugin_instance *inst)
 	}
 	for (uint32_t i = 0; i < OC_CAP_COUNT; i++) {
 		oc_session_destroy(p->caps[i].session);
+		oc_ov_session_destroy(p->caps[i].ov_session);
 	}
 	// ONNX Runtime stays mapped and its environment alive: it does not support
 	// being unloaded and re-initialised within one process.
 	free(p->chw);
 	free(p->map);
-	free(p->pack);
+	free(p->gauss);
+	for (uint32_t i = 0; i < p->pack_count; i++) {
+		free(p->packs[i]);
+	}
 	oc_mutex_destroy(&p->lock);
 	free(p);
 }
@@ -1596,6 +2243,35 @@ oc_destroy(struct xrt_conversion_plugin_instance *inst)
  * Negotiate: the only export.
  *
  */
+
+/*! The settings this provider reads (`displayxr-cli conv options open-conversion`). */
+static const struct xrt_component_setting_desc g_settings[] = {
+    {"ENABLE", XRT_COMPONENT_SETTING_TYPE_BOOL, "1", "0 = probe declines"},
+    {"QUALITY", XRT_COMPONENT_SETTING_TYPE_ENUM, "medium", "low | medium | high: which model defaults[task] names"},
+    {"EP", XRT_COMPONENT_SETTING_TYPE_ENUM, "auto",
+     "auto | cpu | dml | coreml | openvino: the execution provider (openvino: the splat capability only)"},
+    {"OV_DEVICE", XRT_COMPONENT_SETTING_TYPE_ENUM, "auto",
+     "auto | gpu | cpu: the OpenVINO device (auto = GPU, else CPU)"},
+    {"OV_CACHE", XRT_COMPONENT_SETTING_TYPE_BOOL, "1", "0 = no OpenVINO compiled-model cache in the scratch dir"},
+    {"OPENVINO", XRT_COMPONENT_SETTING_TYPE_STRING, "", "absolute path of another OpenVINO runtime folder"},
+    {"COREML_UNITS", XRT_COMPONENT_SETTING_TYPE_ENUM, "gpu", "gpu | all | ane | cpu: macOS Core ML compute units"},
+    {"COREML_CACHE", XRT_COMPONENT_SETTING_TYPE_BOOL, "1", "0 = no Core ML compiled-model cache"},
+    {"ORT_LOG", XRT_COMPONENT_SETTING_TYPE_ENUM, "warning", "warning | info | verbose"},
+    {"THREADS", XRT_COMPONENT_SETTING_TYPE_INT, "4", "CPU inference threads; 0 = every core"},
+    {"GRAPH_OPT", XRT_COMPONENT_SETTING_TYPE_ENUM, "extended", "basic | extended | all (ONNX Runtime)"},
+    {"PACK", XRT_COMPONENT_SETTING_TYPE_STRING, "",
+     "absolute pack manifest paths, ';'-separated (default: every *.models.json next to the binary)"},
+    {"ONNXRUNTIME", XRT_COMPONENT_SETTING_TYPE_STRING, "", "absolute path of another ONNX Runtime library"},
+};
+
+static uint32_t
+oc_describe_settings(const struct xrt_component_setting_desc **out_descs)
+{
+	if (out_descs != NULL) {
+		*out_descs = g_settings;
+	}
+	return (uint32_t)(sizeof(g_settings) / sizeof(g_settings[0]));
+}
 
 static struct xrt_conversion_plugin_iface g_iface = {
     .struct_size = (uint32_t)sizeof(struct xrt_conversion_plugin_iface),
@@ -1616,6 +2292,7 @@ static struct xrt_conversion_plugin_iface g_iface = {
     .stream_destroy = oc_stream_destroy,
     .job_execute = oc_job_execute,
     .destroy = oc_destroy,
+    .describe_settings = oc_describe_settings,
 };
 
 XRT_CONVERSION_PLUGIN_EXPORT xrt_result_t
