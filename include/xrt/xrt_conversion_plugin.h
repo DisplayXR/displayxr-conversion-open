@@ -40,6 +40,8 @@
 
 #pragma once
 
+#include "xrt/xrt_component_settings.h"
+#include "xrt/xrt_component_license.h"
 #include "xrt/xrt_results.h"
 
 #include <stdbool.h>
@@ -265,6 +267,10 @@ struct xrt_conv_image
 #define XRT_CONV_FAIL_MODEL 7u     //!< missing / bad hash / unsupported
 #define XRT_CONV_FAIL_DEVICE_LOST 8u
 #define XRT_CONV_FAIL_CRASH_LOOP 9u //!< satellite only: the crash-loop cutoff; a single crash is WARMING(restarting)
+#define XRT_CONV_FAIL_POLICY 10u    //!< ABSENT: a policy forbids fetching / loading the model (downloads off, research-only)
+/*! A JOB's input was refused (ADR-057 §4): the job failed, the capability is
+ *  untouched; xrt_conv_splat_result::refusal_code says why. Never a state. */
+#define XRT_CONV_FAIL_INPUT 11u
 /*! @} */
 
 /*! Runtime pre-sizes + zero-fills; provider answers from memory. */
@@ -325,6 +331,31 @@ struct xrt_conv_state
 #define XRT_CONV_CAP_DETERMINISTIC (1u << 6)         //!< same input ⇒ same bytes (tests)
 #define XRT_CONV_CAP_LANES_CONCURRENT (1u << 7)      //!< job_execute may overlap stream_* calls; else serialised
 #define XRT_CONV_CAP_WARM_CONCURRENT (1u << 8) //!< warm may overlap converts; else serialised (stall reported in stats)
+/*! job_execute sends the job's inputs OFF THE BOX (a remote endpoint, ADR-057
+ *  §2): the network is used inside job_execute, not only in warm (the one
+ *  exception to the §2.4 network rule). Such a capability is consent-gated:
+ *  without the user's per-provider consent (host->get_consent(
+ *  XRT_CONV_CONSENT_OFFBOX)) the provider reports it DISABLED. */
+#define XRT_CONV_CAP_REMOTE (1u << 9)
+/*! The model is a runtime the USER installed on this box separately, under
+ *  its own licence (e.g. Leia's NeurD runtime), and the provider found a
+ *  valid copy of it: that install is the opt-in, so selection admits this
+ *  capability without AllowResearchOnly even when its licence class is
+ *  RESEARCH_ONLY / UNKNOWN. Set it ONLY while that install is present and
+ *  usable; never for a model the runtime or the provider fetches itself.
+ *  Same footing as the grandfathered dp-lift adapter, whose exemption had the
+ *  same reason (the user installed the module). */
+#define XRT_CONV_CAP_LICENSED_LOCAL_INSTALL (1u << 10)
+/*! The provider runs its own auto-convergence when params.convergence_mode
+ *  is XRT_CONV_CONVERGENCE_AUTO, and so owns convergence whenever the app
+ *  leaves it AUTO. A stream bound to such a capability (provider-produced
+ *  views, not composed) gets no runtime convergence observer and no D10 hint:
+ *  params carry AUTO unless the APP set a plane, which still wins (DECODED).
+ *  The runtime does not judge whose auto-convergence is better; the provider
+ *  the user installed decides. The runtime's observer runs only for providers
+ *  that do not declare this. One convergence owner per stream (ADR-053
+ *  Amendment 1). Append-only: an older provider simply does not set it. */
+#define XRT_CONV_CAP_AUTO_CONVERGENCE (1u << 11)
 /*! @} */
 
 /*! One capability = (task × model × backend × device). Top-level: the
@@ -658,7 +689,30 @@ struct xrt_conv_job_in
 	uint64_t encoded_size[2];       //!< RESERVED: 0 in v1
 	uint32_t requested_blob_format; //!< XRT_CONV_BLOB_*; 0 = provider default
 	uint32_t reserved_0;
+
+	/* ADR-057 §4 (XRT_CONVERSION_PLUGIN_HAS_SPLAT_RESULT), appended. A provider
+	 * reads them only when struct_size covers them (XRT_CONV_COVERS); absent
+	 * reads as 0 = undeclared / the provider's default. The baseline is NOT
+	 * here: it is params.stereo.baseline_m (0 = unknown, so no metric result;
+	 * never defaulted), which the runtime validates at submit (finite,
+	 * 0 <= b <= XRT_CONV_MAX_BASELINE_M). The focal length is params.focal_px;
+	 * XRT_CONV_JOB_FOCAL_GIVEN says the caller gave it. */
+	uint32_t job_flags;           //!< XRT_CONV_JOB_*
+	uint32_t max_input_long_side; //!< px: the knob that bounds splat count; 0 = the provider's / model's own
 };
+
+/*! @name xrt_conv_job_in::job_flags (ADR-057 §4) @{ */
+//! The pair is declared rectified (a SPLATS_STEREO / DISPARITY_STEREO input).
+#define XRT_CONV_JOB_PAIR_RECTIFIED (1u << 0)
+//! The pair is declared RAW (not rectified). Neither bit = undeclared: a provider
+//! that needs to know refuses with XRT_CONV_REFUSAL_UNRECTIFIED_PAIR, never guesses.
+#define XRT_CONV_JOB_PAIR_RAW (1u << 1)
+//! params.focal_px was GIVEN by the caller: it wins over EXIF and over any estimate.
+#define XRT_CONV_JOB_FOCAL_GIVEN (1u << 2)
+/*! @} */
+
+//! Upper bound the runtime accepts for a declared stereo baseline (metres).
+#define XRT_CONV_MAX_BASELINE_M 10.0f
 
 /*! Runtime-owned control block for job_execute: sinks, progress, cancel. */
 struct xrt_conv_job_control
@@ -684,7 +738,130 @@ struct xrt_conv_job_out
 	struct xrt_conv_depth_info depth_info;
 	struct xrt_conv_views_info views_info;
 	uint32_t reserved_pad; //!< explicit tail padding (8-aligned size); 0
+
+	/*! ADR-057 §4: the splat job's facts (build stamp, refusal, metric fit,
+	 *  layers, focus suggestion). RUNTIME-owned: for every SPLATS_* job the
+	 *  runtime zero-fills one, sets its struct_size and points here; NULL
+	 *  otherwise. A provider writes through it only when
+	 *  XRT_CONV_COVERS(out, struct xrt_conv_job_out, splat_result) and it is
+	 *  non-NULL, and only within ITS struct_size; valid for the call only. A
+	 *  chained top-level struct rather than an embedded one because embedded
+	 *  structs are frozen: xrt_conv_splat_info stays exactly as it is. */
+	struct xrt_conv_splat_result *splat_result;
 };
+
+/*
+ *
+ * Splat result (ADR-057 §3 / §4).
+ *
+ */
+
+/*! @name xrt_conv_splat_result::refusal_code. A refused METRIC FIT still
+ *  returns the non-metric splat (splat_info.metric = 0, the job SUCCEEDS);
+ *  every other code fails the job with no blob (XRT_CONV_FAIL_INPUT, or
+ *  XRT_CONV_FAIL_NETWORK for REMOTE_ERROR). Append-only. @{ */
+#define XRT_CONV_REFUSAL_NONE 0u
+#define XRT_CONV_REFUSAL_METRIC_FIT_REFUSED 1u //!< the fit was tried and rejected; the splat is not metric
+#define XRT_CONV_REFUSAL_BASELINE_MISSING 2u   //!< a metric result needs a baseline and none was given (0 = unknown)
+#define XRT_CONV_REFUSAL_INPUT_TOO_LARGE 3u    //!< over the provider's / endpoint's input size or byte limit
+#define XRT_CONV_REFUSAL_UNRECTIFIED_PAIR 4u   //!< the pair is raw or undeclared and the model needs it rectified
+#define XRT_CONV_REFUSAL_UNSUPPORTED_INPUT 5u  //!< a format / kind / role the provider cannot take
+#define XRT_CONV_REFUSAL_REMOTE_ERROR 6u       //!< every remote host failed; the reason says how
+/*! @} */
+
+/*! @name xrt_conv_splat_result::metric_source @{ */
+#define XRT_CONV_METRIC_SOURCE_NONE 0u   //!< no metric fit (not attempted, or refused)
+#define XRT_CONV_METRIC_SOURCE_STEREO 1u //!< fitted to the pair's stereo depth at the given baseline
+#define XRT_CONV_METRIC_SOURCE_MODEL 2u  //!< the model's own metric output
+#define XRT_CONV_METRIC_SOURCE_OTHER 3u  //!< anything else; the build stamp says which build decided
+/*! @} */
+
+/*! @name xrt_conv_splat_result::focus_source: where a SUGGESTION came from (§3) @{ */
+#define XRT_CONV_FOCUS_SOURCE_NONE 0u          //!< no suggestion
+#define XRT_CONV_FOCUS_SOURCE_NEAREST_CLUMP 1u //!< the cloud's nearest substantial clump
+#define XRT_CONV_FOCUS_SOURCE_CONVERGENCE 2u   //!< the pair's measured convergence / median disparity
+#define XRT_CONV_FOCUS_SOURCE_OTHER 3u
+/*! @} */
+
+/*! @name xrt_conv_splat_result::host_kind @{ */
+#define XRT_CONV_HOST_KIND_UNKNOWN 0u
+#define XRT_CONV_HOST_KIND_LOCAL 1u  //!< inference ran in this machine's conversion host
+#define XRT_CONV_HOST_KIND_REMOTE 2u //!< a remote endpoint; build_host_id names it
+/*! @} */
+
+/*! @name xrt_conv_splat_result::valid: the groups the provider filled @{ */
+#define XRT_CONV_SPLAT_VALID_BUILD (1u << 0)
+#define XRT_CONV_SPLAT_VALID_METRIC_FIT (1u << 1)
+#define XRT_CONV_SPLAT_VALID_LAYERS (1u << 2)
+#define XRT_CONV_SPLAT_VALID_FOCUS (1u << 3)
+/*! @} */
+
+/*! @name xrt_conv_splat_result::layer_flags[i] @{ */
+#define XRT_CONV_LAYER_VISIBLE (1u << 0)   //!< the layer is the visible surface
+#define XRT_CONV_LAYER_INPAINTED (1u << 1) //!< the layer was inpainted (disocclusion fill)
+/*! @} */
+
+#define XRT_CONV_MAX_SPLAT_LAYERS 8u
+#define XRT_CONV_STAMP_MAX 64u //!< one build-stamp string, NUL included
+
+/*!
+ * ADR-057 §3 / §4: what a splat job MEASURED (facts) and what it SUGGESTS.
+ * Never intent: the rig, the rest pose and the chosen focus belong to the
+ * author, who writes the content file's camera block. The runtime never
+ * writes or rewrites a camera block. Unknown = 0 / "" / its `valid` bit
+ * clear, never invented. Reached through xrt_conv_job_out::splat_result.
+ *
+ * Top-level (struct_size first, append-only), flat (fixed-size strings, no
+ * pointers) and without hidden padding, so a satellite carries it as a
+ * byte-equal twin. The runtime zero-fills it and sets struct_size; the
+ * provider writes within it.
+ */
+struct xrt_conv_splat_result
+{
+	uint32_t struct_size;
+	uint32_t valid; //!< XRT_CONV_SPLAT_VALID_*
+
+	/* Build stamp: which build answered. Returned with every result. */
+	char build_provider[XRT_CONV_STAMP_MAX]; //!< provider build (commit / version)
+	char build_model_id[XRT_CONV_STAMP_MAX]; //!< the model's id, e.g. "<pack>/<model>@<version>"
+	char build_model_sha256[72];             //!< 64 lowercase hex + NUL; "" = unknown
+	char build_runtime[32];                  //!< inference runtime, e.g. "onnxruntime-dml"
+	char build_runtime_version[32];          //!< its version
+	char build_host_id[XRT_CONV_STAMP_MAX];  //!< REMOTE: the endpoint id (and host); LOCAL: ""
+	uint32_t host_kind;                      //!< XRT_CONV_HOST_KIND_*
+	uint32_t reserved_0;                     //!< 0
+
+	/* Refusal. */
+	uint32_t refusal_code;                    //!< XRT_CONV_REFUSAL_*
+	uint32_t reserved_1;                      //!< 0
+	char refusal_reason[XRT_CONV_DETAIL_MAX]; //!< for a human, verbatim
+
+	/* Metric fit (valid & METRIC_FIT): the fit's facts. Whether the result IS
+	 * metric is splat_info.metric / splat_info.baseline_m. */
+	float metric_scale;             //!< the scale applied; 0 = unknown
+	uint32_t metric_source;         //!< XRT_CONV_METRIC_SOURCE_*
+	float metric_inlier_fraction;   //!< [0,1]; < 0 = unknown
+	float metric_mad_log;           //!< MAD of the log depth ratio; < 0 = unknown
+	float principal_point_shift_px; //!< deconvergence as a cx offset (cx = w/2 - shift); 0 = none
+
+	/* Layers (valid & LAYERS). */
+	uint32_t layer_count;                            //!< <= XRT_CONV_MAX_SPLAT_LAYERS
+	uint32_t layer_flags[XRT_CONV_MAX_SPLAT_LAYERS]; //!< XRT_CONV_LAYER_* per layer
+
+	/* Focus SUGGESTION (valid & FOCUS): advisory and labelled; an author may discard it. */
+	float focus_point[3]; //!< in the splat's own coordinates (splat_info.coords)
+	float focus_subject_m;
+	float focus_near_m;
+	float focus_far_m;
+	uint32_t focus_source; //!< XRT_CONV_FOCUS_SOURCE_*
+	uint32_t reserved_2;   //!< 0
+};
+
+/*! Defined when xrt_conv_job_out carries `splat_result`, xrt_conv_job_in
+ *  carries `job_flags` / `max_input_long_side`, XRT_CONV_CAP_REMOTE exists and
+ *  the host iface carries `get_consent` (ADR-057 S1), so a provider built
+ *  against an older header can #ifdef-guard them. */
+#define XRT_CONVERSION_PLUGIN_HAS_SPLAT_RESULT 1
 
 /*
  *
@@ -734,9 +911,10 @@ struct xrt_conv_adapter_hint
 struct xrt_conv_model_location
 {
 	uint32_t struct_size;
-	uint32_t state; //!< READY / DOWNLOADING / ABSENT / FAILED
-	float progress;
-	uint32_t failure_reason;
+	uint32_t state;          //!< READY / INSTALLED (on disk, not yet verified: request it) / WARMING (verifying) /
+	                         //!< DOWNLOADING / ABSENT / FAILED
+	float progress;          //!< DOWNLOADING: bytes / total over the model's files; < 0 = n/a
+	uint32_t failure_reason; //!< XRT_CONV_FAIL_*: POLICY (ABSENT), NETWORK / MODEL (FAILED)
 	char path[512]; //!< UTF-8 absolute path of the verified blob when READY
 };
 
@@ -773,8 +951,20 @@ struct xrt_conversion_plugin_host_iface
 	 *  re-reads on its own thread. Replaces 1 Hz polling. */
 	void (*notify_changed)(uint32_t cap_id);
 
-	void *reserved[10];
+	/*! ADR-057 §2, carved from reserved[0] (XRT_CONVERSION_PLUGIN_HAS_SPLAT_RESULT):
+	 *  has the user granted THIS provider consent of @p kind
+	 *  (XRT_CONV_CONSENT_*)? Per user, revocable, answered from the runtime's
+	 *  consent store (`displayxr-cli conv consent <id> grant|revoke`), never
+	 *  from a setting. NULL (a host that predates it) = not granted: fail closed. */
+	bool (*get_consent)(uint32_t kind);
+
+	void *reserved[9];
 };
+
+/*! @name get_consent kinds @{ */
+//! The provider may send the user's pictures off this machine (a remote endpoint).
+#define XRT_CONV_CONSENT_OFFBOX 1u
+/*! @} */
 
 /*
  *
@@ -900,7 +1090,92 @@ struct xrt_conversion_plugin_iface
 	/* Append-only below this line, forever (ADR-020). Each appended slot
 	 * gets an XRT_CONVERSION_PLUGIN_HAS_<X> macro so the downstream
 	 * `features` repin gate sees it. */
+
+	/*! [C]; pure. The settings this provider reads through
+	 *  `host->get_setting` (ADR-054 decision 7, the one options contract),
+	 *  for `displayxr-cli conv options <id>`. Optional: NULL (or a provider
+	 *  whose `struct_size` predates this slot) declares nothing — the store's
+	 *  keys are still listed. Gated by XRT_CONV_IFACE_HAS; announced by
+	 *  XRT_CONVERSION_PLUGIN_HAS_DESCRIBE_SETTINGS. */
+	xrt_component_describe_settings_fn_t describe_settings;
+
+	/*! [C]; from memory. The provider's LICENCE STATE (ADR-054 N5, ADR-064
+	 *  §5; the one contract every class shares,
+	 *  `xrt/xrt_component_license.h`): does THIS USER hold an entitlement.
+	 *  It is not the licence class of a capability (XRT_CONV_LICENCE_*, the
+	 *  terms a model ships under). While the state is `unlicensed` or
+	 *  `expired` the runtime reads every capability of the provider as
+	 *  XRT_CONV_STATE_UNLICENSED / XRT_CONV_FAIL_LICENCE
+	 *  (@ref xrt_conv_state_apply_license), so selection falls through to
+	 *  the next candidate by the rule it already has; a provider may keep
+	 *  reporting XRT_CONV_STATE_UNLICENSED per capability itself, as before.
+	 *  A provider whose licence state changes calls host->state_changed like
+	 *  for any other readiness change. Optional: NULL (or a provider whose
+	 *  `struct_size` predates this slot) has no licence to report
+	 *  (`not_applicable`). Gated by XRT_CONV_IFACE_HAS; announced by
+	 *  XRT_CONVERSION_PLUGIN_HAS_GET_LICENSE_STATE. */
+	xrt_component_get_license_state_fn_t get_license_state;
+
+	/*! May block for a few seconds; never overlaps another activate on the
+	 *  provider. Hand the provider an ACTIVATION TOKEN (a pasted key, or a
+	 *  vendor checkout's deep-link token): an opaque UTF-8 blob the runtime
+	 *  never interprets, logs or stores. Returns the new licence state or an
+	 *  error line. Optional. Gated by XRT_CONV_IFACE_HAS; announced by
+	 *  XRT_CONVERSION_PLUGIN_HAS_ACTIVATE. */
+	xrt_component_activate_fn_t activate;
 };
+
+/*! Defined when @ref xrt_conversion_plugin_iface carries `describe_settings`
+ *  (N3c), so a provider built against an older runtime header can
+ *  #ifdef-guard filling it. */
+#define XRT_CONVERSION_PLUGIN_HAS_DESCRIBE_SETTINGS 1
+
+/*! Defined when @ref xrt_conversion_plugin_iface carries `get_license_state`
+ *  (ADR-054 N5), so a provider built against an older runtime header can
+ *  #ifdef-guard filling it. */
+#define XRT_CONVERSION_PLUGIN_HAS_GET_LICENSE_STATE 1
+
+/*! Defined when @ref xrt_conversion_plugin_iface carries `activate`
+ *  (ADR-054 N5), so a provider built against an older runtime header can
+ *  #ifdef-guard filling it. */
+#define XRT_CONVERSION_PLUGIN_HAS_ACTIVATE 1
+
+/*!
+ * The licence state of @p iface, with the absent-slot rule applied
+ * (`not_applicable` unless the provider says otherwise). @p out is always a
+ * valid, sanitised struct. Returns the state.
+ */
+static inline uint32_t
+xrt_conversion_plugin_iface_license_state(const struct xrt_conversion_plugin_iface *iface,
+                                          struct xrt_component_license_state *out)
+{
+	return xrt_component_license_query(
+	    iface != NULL && XRT_CONV_IFACE_HAS(iface, get_license_state) ? iface->get_license_state : NULL, out);
+}
+
+/*!
+ * The mapping of the shared licence state onto the conversion readiness
+ * vocabulary: when @p license_state is `unlicensed` or `expired`, @p st (one
+ * capability's get_state answer) reads XRT_CONV_STATE_UNLICENSED with
+ * XRT_CONV_FAIL_LICENCE, not retryable; otherwise @p st is untouched. Applied
+ * by whoever reads a provider's get_state (the in-process host, which the
+ * satellite host uses too, and the headless status pass), so every consumer
+ * of readiness - selection first - sees one answer. Returns true when it
+ * changed @p st.
+ */
+static inline bool
+xrt_conv_state_apply_license(uint32_t license_state, struct xrt_conv_state *st)
+{
+	if (st == NULL || !xrt_component_license_blocks(license_state)) {
+		return false;
+	}
+	st->state = XRT_CONV_STATE_UNLICENSED;
+	st->failure_reason = XRT_CONV_FAIL_LICENCE;
+	st->retryable = 0;
+	st->progress = 0.0f;
+	st->eta_ns = 0;
+	return true;
+}
 
 /*!
  * Signature of the exported XRT_CONVERSION_PLUGIN_ENTRYPOINT_NAME symbol. The
@@ -930,8 +1205,14 @@ XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conversion_plugin_iface, warm) == 8 + 9 
                     "conversion iface: warm is slot 5");
 XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conversion_plugin_iface, destroy) == 8 + 16 * sizeof(void *),
                     "conversion iface: v1 slot order changed - API major bump");
-XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conversion_plugin_iface) == 8 + 17 * sizeof(void *),
-                    "conversion iface v1 = 4 strings + 13 slots; append-only past destroy");
+XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conversion_plugin_iface, describe_settings) == 8 + 17 * sizeof(void *),
+                    "conversion iface: describe_settings is the first slot appended past destroy (N3c)");
+XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conversion_plugin_iface, get_license_state) == 8 + 18 * sizeof(void *) &&
+                    offsetof(struct xrt_conversion_plugin_iface, activate) == 8 + 19 * sizeof(void *),
+                    "conversion iface: get_license_state then activate follow describe_settings (ADR-054 N5)");
+XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conversion_plugin_iface) == 8 + 20 * sizeof(void *),
+                    "conversion iface v1 = 4 strings + 13 slots + describe_settings + the two licence slots; "
+                    "append-only past it");
 XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conversion_plugin_host_iface) == 16 + 16 * sizeof(void *),
                     "conversion host iface size changed - carve from reserved[] instead");
 XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conv_capability, struct_size) == 0 &&
@@ -943,7 +1224,8 @@ XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conv_capability, struct_size) == 0 &&
                     offsetof(struct xrt_conv_frame_out, struct_size) == 0 &&
                     offsetof(struct xrt_conv_job_in, struct_size) == 0 &&
                     offsetof(struct xrt_conv_job_control, struct_size) == 0 &&
-                    offsetof(struct xrt_conv_job_out, struct_size) == 0,
+                    offsetof(struct xrt_conv_job_out, struct_size) == 0 &&
+                    offsetof(struct xrt_conv_splat_result, struct_size) == 0,
                     "every top-level conversion struct starts with struct_size");
 XRT_CONV_ABI_ASSERT(XRT_CONV_STATE_DISABLED == 7u && XRT_CONV_STATE_EVICTED == 10u,
                     "conversion state values are ABI");
@@ -975,8 +1257,20 @@ XRT_CONV_ABI_ASSERT(sizeof(void *) != 8 || offsetof(struct xrt_conv_frame_out, d
 XRT_CONV_ABI_ASSERT(sizeof(void *) != 8 || sizeof(struct xrt_conv_frame_out) == 776,
                     "xrt_conv_frame_out: no hidden padding (8 + 4 x 128 + 124 + 4 + 128)");
 XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conv_job_out, views_info) == 208 &&
-                    sizeof(struct xrt_conv_job_out) == 336,
-                    "xrt_conv_job_out: no hidden padding (8 + 72 + 128 + 124 + 4)");
+                    offsetof(struct xrt_conv_job_out, splat_result) == 336 &&
+                    sizeof(struct xrt_conv_job_out) == 336 + sizeof(void *),
+                    "xrt_conv_job_out: no hidden padding (8 + 72 + 128 + 124 + 4), then splat_result (ADR-057)");
+XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conv_job_in, job_flags) == offsetof(struct xrt_conv_job_in, reserved_0) + 4,
+                    "xrt_conv_job_in: the ADR-057 job inputs follow reserved_0");
+XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conversion_plugin_host_iface, get_consent) == 16 + 6 * sizeof(void *),
+                    "conversion host iface: get_consent is carved from reserved[0] (ADR-057)");
+XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conv_splat_result, host_kind) == 336 &&
+                    offsetof(struct xrt_conv_splat_result, refusal_code) == 344 &&
+                    offsetof(struct xrt_conv_splat_result, metric_scale) == 480 &&
+                    offsetof(struct xrt_conv_splat_result, layer_flags) == 504 &&
+                    offsetof(struct xrt_conv_splat_result, focus_point) == 536 &&
+                    sizeof(struct xrt_conv_splat_result) == 568,
+                    "xrt_conv_splat_result: flat, no hidden padding (the satellite twins it byte for byte)");
 XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_stereo_calibration) == 32,
                     "xrt_conv_stereo_calibration is FROZEN (8 x 4)");
 // clang-format on
