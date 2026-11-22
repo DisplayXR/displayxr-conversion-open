@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # Copyright 2026, The DisplayXR Project
 # SPDX-License-Identifier: BSL-1.0
-"""Build the local SHARP (image -> Gaussian splats) ONNX model from Apple's official checkpoint.
+"""Build the local SHARP (image -> Gaussian splats) ONNX models from Apple's official checkpoint.
 
-    export_sharp.py --accept-research-license [--checkpoint FILE] [--ml-sharp DIR]
-                    [--work DIR] [--store DIR | --no-store] [--keep-fp32] [--check IMAGE]
+    export_sharp.py --accept-research-license [--variant int4|full|both] [--checkpoint FILE]
+                    [--ml-sharp DIR] [--work DIR] [--store DIR | --no-store] [--keep-fp32]
+                    [--check IMAGE]
 
 SHARP's weights are licensed for research only (Apple Machine Learning Research Model
 licence, `apple-amlr`), and the licence follows every derivative. DisplayXR therefore never
@@ -19,23 +20,36 @@ What it does, in order:
 2. Takes Apple's reference code `apple/ml-sharp` (`--ml-sharp DIR`), or clones it, and refuses
    any checkout that is not the pinned commit.
 3. Exports the fp32 predictor to ONNX (opset 18, standard ai.onnx operators only, a fixed
-   1x3x1536x1536 image input) into the work directory. This file is an intermediate (2.6 GB,
-   external weights) and is deleted unless --keep-fp32.
-4. Quantizes it with ONNX Runtime's MatMulNBitsQuantizer (4-bit, block 32, symmetric): only
-   the weights of MatMul nodes with a constant weight become 4-bit (com.microsoft MatMulNBits);
-   Conv weights, every other weight and every activation stay fp32. The result is one
-   self-contained .onnx file (about 0.58 GB).
-5. Writes that file into the DisplayXR model store (blobs/<sha256> plus its .ok stamp, the
-   store's own write protocol), so the `dxr-open-sharp` pack resolves it, and prints the
-   SHA-256 and size. The pack lists exactly these bytes: the export is byte-deterministic with
-   the pinned package versions in scripts/requirements-export-sharp.txt, and the script checks
-   the hash it produced against the pack and says so if they differ.
+   1x3x1536x1536 image input) into the work directory (2.6 GB, external weights).
+4. Builds the variant(s) asked for from that one export (one download serves both):
+   - `full` (`sharp-full-1536`): the fp32 export itself, re-saved as two files, the graph and
+     ONE external-data file. The graph names the data file by the data's own SHA-256, so the
+     two sit side by side in the store's blobs/ directory and the inference runtime finds the
+     weights next to the graph (ONNX's protobuf cannot hold 2.6 GB in one file). About
+     2.6 GB; numerically the PyTorch model.
+   - `int4` (`sharp-int4-1536`): ONNX Runtime's MatMulNBitsQuantizer (4-bit, block 32,
+     symmetric): only the weights of MatMul nodes with a constant weight become 4-bit
+     (com.microsoft MatMulNBits); Conv weights, every other weight and every activation stay
+     fp32. One self-contained .onnx file (about 0.58 GB).
+   The fp32 intermediate is deleted unless --keep-fp32.
+5. Writes the result into the DisplayXR model store (blobs/<sha256> plus its .ok stamp, the
+   store's own write protocol; for `full` the data file first, the graph last), so the
+   `dxr-open-sharp` pack resolves it, and prints each SHA-256 and size. The pack lists exactly
+   these bytes: both exports are byte-deterministic with the pinned package versions in
+   scripts/requirements-export-sharp.txt, and the script checks the hashes it produced against
+   the pack and says so if they differ.
 
---check IMAGE runs the PyTorch fp32 reference and the int4 model (ONNX Runtime, CPU) on one
+--variant picks what to build. The default is the variant this machine's provider picks by
+itself (its `MODEL=auto` rule: `full` when the splat capability runs on a GPU and the machine
+has at least 16 GB of memory, else `int4`); the script says which and why. `both` builds both
+from one export.
+
+--check IMAGE runs the PyTorch fp32 reference and each built model (ONNX Runtime, CPU) on one
 image and prints the per-tensor relative error and the median relative depth error. It takes
-a few minutes and about 16 GB of memory (ONNX Runtime's CPU execution provider peaks near 14 GB here).
+a few minutes and about 16 GB of memory (ONNX Runtime's CPU execution provider peaks near 14 GB
+on int4).
 
-Needs: Python 3.11+, git, about 8 GB free memory, about 7 GB free disk in --work, and the
+Needs: Python 3.11+, git, about 8 GB free memory, about 10 GB free disk in --work, and the
 packages pinned in scripts/requirements-export-sharp.txt (CPU-only PyTorch is enough).
 
 Exit code 0 = done, 1 = a check failed (bad hash, wrong commit, parity), 2 = usage.
@@ -54,7 +68,7 @@ import sys
 import tempfile
 import urllib.request
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
 
 # The official checkpoint (Apple, research-only). Same bytes as Apple's CDN copy.
 CHECKPOINT_NAME = "sharp_2572gikvuh.pt"
@@ -74,8 +88,15 @@ INPUTS = ["image", "disparity_factor"]
 OUTPUTS = ["mean_vectors", "singular_values", "quaternions", "colors", "opacities"]
 
 PACK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "packs", "dxr-open-sharp.models.json")
-PACK_MODEL = "sharp-int4-1536"
+# variant -> (pack model, the script version whose recipe made these bytes). That version is
+# written into the model's metadata, so it is part of the bytes: it changes only when the
+# recipe does, never with an unrelated script change.
+VARIANTS = {
+    "int4": ("sharp-int4-1536", "1.0.0"),
+    "full": ("sharp-full-1536", "1.1.0"),
+}
 STORE_OWNER_MARKER = "displayxr-runtime.owner"
+GPU_RAM_FLOOR_GB = 16  # the provider's MODEL=auto rule: full needs a GPU and this much memory
 
 
 def log(msg):
@@ -275,6 +296,107 @@ def quantize_int4(fp32_path, out_path, provenance):
     return out_path
 
 
+def write_full(fp32_path, out_dir, provenance):
+    """The fp32 export as <sha(graph)> + <sha(data)>: the graph names its one data file by the
+    data's SHA-256, so the two files find each other inside the store's blobs/ directory."""
+    import onnx
+    from onnx import external_data_helper as edh
+
+    log("writing the full (fp32) model: one graph + one external-data file ...")
+    if os.path.isdir(out_dir):
+        shutil.rmtree(out_dir)
+    os.makedirs(out_dir)
+    model = onnx.load(fp32_path)
+    del model.metadata_props[:]
+    for k, v in provenance.items():
+        model.metadata_props.add(key=k, value=v)
+    graph, data = os.path.join(out_dir, "graph.onnx"), os.path.join(out_dir, "weights.data")
+    onnx.save_model(model, graph, save_as_external_data=True, all_tensors_to_one_file=True,
+                    location=os.path.basename(data), size_threshold=1024, convert_attribute=False)
+    del model
+    gc.collect()
+    data_sha, data_size = sha256_file(data), os.path.getsize(data)
+    os.replace(data, os.path.join(out_dir, data_sha))
+    model = onnx.load(graph, load_external_data=False)
+    n = 0
+    for t in edh._get_all_tensors(model):
+        if edh.uses_external_data(t):
+            for e in t.external_data:
+                if e.key == "location":
+                    e.value = data_sha
+                    n += 1
+    onnx.save(model, graph)
+    graph_sha, graph_size = sha256_file(graph), os.path.getsize(graph)
+    final = os.path.join(out_dir, graph_sha)
+    os.replace(graph, final)
+    log(f"full ok: {n} external tensors in one data file ({data_size} bytes), graph {graph_size} bytes")
+    return [("data", os.path.join(out_dir, data_sha), data_sha, data_size), ("model", final, graph_sha, graph_size)]
+
+
+# ---------------------------------------------------------------------------- machine
+
+
+def total_ram_gb():
+    """Physical memory in GB (portable; None when it cannot be read)."""
+    try:
+        if platform.system() == "Windows":
+            import ctypes
+
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            ms = MemoryStatus()
+            ms.dwLength = ctypes.sizeof(MemoryStatus)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                return None
+            return ms.ullTotalPhys / 2**30
+        if platform.system() == "Darwin":
+            out = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, check=True)
+            return int(out.stdout.strip()) / 2**30
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
+    except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
+        return None
+
+
+def splat_gpu():
+    """(bool, why): does the provider's splat capability run on a GPU here? Its backends are
+    OpenVINO's GPU device (Linux x86_64, Windows x64), else OpenVINO's CPU device, else ONNX
+    Runtime's CPU execution provider (the pack lists no DirectML / Core ML variant for SHARP)."""
+    system = platform.system()
+    if system == "Darwin":
+        return False, "macOS: no OpenVINO, the splat capability runs on ONNX Runtime's CPU"
+    try:
+        import openvino
+
+        devices = openvino.Core().available_devices
+        return any(d.startswith("GPU") for d in devices), f"OpenVINO reports {', '.join(devices) or 'no device'}"
+    except Exception:  # noqa: BLE001 - openvino is optional here; any failure falls to the heuristic
+        pass
+    if system == "Windows":
+        return True, "Windows: assuming OpenVINO's GPU device (pip install openvino to check)"
+    render = os.path.isdir("/dev/dri") and any(n.startswith("renderD") for n in os.listdir("/dev/dri"))
+    icd = os.path.isdir("/etc/OpenCL/vendors") and bool(os.listdir("/etc/OpenCL/vendors"))
+    return render and icd, (f"GPU render node {'present' if render else 'absent'}, OpenCL driver "
+                            f"{'present' if icd else 'absent'}; OpenVINO's GPU device needs both")
+
+
+def machine_variant():
+    """The provider's MODEL=auto rule, applied to this machine: (variant, why)."""
+    gpu, gpu_why = splat_gpu()
+    ram = total_ram_gb()
+    # The provider compares the memory the OS reports (a "16 GB" machine reports a bit less).
+    ram_ok = ram is not None and ram * 1024 >= GPU_RAM_FLOOR_GB * 1024 - 1024
+    ram_txt = "unknown memory" if ram is None else f"{ram:.1f} GB of memory"
+    if gpu and ram_ok:
+        return "full", f"a GPU ({gpu_why}) and {ram_txt} (at least {GPU_RAM_FLOOR_GB} GB)"
+    return "int4", (f"{'a GPU' if gpu else 'no GPU'} ({gpu_why}) and {ram_txt}"
+                    f"{'' if ram_ok else f' (under {GPU_RAM_FLOOR_GB} GB)'}")
+
+
 # ---------------------------------------------------------------------------- store
 
 
@@ -337,18 +459,18 @@ def store_put(root, src, sha, size):
     return blob
 
 
-def pack_expectation():
+def pack_expectation(model_name):
+    """(pack id, variant id, {role: (sha256, size)}) the pack lists for @p model_name, or None."""
     try:
         with open(PACK_FILE, encoding="utf-8") as f:
             pack = json.load(f)
     except (OSError, ValueError):
         return None
     for m in pack.get("models", []):
-        if m.get("name") == PACK_MODEL:
+        if m.get("name") == model_name:
             for v in m.get("variants", []):
-                for fl in v.get("files", []):
-                    if fl.get("role") == "model":
-                        return pack.get("pack"), v.get("id"), fl.get("sha256"), fl.get("size")
+                files = {fl.get("role"): (fl.get("sha256"), fl.get("size")) for fl in v.get("files", [])}
+                return pack.get("pack"), v.get("id"), files
     return None
 
 
@@ -385,14 +507,14 @@ def check_reference(predictor, inputs, image_path):
     return [t[0].numpy().copy() for t in predictor(*(torch.from_numpy(a) for a in inputs))]
 
 
-def check_int4(int4_path, inputs, ref):
+def check_model(name, model_path, inputs, ref):
     import numpy as np
     import onnxruntime as ort
 
-    log("check: int4 on ONNX Runtime CPU ...")
+    log(f"check: {name} on ONNX Runtime CPU ...")
     so = ort.SessionOptions()
     so.enable_cpu_mem_arena = False  # the arena roughly doubles peak memory on this graph
-    sess = ort.InferenceSession(int4_path, so, providers=["CPUExecutionProvider"])
+    sess = ort.InferenceSession(model_path, so, providers=["CPUExecutionProvider"])
     got = [t[0] for t in sess.run(OUTPUTS, dict(zip(INPUTS, inputs)))]
     del sess
     for name, a, b in zip(OUTPUTS, got, ref):
@@ -402,7 +524,7 @@ def check_int4(int4_path, inputs, ref):
     worst = float(np.median(dz))
     log(f"  depth: median relative error {worst:.4f}, p95 {float(np.percentile(dz, 95)):.4f}")
     if worst > 0.03:
-        fail(f"median relative depth error {worst:.3f} is above 3 %: the export does not match")
+        fail(f"{name}: median relative depth error {worst:.3f} is above 3 %: the export does not match")
 
 
 # ---------------------------------------------------------------------------- main
@@ -412,20 +534,29 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--accept-research-license", action="store_true",
                     help=f"confirm you accept Apple's research-only model licence ({LICENSE_URL})")
+    ap.add_argument("--variant", choices=["int4", "full", "both"],
+                    help="what to build (default: the variant this machine's provider picks, MODEL=auto)")
     ap.add_argument("--checkpoint", help=f"the official {CHECKPOINT_NAME} (downloaded into --work when omitted)")
     ap.add_argument("--ml-sharp", help=f"a clean apple/ml-sharp checkout at {ML_SHARP_COMMIT[:12]} (cloned when omitted)")
     ap.add_argument("--work", default=os.path.join(os.path.expanduser("~"), "displayxr-sharp-export"),
                     help="work directory for the download, the clone and the fp32 intermediate")
     ap.add_argument("--store", help="model store root (default: the runtime's own resolution)")
-    ap.add_argument("--no-store", action="store_true", help="leave the int4 file in --work only")
+    ap.add_argument("--no-store", action="store_true", help="leave the built files in --work only")
     ap.add_argument("--keep-fp32", action="store_true", help="keep the fp32 intermediate in --work")
-    ap.add_argument("--check", metavar="IMAGE", help="compare the int4 model against PyTorch fp32 on IMAGE")
+    ap.add_argument("--check", metavar="IMAGE", help="compare each built model against PyTorch fp32 on IMAGE")
     args = ap.parse_args()
 
     if not args.accept_research_license:
         print(f"SHARP is licensed for research use only: {LICENSE_URL}\n"
               "Read the licence, then re-run with --accept-research-license.", file=sys.stderr)
         return 2
+
+    if args.variant is None:
+        pick, why = machine_variant()
+        log(f"--variant {pick} (this machine's provider would pick it: {why}; --variant both builds both)")
+        variants = [pick]
+    else:
+        variants = ["full", "int4"] if args.variant == "both" else [args.variant]
 
     import numpy
     import onnx
@@ -455,42 +586,59 @@ def main():
     del predictor
     gc.collect()
 
-    provenance = {
-        "dxr.model": PACK_MODEL,
-        "dxr.converter": f"displayxr-conversion-open scripts/export_sharp.py {SCRIPT_VERSION}",
-        "dxr.parent.url": CHECKPOINT_URL,
-        "dxr.parent.sha256": CHECKPOINT_SHA256,
-        "dxr.code": f"apple/ml-sharp@{ML_SHARP_COMMIT}",
-        "dxr.license": "apple-amlr (research only) " + LICENSE_URL,
-    }
-    int4 = quantize_int4(fp32, os.path.join(work, f"{PACK_MODEL}.onnx"), provenance)
+    # variant -> [(role, path, sha256, size)], the model-role file last
+    built = {}
+    for variant in variants:
+        name, recipe = VARIANTS[variant]
+        provenance = {
+            "dxr.model": name,
+            "dxr.converter": f"displayxr-conversion-open scripts/export_sharp.py {recipe}",
+            "dxr.parent.url": CHECKPOINT_URL,
+            "dxr.parent.sha256": CHECKPOINT_SHA256,
+            "dxr.code": f"apple/ml-sharp@{ML_SHARP_COMMIT}",
+            "dxr.license": "apple-amlr (research only) " + LICENSE_URL,
+        }
+        if variant == "full":
+            built[variant] = write_full(fp32, os.path.join(work, name), provenance)
+        else:
+            path = quantize_int4(fp32, os.path.join(work, f"{name}.onnx"), provenance)
+            built[variant] = [("model", path, sha256_file(path), os.path.getsize(path))]
+        gc.collect()
     if not args.keep_fp32:
         shutil.rmtree(fp32_dir, ignore_errors=True)
-    size = os.path.getsize(int4)
-    sha = sha256_file(int4)
 
     if args.check:
-        check_int4(int4, inputs, reference)
+        for variant in variants:
+            check_model(VARIANTS[variant][0], built[variant][-1][1], inputs, reference)
 
-    log("")
-    log(f"{PACK_MODEL}.onnx  sha256 {sha}  size {size}")
-    log(f"  ({versions})")
-    expect = pack_expectation()
-    if expect is None:
-        log("  (no packs/dxr-open-sharp.models.json next to this script to compare against)")
-    elif expect[2] == sha and expect[3] == size:
-        log(f"  matches the pack entry {expect[0]}/{PACK_MODEL}/{expect[1]}")
-    else:
-        log(f"  WARNING: the pack lists sha256 {expect[2]} size {expect[3]}; these bytes differ.\n"
-            "  The model store will not hand them out under the pack entry. Use the pinned package\n"
-            "  versions (scripts/requirements-export-sharp.txt) to reproduce the listed bytes.")
-
+    ok = True
+    root = source = None
     if not args.no_store:
         root, source = store_root(args.store)
-        blob = store_put(root, int4, sha, size)
-        log(f"stored: {blob}  (store {root}, {source})")
-        log("`displayxr-cli conv models list` shows it under the dxr-open-sharp pack once that pack is registered.")
-    return 0 if expect is None or (expect[2] == sha and expect[3] == size) else 1
+    for variant in variants:
+        name = VARIANTS[variant][0]
+        log("")
+        for role, path, sha, size in built[variant]:
+            log(f"{name} {role:5s}  sha256 {sha}  size {size}")
+        log(f"  ({versions})")
+        expect = pack_expectation(name)
+        got = {role: (sha, size) for role, _, sha, size in built[variant]}
+        if expect is None:
+            log(f"  (no {name} entry in packs/dxr-open-sharp.models.json next to this script to compare against)")
+        elif expect[2] == got:
+            log(f"  matches the pack entry {expect[0]}/{name}/{expect[1]}")
+        else:
+            ok = False
+            log(f"  WARNING: the pack lists {expect[2]}; these bytes differ.\n"
+                "  The model store will not hand them out under the pack entry. Use the pinned package\n"
+                "  versions (scripts/requirements-export-sharp.txt) to reproduce the listed bytes.")
+        if root is not None:
+            for role, path, sha, size in built[variant]:  # the model file last
+                blob = store_put(root, path, sha, size)
+                log(f"stored: {blob}  (store {root}, {source})")
+    if root is not None:
+        log("`displayxr-cli conv models list` shows them under the dxr-open-sharp pack once that pack is registered.")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
