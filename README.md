@@ -64,6 +64,7 @@ for identity, I/O and licence, and resolves blob bytes only through the host:
 |---|---|---|
 | `probe` | `model_resolve(ref)` (non-blocking) | `INSTALLED` (cold; the model downloads on first use if it is not in the store) or `DOWNLOADING` if the host is already fetching it |
 | `warm`, blob in the store | `model_resolve` → `READY` + path | `WARMING` (session load, one warm-up inference) → `READY` |
+| `warm`, blob in the store, not yet verified by this process | `model_resolve` → `INSTALLED`, `model_request(ref)`, then `model_resolve` every 50 ms while it reads `WARMING` (the store re-hashes it) | `WARMING` ("the model store is verifying it", the host's progress when it gives one) → session load → `READY`; `ABSENT` only when the store's state and progress stop moving for 2 min, or for the model's bytes at 8 MiB/s if longer |
 | `warm`, blob missing | `model_request(ref)`, then `model_resolve` every 50 ms | `DOWNLOADING` with the host's progress → `WARMING` → `READY` |
 | `warm`, download refused (policy, no store) | `model_request` returns false | `ABSENT` — the runtime falls through to the next provider; a later `warm` asks again |
 | `warm`, the store failed | `model_resolve` → `FAILED` | `FAILED(reason)` (retryable for `NETWORK`) |
@@ -454,6 +455,7 @@ protocol, without network.
 | `splats-pick-auto-cpu` | a two-model pack (`tiny-full` = high, `tiny-int4` = low) on the CPU: `MODEL=auto` picks `tiny-int4` | no |
 | `splats-pick-full-external-data` | `MODEL=full`: `tiny-full`, stored as a graph + an external-data file named by its sha256, downloads both files and runs (the full SHARP layout) | no |
 | `splats-pick-fallback` | the store holds only `tiny-full`, downloads off: `auto` (int4 on a CPU) takes `tiny-full` and says so | no |
+| `splats-pick-slow-verify` | the same store, re-verified by the host for 7 s (longer than the 5 s request grace; the runtime's store re-hashes a stored blob once per process): the provider waits through `WARMING`, then runs | no |
 | `splats-pick-forced-absent` | the same store, `MODEL=int4`: `ABSENT` with the reason, never switched to `tiny-full` | no |
 | `splats-pick-full-openvino-cpu` | `MODEL=full` on OpenVINO's CPU device: OpenVINO finds the external data the same way | no |
 | `splats-default-ep` (`-DOPENCONV_TEST_GPU=ON -DOPENCONV_TEST_SPLAT_MODEL=<.onnx> [-DOPENCONV_TEST_SPLAT_IMAGE=<.ppm>]`) | a real splat model you built yourself, on the default backend (OpenVINO GPU where there is one); nothing is fetched | yes (yours) |

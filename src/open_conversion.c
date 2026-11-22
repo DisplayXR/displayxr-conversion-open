@@ -97,6 +97,12 @@
 #define OC_OPT_DEFAULT OC_OPT_EXTENDED
 #define OC_POLL_MS 50u            //!< warm() polls the host and is_cancelled this often (≤ 250 ms)
 #define OC_REQUEST_GRACE_MS 5000u //!< ABSENT this long after an accepted request = refused
+/*! The store verifying a model (WARMING: it re-hashes a stored blob once per process)
+ *  is progress, not a refusal. warm() gives up only when the store's state and
+ *  progress stop moving for the longer of this ... */
+#define OC_STORE_STALL_MIN_MS 120000u
+//! ... and the model's bytes at this hashing floor (a slow disk), so a big model never times out early.
+#define OC_STORE_VERIFY_FLOOR_BPS (8ull << 20)
 
 /*! xrt_plugin_platform_state values (xrt_plugin.h), restated so this file
  *  needs only the conversion header. */
@@ -292,6 +298,17 @@ static bool
 store_request(const char *ref)
 {
 	return HOST_HAS(model_request) && g_host->model_request(ref);
+}
+
+//! The bytes the store hands out for a variant: its model file and every data file.
+static uint64_t
+variant_bytes(const struct oc_pack_variant *v)
+{
+	uint64_t n = v != NULL ? v->file.size : 0;
+	for (uint32_t i = 0; v != NULL && i < v->data_count; i++) {
+		n += v->data[i].size;
+	}
+	return n;
 }
 
 
@@ -1568,6 +1585,9 @@ oc_warm(struct xrt_conversion_plugin_instance *inst, uint32_t cap_id, bool (*is_
 	struct xrt_conv_model_location loc;
 	bool requested = false;
 	uint64_t absent_since = 0;
+	uint64_t verify_t0 = 0, moved_at = 0; // the store's verify: start, last state / progress change
+	uint32_t seen_state = UINT32_MAX;
+	float seen_progress = -2.0f;
 	char err[XRT_CONV_DETAIL_MAX];
 	enum oc_run_status r = OC_RUN_FAILED;
 
@@ -1582,7 +1602,45 @@ resolve:
 		}
 		const bool known = store_resolve(c->ref, &loc);
 		if (known && loc.state == XRT_CONV_STATE_READY && loc.path[0] != '\0') {
+			if (verify_t0 != 0) {
+				fprintf(stderr, "[open-conversion] %s: the model store verified it in %llu ms\n",
+				        m->name, (unsigned long long)(oc_now_ms() - verify_t0));
+			}
 			break;
+		}
+		if (known && loc.state == XRT_CONV_STATE_WARMING) {
+			// Every file is on disk and the store is hashing it: wait while it
+			// moves (state or progress), fail only a store that has stalled.
+			const uint64_t now = oc_now_ms();
+			const uint64_t bytes = variant_bytes(c->variant);
+			const uint64_t floor_ms = bytes * 1000ull / OC_STORE_VERIFY_FLOOR_BPS;
+			const uint64_t stall_ms = floor_ms > OC_STORE_STALL_MIN_MS ? floor_ms : OC_STORE_STALL_MIN_MS;
+			if (verify_t0 == 0) {
+				verify_t0 = now;
+				fprintf(stderr, "[open-conversion] %s: the model store is verifying it (%.2f GB)\n",
+				        m->name, (double)bytes / 1e9);
+			}
+			if (loc.state != seen_state || loc.progress > seen_progress) {
+				seen_state = loc.state;
+				seen_progress = loc.progress;
+				moved_at = now;
+			} else if (now - moved_at > stall_ms) {
+				snprintf(why, sizeof(why),
+				         "%.40s: the model store stopped verifying it (no progress in %llu s)", m->name,
+				         (unsigned long long)(stall_ms / 1000u));
+				set_state(p, c, XRT_CONV_STATE_ABSENT, XRT_CONV_FAIL_NONE, 0, -1.0f, why);
+				return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+			}
+			// Verify is the first stretch of the warm (loading starts at 0.1); the
+			// host's progress when it gives one, else none.
+			snprintf(why, sizeof(why), "%.40s: the model store is verifying it (%llu s)", m->name,
+			         (unsigned long long)((now - verify_t0) / 1000u));
+			set_state(p, c, XRT_CONV_STATE_WARMING, XRT_CONV_FAIL_NONE, 0,
+			          loc.progress >= 0.0f ? 0.1f * (loc.progress > 1.0f ? 1.0f : loc.progress) : -1.0f,
+			          why);
+			absent_since = 0;
+			oc_sleep_ms(OC_POLL_MS);
+			continue;
 		}
 		if (known && loc.state == XRT_CONV_STATE_DOWNLOADING) {
 			snprintf(why, sizeof(why), "%s: downloading", m->name);
@@ -1603,13 +1661,22 @@ resolve:
 		if (!requested) {
 			requested = true;
 			if (!store_request(c->ref)) {
+				// ABSENT(MODEL) after a refused request: a locally built model that
+				// nothing can fetch (spec §5.3, build-locally); else a policy.
+				struct xrt_conv_model_location after;
+				const bool build = store_resolve(c->ref, &after) &&
+				                   after.state == XRT_CONV_STATE_ABSENT &&
+				                   after.failure_reason == XRT_CONV_FAIL_MODEL;
 				if (c->pick_forced) {
 					// MODEL names this model: say so, never switch to the other one.
 					snprintf(
 					    why, sizeof(why),
-					    "%.40s: MODEL=%s, but it is not in the model store (build or fetch it); "
-					    "not switching",
-					    m->name, p->splat_model_setting);
+					    "%.40s: MODEL=%s, but it is not in the model store (%s); not switching",
+					    m->name, p->splat_model_setting,
+					    build ? "build it locally" : "build or fetch it");
+				} else if (build) {
+					snprintf(why, sizeof(why), "%.40s: not in the model store; build it locally",
+					         m->name);
 				} else {
 					snprintf(why, sizeof(why),
 					         "%s: not in the model store and the download is not allowed", m->name);
