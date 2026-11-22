@@ -136,11 +136,21 @@ parse_model(const struct oc_json *jm, struct oc_pack_model *m, char *err, size_t
 	}
 	copy_str(m->depth_kind, sizeof(m->depth_kind), oc_json_str(out, "depth_kind", ""));
 	copy_str(m->measure, sizeof(m->measure), oc_json_str(out, "measure", "planar"));
+	copy_str(m->coords, sizeof(m->coords), oc_json_str(out, "coords", ""));
+	copy_str(m->splat_format, sizeof(m->splat_format), oc_json_str(out, "splat_format", ""));
+	copy_str(m->color_space, sizeof(m->color_space), oc_json_str(out, "color_space", "linear"));
+	m->splat_count = (uint32_t)oc_json_num(out, "count", 0.0);
 	copy_str(m->t_image, sizeof(m->t_image), oc_json_str(t, "image", ""));
 	copy_str(m->t_depth, sizeof(m->t_depth), oc_json_str(t, "depth", ""));
 	copy_str(m->t_cache_in, sizeof(m->t_cache_in), oc_json_str(t, "cache_in", ""));
 	copy_str(m->t_cache_out, sizeof(m->t_cache_out), oc_json_str(t, "cache_out", ""));
 	copy_str(m->t_is_first, sizeof(m->t_is_first), oc_json_str(t, "is_first", ""));
+	copy_str(m->t_disparity_factor, sizeof(m->t_disparity_factor), oc_json_str(t, "disparity_factor", ""));
+	copy_str(m->t_means, sizeof(m->t_means), oc_json_str(t, "means", ""));
+	copy_str(m->t_scales, sizeof(m->t_scales), oc_json_str(t, "scales", ""));
+	copy_str(m->t_quats, sizeof(m->t_quats), oc_json_str(t, "rotations", ""));
+	copy_str(m->t_colors, sizeof(m->t_colors), oc_json_str(t, "colors", ""));
+	copy_str(m->t_opacities, sizeof(m->t_opacities), oc_json_str(t, "opacities", ""));
 	const struct oc_json *cs = oc_json_get(st, "cache_shape");
 	for (const struct oc_json *d = cs != NULL ? cs->child : NULL; d != NULL; d = d->next) {
 		if (d->type != OC_JSON_NUMBER || d->number < 1.0 || m->cache_rank >= 4) {

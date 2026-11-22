@@ -1,0 +1,33 @@
+{
+  "schema": 2,
+  "pack": "dxr-open-test-splats-local",
+  "generated": "2026-11-22",
+  "provider": "open-conversion",
+  "blobBaseUrl": "file://@_splat_link_dir@",
+  "commercial": false,
+  "models": [
+    {
+      "name": "splats-local",
+      "version": "0.0.0-test",
+      "task": "splats-mono",
+      "io": {
+        "input": { "color_space": "srgb", "range": [0, 1], "layout": "nchw-rgb", "resolution": "fixed-1536x1536",
+                   "native_long_edge": 1536, "intrinsics_in": "focal" },
+        "output": { "coords": "opencv", "splat_format": "sharp-projective", "color_space": "linear", "count": 1179648,
+                    "intrinsics_out": "none" },
+        "tensors": { "image": "image", "disparity_factor": "disparity_factor", "means": "mean_vectors",
+                     "scales": "singular_values", "rotations": "quaternions", "colors": "colors",
+                     "opacities": "opacities" }
+      },
+      "license": { "spdx": "LicenseRef-local-test", "link": "https://example.invalid/local", "commercial": false },
+      "prefetch": false,
+      "variants": [
+        {
+          "id": "local", "backend": "onnx", "ep": ["openvino", "cpu"], "precision": "int4",
+          "files": [ { "role": "model", "format": "onnx", "sha256": "@_splat_sha@", "size": @_splat_size@ } ]
+        }
+      ]
+    }
+  ],
+  "defaults": { "splats-mono": { "low": "splats-local", "medium": "splats-local", "high": "splats-local" } }
+}

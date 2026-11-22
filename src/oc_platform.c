@@ -44,6 +44,20 @@ oc_copy_str(char *dst, size_t cap, const char *src)
 	dst[n] = '\0';
 }
 
+
+static bool
+ends_with(const char *s, const char *suffix)
+{
+	const size_t n = strlen(s), k = strlen(suffix);
+	return n >= k && strcmp(s + n - k, suffix) == 0;
+}
+
+static int
+cmp_names(const void *a, const void *b)
+{
+	return strcmp((const char *)a, (const char *)b);
+}
+
 #ifdef _WIN32
 
 void
@@ -178,6 +192,37 @@ oc_sweep_stale(const char *dir, const char *prefix)
 {
 	(void)dir;
 	(void)prefix;
+}
+
+uint32_t
+oc_list_dir(const char *dir, const char *suffix, char *names, size_t name_size, uint32_t max)
+{
+	char pattern[MAX_PATH * 2];
+	wchar_t w[MAX_PATH * 2];
+	snprintf(pattern, sizeof(pattern), "%s\\*", dir != NULL ? dir : "");
+	if (dir == NULL || !to_wide(pattern, w, (int)(sizeof(w) / sizeof(w[0])))) {
+		return 0;
+	}
+	WIN32_FIND_DATAW fd;
+	HANDLE h = FindFirstFileW(w, &fd);
+	if (h == INVALID_HANDLE_VALUE) {
+		return 0;
+	}
+	uint32_t n = 0;
+	do {
+		char name[MAX_PATH * 3];
+		if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+		    WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name, (int)sizeof(name), NULL, NULL) == 0) {
+			continue;
+		}
+		if (ends_with(name, suffix) && strlen(name) < name_size && n < max) {
+			oc_copy_str(names + (size_t)n * name_size, name_size, name);
+			n++;
+		}
+	} while (FindNextFileW(h, &fd));
+	FindClose(h);
+	qsort(names, n, name_size, cmp_names);
+	return n;
 }
 
 void *
@@ -359,6 +404,31 @@ oc_sweep_stale(const char *dir, const char *prefix)
 		(void)oc_remove_tree(path);
 	}
 	closedir(d);
+}
+
+uint32_t
+oc_list_dir(const char *dir, const char *suffix, char *names, size_t name_size, uint32_t max)
+{
+	DIR *d = dir != NULL ? opendir(dir) : NULL;
+	if (d == NULL) {
+		return 0;
+	}
+	uint32_t n = 0;
+	struct dirent *e;
+	while ((e = readdir(d)) != NULL) {
+		char path[4096];
+		struct stat st;
+		snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+		if (!ends_with(e->d_name, suffix) || strlen(e->d_name) >= name_size || n >= max ||
+		    stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+			continue;
+		}
+		oc_copy_str(names + (size_t)n * name_size, name_size, e->d_name);
+		n++;
+	}
+	closedir(d);
+	qsort(names, n, name_size, cmp_names);
+	return n;
 }
 
 void *

@@ -88,6 +88,12 @@ oc_process_id(void);
 void
 oc_sweep_stale(const char *dir, const char *prefix);
 
+/*! The names of the regular files in @p dir that end in @p suffix, sorted
+ *  (strcmp), at most @p max of them, each at most @p name_size bytes. Returns
+ *  the count (0 when the directory cannot be read). */
+uint32_t
+oc_list_dir(const char *dir, const char *suffix, char *names, size_t name_size, uint32_t max);
+
 /*! Load a shared library by ABSOLUTE path; its own dependencies resolve from
  *  its directory first (Windows: LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, with
  *  backslashes). Never via PATH. */

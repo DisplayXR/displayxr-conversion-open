@@ -103,8 +103,14 @@ Section "Open Conversion provider"
 	WriteRegStr   HKLM "${ROW}" "Vendor"          "DisplayXR"
 	WriteRegStr   HKLM "${ROW}" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
 	WriteRegDWORD HKLM "${ROW}" "ProbeOrder"      200
-	; Packs is a REG_MULTI_SZ (NSIS has no native writer).
-	nsExec::ExecToLog '"$SYSDIR\reg.exe" add "HKLM\${ROW}" /v Packs /t REG_MULTI_SZ /d "$INSTDIR\dxr-open-default.models.json" /f /reg:64'
+	; Packs is a REG_MULTI_SZ (NSIS has no native writer): the default pack, plus the
+	; research-only splat pack when this build ships it (a manifest only: its weights are
+	; never shipped, the user builds them locally and the model store holds them).
+	StrCpy $1 "$INSTDIR\dxr-open-default.models.json"
+	${If} ${FileExists} "$INSTDIR\dxr-open-sharp.models.json"
+		StrCpy $1 "$1\0$INSTDIR\dxr-open-sharp.models.json"
+	${EndIf}
+	nsExec::ExecToLog '"$SYSDIR\reg.exe" add "HKLM\${ROW}" /v Packs /t REG_MULTI_SZ /d "$1" /f /reg:64'
 	Pop $0
 	${If} $0 != 0
 		SetErrorLevel 6
@@ -146,7 +152,8 @@ Section "Uninstall"
 	Delete "$INSTDIR\DisplayXR-OpenConversion.dll"
 	Delete "$INSTDIR\onnxruntime*.dll"
 	Delete "$INSTDIR\DirectML.dll"
-	Delete "$INSTDIR\dxr-open-default.models.json"
+	Delete "$INSTDIR\*.models.json"
+	RMDir /r "$INSTDIR\openvino"
 	RMDir /r "$INSTDIR\licenses"
 	Delete "$INSTDIR\Uninstall.exe"
 	RMDir "$INSTDIR"

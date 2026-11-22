@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: BSL-1.0
 #
 # Build the provider and the fake host on Windows, Ubuntu 22.04 and macOS, run every CTest
-# (inference on the CPU execution provider), check the provider exports exactly one symbol,
-# and validate the model pack (including: no pre-fetched blob is non-commercial).
+# (inference on the CPU execution provider; the splat lane on a synthetic model, on ONNX
+# Runtime and on OpenVINO's CPU device), check the provider exports exactly one symbol and
+# imports no inference runtime, and validate the model pack (including: no pre-fetched blob is
+# non-commercial).
 
 name: build
 
@@ -44,11 +46,14 @@ jobs:
           path: |
             downloads
             models-cache
-          key: deps-${{ runner.os }}-${{ hashFiles('cmake/OnnxRuntime.cmake', 'packs/*.json') }}
+          key: deps-${{ runner.os }}-${{ hashFiles('cmake/OnnxRuntime.cmake', 'cmake/OpenVINO.cmake', 'packs/*.json') }}
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      - name: Test tools (onnx builds the synthetic splat model the splat tests run)
+        run: python -m pip install --quiet onnx==1.19.1 numpy
 
       - name: Fetch the test models (hash-checked)
         run: python -I scripts/fetch_models.py packs/dxr-open-default.models.json models-cache --models vda-small-stream-518x294,da2-small
@@ -85,7 +90,7 @@ jobs:
           $deps = & dumpbin /nologo /dependents build\DisplayXR-OpenConversion.dll | Select-String '\.dll' |
             ForEach-Object { $_.Line.Trim() } | Where-Object { $_ -notmatch '^Dump of file' }
           Write-Host "imports: $($deps -join ', ')"
-          if ($deps -match 'onnxruntime|DirectML') { Write-Error "ONNX Runtime / DirectML must not be imported statically" }
+          if ($deps -match 'onnxruntime|DirectML|openvino') { Write-Error "ONNX Runtime / DirectML / OpenVINO must not be imported statically" }
 
       - name: Exactly one export (Linux)
         if: runner.os == 'Linux'
@@ -94,6 +99,7 @@ jobs:
           echo "exports: $names"
           test "$names" = "xrtConversionPluginNegotiate"
           ! readelf -d build/DisplayXR-OpenConversion.so | grep -q onnxruntime
+          ! readelf -d build/DisplayXR-OpenConversion.so | grep -q openvino
 
       - name: Exactly one export (macOS)
         if: runner.os == 'macOS'
