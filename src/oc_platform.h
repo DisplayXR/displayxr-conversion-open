@@ -103,6 +103,10 @@ oc_lib_open(const char *path, char *err, size_t err_size);
 void *
 oc_lib_sym(void *lib, const char *name);
 
+/*! Physical memory the OS reports, in MiB; 0 = unknown. */
+uint64_t
+oc_system_ram_mb(void);
+
 /*! Copy at most cap-1 bytes and terminate. */
 void
 oc_copy_str(char *dst, size_t cap, const char *src);

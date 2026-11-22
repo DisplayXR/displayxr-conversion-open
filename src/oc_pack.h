@@ -26,6 +26,7 @@ extern "C" {
 #define OC_PACK_MAX_EPS 4
 #define OC_PACK_MAX_DEFAULTS 8
 #define OC_PACK_MAX_DEPS 4
+#define OC_PACK_MAX_DATA_FILES 3 //!< files beside the model file (role "data": ONNX external weights)
 
 struct oc_pack_file
 {
@@ -43,6 +44,13 @@ struct oc_pack_variant
 	uint32_t ep_count;
 	char precision[24];
 	struct oc_pack_file file; //!< the one "model" file
+	/*! The variant's other files (role "data"). The provider never opens them:
+	 *  the store hands out a variant only when every file is present and
+	 *  verified, and lays them out side by side (blobs/<sha256>), so a model
+	 *  that names its external weights by their sha256 finds them. The fake
+	 *  host stores them. */
+	struct oc_pack_file data[OC_PACK_MAX_DATA_FILES];
+	uint32_t data_count;
 };
 
 struct oc_pack_model
