@@ -1889,9 +1889,14 @@ main(int argc, char **argv)
 		      "cap %u cold state: %s (reason %u, retryable %u) '%s'", caps[i].cap_id, state_name(st.state),
 		      st.failure_reason, st.retryable, st.detail);
 		if (caps[i].model_id[0] == '\0') {
-			// No pack names a model for the task (the default pack has no splat model).
-			check(st.state == XRT_CONV_STATE_ABSENT, "cap %u: no model for %s -> ABSENT", caps[i].cap_id,
-			      task_name(caps[i].task));
+			// No pack names a model for the task (the default pack has no splat model): ABSENT,
+			// unless the runtime it is bound to already failed (that state comes first).
+			const bool runtime_state = strcmp(expect, "version") == 0 &&
+			                           st.state == XRT_CONV_STATE_FAILED &&
+			                           st.failure_reason == XRT_CONV_FAIL_VERSION;
+			check(st.state == XRT_CONV_STATE_ABSENT || runtime_state,
+			      "cap %u: no model for %s -> ABSENT (%s)", caps[i].cap_id, task_name(caps[i].task),
+			      state_name(st.state));
 		} else if (strcmp(expect, "absent") == 0) {
 			check(st.state == XRT_CONV_STATE_ABSENT, "cap %u: expected ABSENT", caps[i].cap_id);
 		} else if (strcmp(expect, "version") == 0) {
