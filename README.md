@@ -174,6 +174,28 @@ needs it: `probe` checks that the files are there, nothing more.
   killed process is replaced rather than trusted; the scratch directory may be deleted at any time.
 - **macOS** builds carry no OpenVINO: the splat capability runs on ONNX Runtime there.
 
+Measured on a developer laptop with an Intel Panther Lake iGPU (Ubuntu 26.04, OpenVINO 2026.4.1),
+a 4-bit SHARP export, one 6016 × 4000 photo, focal given, through the provider (fake host, the
+model store played per protocol). **The GPU was shared with a desktop browser using ~75 % of its
+render engine during these runs**, which also slows OpenVINO's compute: compare ratios, and
+expect an idle GPU to be several times faster (the same reference script measured 2.4 s per
+inference on this machine when the GPU was idle; under the same load it measured 10.9 – 12.4 s).
+
+| | OpenVINO GPU |
+|---|---|
+| warm, first (no cache; includes the fake store's copy) | 13.5 – 16.0 s (compile 11 – 14 s) |
+| warm, cached compile | 3.5 s (import 3.2 s) |
+| one job (preprocess + inference + PLY), median of 3 | 13.1 s (inference 12.4 – 13.4 s, PLY 0.35 – 0.39 s) |
+| reference script, same model, same load | 10.9 – 12.4 s (inference only) |
+| peak RSS, cached / first compile | 0.59 / 1.64 GB |
+| result | 1 179 648 Gaussians, 66 MB PLY |
+
+Geometry against the same model run by the reference script on the same device: median depth
+difference 0.17 % (95th percentile 2.8 %), means relative L2 2.3 %, the same splat count; the
+reference script's own CPU-vs-GPU difference is 1.1 % / 3.3 %, so the provider is within that
+noise. Against the PyTorch fp32 checkpoint: median depth difference 1.2 %, the same as the
+reference script's int4 run (1.1 %).
+
 ## Getting a splat model (`conv models fetch`, the export script)
 
 Research-only weights are **never bundled, mirrored or pre-fetched** (ADR-057 §5), and the
@@ -184,7 +206,10 @@ see that script for its requirements and the licence it asks you to accept. A pa
 a downloadable source is fetched the usual way, `displayxr-cli conv models fetch <pack>
 --model <name>` (the same action as the Dashboard's Download button). Either way the runtime
 selects the capability only with `AllowResearchOnly` (`displayxr-cli conv run … --allow-research-only`
-for one run).
+for one run). As of runtime v2.69.4 the runtime reads `AllowResearchOnly` only from the Windows
+registry, so on Linux and macOS its model store refuses a research-only model (`fetch` reports
+`policy`), and `conv run` hosts providers without a model store; both are runtime work, tracked
+with this capability.
 
 ## Build
 
