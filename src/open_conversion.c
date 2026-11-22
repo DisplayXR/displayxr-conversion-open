@@ -14,6 +14,10 @@
  *   cap 3  SPLATS_MONO  job lane: photo -> 3DGS PLY, from whatever model the
  *                       packs name for "splats-mono" (none in the default
  *                       pack: a splat model is a separate, user-installed pack).
+ *                       Setting MODEL picks between the pack's full model
+ *                       (defaults.high) and its small one (defaults.low):
+ *                       auto = full on a GPU backend with >= 16 GB of RAM,
+ *                       among the models actually in the store.
  *
  * The splat capability runs through OpenVINO when the provider ships it
  * (oc_ov.h; its GPU device, else its CPU device, else ONNX Runtime's CPU
@@ -78,6 +82,12 @@
 #define OC_CAP_COUNT 3u
 #define OC_MAX_SPLAT_INPUT_EDGE 8192u //!< the runtime downscales above it; the splat model resamples to its grid
 #define OC_ASSUMED_FOCAL_MM 30.0      //!< no focal given: a 30 mm full-frame equivalent, labelled ASSUMED
+/*! MODEL=auto picks the full splat model only with at least this much RAM: "16 GB" as
+ *  the OS reports it (firmware and an integrated GPU reserve some of it, so a 16 GB
+ *  machine reports a little under 16 GiB). */
+#define OC_FULL_MODEL_MIN_RAM_MB (15u * 1024u)
+#define OC_SPLAT_FULL 0u  //!< splat_cand index: defaults["splats-mono"].high
+#define OC_SPLAT_SMALL 1u //!< splat_cand index: defaults["splats-mono"].low
 
 #define OC_MAX_STREAMS_VIDEO 2u //!< each holds a temporal cache of ~160 MB (518 px model)
 #define OC_MAX_STREAMS_MONO 4u
@@ -136,6 +146,10 @@ struct oc_cap
 	char detail[XRT_CONV_DETAIL_MAX];
 	char version[48];
 
+	/* SPLATS_MONO: why the bound model was picked (MODEL), under `lock`. */
+	bool pick_forced;    //!< MODEL=full / int4: never switched to the other model
+	char pick_note[128]; //!< non-empty when the preferred model was absent and the other one used
+
 	/* [S]-only. */
 	struct oc_session *session;       //!< ONNX Runtime
 	struct oc_ov_session *ov_session; //!< OpenVINO (the splat capability)
@@ -163,9 +177,11 @@ struct oc_provider
 	char ort_path[1100];
 	char quality[16];
 	char ep_setting[16];
-	char ov_device_setting[8]; //!< "auto", "gpu", "cpu"
-	char ov_dir[1100];         //!< the OpenVINO runtime folder
-	char scratch[1100];        //!< the host's per-provider scratch dir; "" = none
+	char ov_device_setting[8];   //!< "auto", "gpu", "cpu"
+	char splat_model_setting[8]; //!< MODEL: "auto", "full", "int4"
+	uint64_t ram_mb;             //!< physical memory (oc_system_ram_mb), 0 = unknown
+	char ov_dir[1100];           //!< the OpenVINO runtime folder
+	char scratch[1100];          //!< the host's per-provider scratch dir; "" = none
 	int threads;
 	enum oc_graph_opt opt;
 	enum oc_ort_log ort_log;
@@ -193,6 +209,12 @@ struct oc_provider
 	bool ov_devices_known;
 	bool ov_has_gpu;
 	char ov_gpu_name[96];
+
+	/* SPLATS_MONO's two candidate models and which of their variants' blobs are in
+	 * the store (refresh_splat_presence, outside `lock`; read under it). */
+	const struct oc_pack *splat_pack[2];
+	const struct oc_pack_model *splat_cand[2]; //!< [OC_SPLAT_FULL], [OC_SPLAT_SMALL]
+	bool splat_on_disk[2][OC_PACK_MAX_VARIANTS];
 
 	/* [S]-only scratch, grown on demand. */
 	float *chw;
@@ -448,10 +470,123 @@ default_model(const struct oc_provider *p, const char *task, const struct oc_pac
 	return NULL;
 }
 
+/*! The model `defaults[task][tier]` names, in the first pack that names one. */
+static const struct oc_pack_model *
+tier_model(const struct oc_provider *p, const char *task, const char *tier, const struct oc_pack **out_pack)
+{
+	for (uint32_t i = 0; i < p->pack_count; i++) {
+		const struct oc_pack_model *m = oc_pack_default_model(p->packs[i], task, tier);
+		if (m != NULL) {
+			*out_pack = p->packs[i];
+			return m;
+		}
+	}
+	*out_pack = NULL;
+	return NULL;
+}
+
+/*! Does @p ep (with the cap's OpenVINO device) run on a GPU? */
+static bool
+backend_is_gpu(const struct oc_provider *p, const struct oc_cap *c, enum oc_ep ep)
+{
+	(void)p;
+	return ep == OC_EP_DML || ep == OC_EP_COREML || (ep == OC_EP_OPENVINO && strcmp(c->ov_device, "GPU") == 0);
+}
+
+/*! The variant bind_cap_locked would take for @p ep: the accelerator's, else the CPU one. */
+static const struct oc_pack_variant *
+variant_for(const struct oc_pack_model *m, enum oc_ep ep)
+{
+	const struct oc_pack_variant *v = oc_pack_variant_for_ep(m, ep_pack_name(ep));
+	return v != NULL ? v : oc_pack_variant_for_ep(m, "cpu");
+}
+
+/*! Is the blob of candidate @p k's variant for @p ep in the store (last refresh)? */
+static bool
+splat_present_locked(const struct oc_provider *p, uint32_t k, enum oc_ep ep)
+{
+	const struct oc_pack_model *m = p->splat_cand[k];
+	const struct oc_pack_variant *v = m != NULL ? variant_for(m, ep) : NULL;
+	return v != NULL && p->splat_on_disk[k][v - m->variants];
+}
+
+/*!
+ * SPLATS_MONO's model (setting MODEL): "full" = the model defaults["splats-mono"].high
+ * names, "int4" = the one .low names. auto = full when the cap's backend is a GPU
+ * (OpenVINO's GPU device, DirectML, Core ML) and the machine has >= 16 GB of RAM, else
+ * int4; and only among the models whose blob is in the store: the preferred one absent
+ * and the other present = the other (said in pick_note and the INFO line). Neither
+ * present = the preferred one, which then reports what it needs (a local build, a
+ * download) the usual way. A forced MODEL never switches. Caller holds `lock` or is in probe.
+ */
+static const struct oc_pack_model *
+pick_splat_model_locked(struct oc_provider *p, struct oc_cap *c, enum oc_ep ep, const struct oc_pack **out_pack)
+{
+	c->pick_note[0] = '\0';
+	c->pick_forced = false;
+	const struct oc_pack_model *full = p->splat_cand[OC_SPLAT_FULL];
+	const struct oc_pack_model *small = p->splat_cand[OC_SPLAT_SMALL];
+	if (full == NULL || small == NULL || full == small) {
+		// One model (or none) for the task: nothing to choose.
+		const uint32_t k = full != NULL ? OC_SPLAT_FULL : OC_SPLAT_SMALL;
+		*out_pack = p->splat_pack[k];
+		return p->splat_cand[k];
+	}
+	uint32_t want;
+	if (strcmp(p->splat_model_setting, "full") == 0) {
+		want = OC_SPLAT_FULL;
+		c->pick_forced = true;
+	} else if (strcmp(p->splat_model_setting, "int4") == 0) {
+		want = OC_SPLAT_SMALL;
+		c->pick_forced = true;
+	} else {
+		// The backend the full model would really run on: a model without a variant for
+		// the accelerator runs on the CPU (bind_cap_locked), and that is not a GPU.
+		const enum oc_ep full_ep = oc_pack_variant_for_ep(full, ep_pack_name(ep)) != NULL ? ep : OC_EP_CPU;
+		want = backend_is_gpu(p, c, full_ep) && p->ram_mb >= OC_FULL_MODEL_MIN_RAM_MB ? OC_SPLAT_FULL
+		                                                                              : OC_SPLAT_SMALL;
+	}
+	uint32_t k = want;
+	const uint32_t other = want == OC_SPLAT_FULL ? OC_SPLAT_SMALL : OC_SPLAT_FULL;
+	if (!c->pick_forced && !splat_present_locked(p, want, ep) && splat_present_locked(p, other, ep)) {
+		k = other;
+		snprintf(c->pick_note, sizeof(c->pick_note), "%.30s is not in the store; using %.30s",
+		         p->splat_cand[want]->name, p->splat_cand[other]->name);
+	}
+	*out_pack = p->splat_pack[k];
+	return p->splat_cand[k];
+}
+
+/*! Re-read which splat candidate blobs are in the store (a stat each, through the
+ *  host). Not under `lock`: the host is called. */
+static void
+refresh_splat_presence(struct oc_provider *p)
+{
+	bool on_disk[2][OC_PACK_MAX_VARIANTS];
+	memset(on_disk, 0, sizeof(on_disk));
+	for (uint32_t k = 0; k < 2; k++) {
+		const struct oc_pack_model *m = p->splat_cand[k];
+		for (uint32_t i = 0; m != NULL && i < m->variant_count; i++) {
+			char ref[192];
+			oc_pack_ref(p->splat_pack[k], m, &m->variants[i], ref, sizeof(ref));
+			struct xrt_conv_model_location loc;
+			// On disk (verified or not) or on its way: anything but ABSENT / FAILED.
+			on_disk[k][i] =
+			    store_resolve(ref, &loc) &&
+			    (loc.state == XRT_CONV_STATE_READY || loc.state == XRT_CONV_STATE_INSTALLED ||
+			     loc.state == XRT_CONV_STATE_WARMING || loc.state == XRT_CONV_STATE_DOWNLOADING);
+		}
+	}
+	oc_lock(&p->lock);
+	memcpy(p->splat_on_disk, on_disk, sizeof(on_disk));
+	oc_unlock(&p->lock);
+}
+
 /*! Describe-time fields for a cap on an EP, from its pack model. Caller holds `lock` or is in probe. */
 static void
 bind_cap_locked(struct oc_provider *p, struct oc_cap *c, enum oc_ep ep)
 {
+	const struct oc_pack_model *prev = c->model;
 	c->model = NULL;
 	c->variant = NULL;
 	c->pack = NULL;
@@ -462,7 +597,8 @@ bind_cap_locked(struct oc_provider *p, struct oc_cap *c, enum oc_ep ep)
 		ep = p->default_ep;
 	}
 	const struct oc_pack *pk = NULL;
-	const struct oc_pack_model *m = default_model(p, c->task_name, &pk);
+	const struct oc_pack_model *m =
+	    is_splats(c) ? pick_splat_model_locked(p, c, ep, &pk) : default_model(p, c->task_name, &pk);
 	const struct oc_pack_variant *v = NULL;
 	if (m != NULL) {
 		v = oc_pack_variant_for_ep(m, ep_pack_name(ep));
@@ -481,6 +617,11 @@ bind_cap_locked(struct oc_provider *p, struct oc_cap *c, enum oc_ep ep)
 	            : ep == OC_EP_OPENVINO ? (ov_gpu ? "openvino-gpu" : "openvino-cpu")
 	                                   : "onnxruntime-cpu");
 	c->device_luid = ep == OC_EP_DML ? p->dml_luid : 0;
+	if (is_splats(c) && m != NULL && m != prev) {
+		fprintf(stderr, "[open-conversion] splats-mono: MODEL=%s -> %s (%s, %llu MB RAM)%s%s\n",
+		        p->splat_model_setting, m->name, c->backend, (unsigned long long)p->ram_mb,
+		        c->pick_note[0] != '\0' ? "; " : "", c->pick_note);
+	}
 	if (m == NULL || v == NULL) {
 		c->licence_class = XRT_CONV_LICENCE_UNKNOWN;
 		c->commercial_ok = 0;
@@ -814,6 +955,11 @@ oc_probe(struct xrt_conversion_plugin_instance **out_inst)
 	if (setting("OV_DEVICE", buf, sizeof(buf)) && (strcmp(buf, "gpu") == 0 || strcmp(buf, "cpu") == 0)) {
 		oc_copy_str(p->ov_device_setting, sizeof(p->ov_device_setting), buf);
 	}
+	oc_copy_str(p->splat_model_setting, sizeof(p->splat_model_setting), "auto");
+	if (setting("MODEL", buf, sizeof(buf)) && (strcmp(buf, "full") == 0 || strcmp(buf, "int4") == 0)) {
+		oc_copy_str(p->splat_model_setting, sizeof(p->splat_model_setting), buf);
+	}
+	p->ram_mb = oc_system_ram_mb();
 	// CPU + GPU by default: the measured configuration. "all" / "ane" let Core ML
 	// use the Neural Engine, whose first-use compile runs in a system service
 	// that a warm cannot cancel, and which computes in fp16.
@@ -878,6 +1024,9 @@ oc_probe(struct xrt_conversion_plugin_instance **out_inst)
 	load_runtime(p);
 	p->default_ep = p->ort != NULL ? choose_ep(p) : OC_EP_CPU;
 	p->ov_present = ov_located(p);
+	p->splat_cand[OC_SPLAT_FULL] = tier_model(p, "splats-mono", "high", &p->splat_pack[OC_SPLAT_FULL]);
+	p->splat_cand[OC_SPLAT_SMALL] = tier_model(p, "splats-mono", "low", &p->splat_pack[OC_SPLAT_SMALL]);
+	refresh_splat_presence(p);
 
 	struct oc_cap *v = &p->caps[0];
 	v->cap_id = OC_CAP_VIDEO;
@@ -1370,6 +1519,26 @@ oc_warm(struct xrt_conversion_plugin_instance *inst, uint32_t cap_id, bool (*is_
 	if (is_cancelled == NULL) {
 		is_cancelled = never_cancelled;
 	}
+	if (is_splats(c)) {
+		// The store may have changed since the pick (a local build finished, a blob
+		// was pruned): pick again, and re-describe if the model changes. A loaded
+		// session of the old model is dropped and the new one warms below.
+		refresh_splat_presence(p);
+		oc_lock(&p->lock);
+		const struct oc_pack_model *before = c->model;
+		bind_cap_locked(p, c, c->ep);
+		const bool changed = c->model != before;
+		if (changed) {
+			p->generation++;
+		}
+		oc_unlock(&p->lock);
+		if (changed) {
+			release_session(p, c);
+			set_state(p, c, XRT_CONV_STATE_INSTALLED, XRT_CONV_FAIL_NONE, 0, -1.0f,
+			          "splat model re-picked");
+			notify(0);
+		}
+	}
 	if (state_of(p, c) == XRT_CONV_STATE_READY && has_session(c)) {
 		return XRT_SUCCESS;
 	}
@@ -1434,8 +1603,17 @@ resolve:
 		if (!requested) {
 			requested = true;
 			if (!store_request(c->ref)) {
-				snprintf(why, sizeof(why), "%s: not in the model store and the download is not allowed",
-				         m->name);
+				if (c->pick_forced) {
+					// MODEL names this model: say so, never switch to the other one.
+					snprintf(
+					    why, sizeof(why),
+					    "%.40s: MODEL=%s, but it is not in the model store (build or fetch it); "
+					    "not switching",
+					    m->name, p->splat_model_setting);
+				} else {
+					snprintf(why, sizeof(why),
+					         "%s: not in the model store and the download is not allowed", m->name);
+				}
 				set_state(p, c, XRT_CONV_STATE_ABSENT, XRT_CONV_FAIL_NONE, 0, -1.0f, why);
 				return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 			}
@@ -1539,6 +1717,8 @@ resolve:
 	oc_unlock(&p->lock);
 	if (c->ep == OC_EP_COREML && reported) {
 		snprintf(why, sizeof(why), "%s: ready (%s, %u/%u nodes)", m->name, c->backend, taken, total);
+	} else if (is_splats(c) && c->pick_note[0] != '\0') {
+		snprintf(why, sizeof(why), "%.20s: ready (%.18s; %.76s)", m->name, c->backend, c->pick_note);
 	} else {
 		snprintf(why, sizeof(why), "%s: ready (%s)", m->name, c->backend);
 	}
@@ -2253,6 +2433,9 @@ static const struct xrt_component_setting_desc g_settings[] = {
     {"OV_DEVICE", XRT_COMPONENT_SETTING_TYPE_ENUM, "auto",
      "auto | gpu | cpu: the OpenVINO device (auto = GPU, else CPU)"},
     {"OV_CACHE", XRT_COMPONENT_SETTING_TYPE_BOOL, "1", "0 = no OpenVINO compiled-model cache in the scratch dir"},
+    {"MODEL", XRT_COMPONENT_SETTING_TYPE_ENUM, "auto",
+     "auto | full | int4: the splat model (full = defaults[splats-mono].high, int4 = .low; auto = full on a GPU "
+     "backend with >= 16 GB RAM, else int4, among the models in the store)"},
     {"OPENVINO", XRT_COMPONENT_SETTING_TYPE_STRING, "", "absolute path of another OpenVINO runtime folder"},
     {"COREML_UNITS", XRT_COMPONENT_SETTING_TYPE_ENUM, "gpu", "gpu | all | ane | cpu: macOS Core ML compute units"},
     {"COREML_CACHE", XRT_COMPONENT_SETTING_TYPE_BOOL, "1", "0 = no Core ML compiled-model cache"},

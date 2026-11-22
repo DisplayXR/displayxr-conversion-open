@@ -22,6 +22,7 @@
  *       --expect ready|absent|version|policy
  *       --expect-licence permissive|commercial|research
  *       --expect-download      the provider must report DOWNLOADING before READY
+ *       --expect-model NAME    every selected capability describes model NAME (cold and after warm)
  *       --warm-timeout-ms N
  *       --scratch DIR          the per-provider scratch dir (get_path SCRATCH; Core ML model cache)
  *       --bench N              after the checked frames, time N more frames per stream (latency stats)
@@ -240,12 +241,18 @@ file_size(const char *path)
  *
  */
 
+#define FH_MAX_BLOBS (OC_PACK_MAX_MODELS * (1 + OC_PACK_MAX_DATA_FILES))
+
 struct blob
 {
 	char sha256[65];
 	char format[16];
 	uint64_t size;
 	char refs[4][192]; //!< "<pack>/<model>/<variant>" and "<pack>/<model>"
+	/*! A model file's variant siblings (role "data"): a ref is READY only when they
+	 *  are too, and a request fetches them all (the runtime store's rule). */
+	struct blob *deps[OC_PACK_MAX_DATA_FILES];
+	uint32_t dep_count;
 
 	/* Download state, under g_store.lock. */
 	uint32_t state; //!< XRT_CONV_STATE_ABSENT / DOWNLOADING / READY / FAILED
@@ -265,7 +272,7 @@ static struct
 	char root[384]; //!< short enough that root/blobs/<sha256>.ok fits xrt_conv_model_location::path
 	char blob_base[1024];
 	char pack_id[64]; //!< the --pack's id (refs are "<pack>/<model>")
-	struct blob blobs[OC_PACK_MAX_MODELS];
+	struct blob blobs[FH_MAX_BLOBS];
 	uint32_t blob_count;
 	uint32_t requests;
 	uint32_t downloads_done;
@@ -411,22 +418,44 @@ host_model_resolve(const char *ref, struct xrt_conv_model_location *out)
 		oc_unlock(&g_store.lock);
 		return false;
 	}
-	if (b->state != XRT_CONV_STATE_DOWNLOADING && b->state != XRT_CONV_STATE_FAILED) {
-		b->state = blob_present(b) ? XRT_CONV_STATE_READY : XRT_CONV_STATE_ABSENT; // a wiped store reads ABSENT
+	// The ref's state over every file of its variant: FAILED > DOWNLOADING > ABSENT > READY.
+	uint32_t state = XRT_CONV_STATE_READY, reason = 0;
+	uint64_t total = 0;
+	double done = 0.0;
+	for (uint32_t i = 0; i <= b->dep_count; i++) {
+		struct blob *f = i == 0 ? b : b->deps[i - 1];
+		if (f->state != XRT_CONV_STATE_DOWNLOADING && f->state != XRT_CONV_STATE_FAILED) {
+			f->state = blob_present(f) ? XRT_CONV_STATE_READY
+			                           : XRT_CONV_STATE_ABSENT; // a wiped store reads ABSENT
+		}
+		total += f->size;
+		done += f->state == XRT_CONV_STATE_READY ? (double)f->size
+		        : f->state == XRT_CONV_STATE_DOWNLOADING
+		            ? (double)f->size * (f->progress > 0.0f ? f->progress : 0.0f)
+		            : 0.0;
+		if (f->state == XRT_CONV_STATE_FAILED) {
+			state = XRT_CONV_STATE_FAILED;
+			reason = f->failure_reason;
+		} else if (f->state == XRT_CONV_STATE_DOWNLOADING && state != XRT_CONV_STATE_FAILED) {
+			state = XRT_CONV_STATE_DOWNLOADING;
+		} else if (f->state == XRT_CONV_STATE_ABSENT && state == XRT_CONV_STATE_READY) {
+			state = XRT_CONV_STATE_ABSENT;
+		}
 	}
 	if (XRT_CONV_COVERS(out, struct xrt_conv_model_location, state)) {
-		out->state = b->state;
+		out->state = state;
 	}
 	if (XRT_CONV_COVERS(out, struct xrt_conv_model_location, progress)) {
-		out->progress = b->state == XRT_CONV_STATE_DOWNLOADING ? b->progress : -1.0f;
+		float pr = total > 0 ? (float)(done / (double)total) : -1.0f;
+		out->progress = state == XRT_CONV_STATE_DOWNLOADING ? (pr > 0.99f ? 0.99f : pr) : -1.0f;
 	}
 	if (XRT_CONV_COVERS(out, struct xrt_conv_model_location, failure_reason)) {
-		out->failure_reason = b->failure_reason;
+		out->failure_reason = reason;
 	}
 	if (XRT_CONV_COVERS(out, struct xrt_conv_model_location, path)) {
 		out->path[0] = '\0';
-		if (b->state == XRT_CONV_STATE_READY) {
-			blob_path(b, out->path, sizeof(out->path));
+		if (state == XRT_CONV_STATE_READY) {
+			blob_path(b, out->path, sizeof(out->path)); // the model file; its data files sit beside it
 		}
 	}
 	oc_unlock(&g_store.lock);
@@ -446,24 +475,41 @@ host_model_request(const char *ref)
 		oc_unlock(&g_store.lock);
 		return false; // unknown ref, or forbidden by policy
 	}
-	if (blob_present(b) || b->state == XRT_CONV_STATE_DOWNLOADING) {
-		oc_unlock(&g_store.lock);
-		return true; // present, or one download shared by every request
-	}
-	if (b->thread_started) {
-		thread_join(b->thread); // a finished, failed attempt
-		b->thread_started = false;
-	}
-	b->state = XRT_CONV_STATE_DOWNLOADING;
-	b->progress = 0.0f;
-	b->failure_reason = 0;
-	b->thread_started = thread_start(&b->thread, download_main, b);
-	if (!b->thread_started) {
-		b->state = XRT_CONV_STATE_FAILED;
-		b->failure_reason = XRT_CONV_FAIL_RESOURCES;
+	for (uint32_t i = 0; i <= b->dep_count; i++) {
+		struct blob *f = i == 0 ? b : b->deps[i - 1];
+		if (blob_present(f) || f->state == XRT_CONV_STATE_DOWNLOADING) {
+			continue; // present, or one download shared by every request
+		}
+		if (f->thread_started) {
+			thread_join(f->thread); // a finished, failed attempt
+			f->thread_started = false;
+		}
+		f->state = XRT_CONV_STATE_DOWNLOADING;
+		f->progress = 0.0f;
+		f->failure_reason = 0;
+		f->thread_started = thread_start(&f->thread, download_main, f);
+		if (!f->thread_started) {
+			f->state = XRT_CONV_STATE_FAILED;
+			f->failure_reason = XRT_CONV_FAIL_RESOURCES;
+		}
 	}
 	oc_unlock(&g_store.lock);
 	return true;
+}
+
+//! The blob for @p f, added on first sight; NULL when the table is full.
+static struct blob *
+add_blob(const struct oc_pack_file *f)
+{
+	struct blob *b = find_blob(f->sha256);
+	if (b == NULL && g_store.blob_count < FH_MAX_BLOBS) {
+		b = &g_store.blobs[g_store.blob_count++];
+		snprintf(b->sha256, sizeof(b->sha256), "%s", f->sha256);
+		snprintf(b->format, sizeof(b->format), "%s", f->format);
+		b->size = f->size;
+		b->state = XRT_CONV_STATE_ABSENT;
+	}
+	return b;
 }
 
 static bool
@@ -493,16 +539,19 @@ store_setup(const char *pack_path, const char *blob_base, const char *root)
 		const struct oc_pack_model *m = &pack->models[i];
 		for (uint32_t v = 0; v < m->variant_count; v++) {
 			const struct oc_pack_variant *var = &m->variants[v];
-			struct blob *b = find_blob(var->file.sha256);
-			if (b == NULL && g_store.blob_count < OC_PACK_MAX_MODELS) {
-				b = &g_store.blobs[g_store.blob_count++];
-				snprintf(b->sha256, sizeof(b->sha256), "%s", var->file.sha256);
-				snprintf(b->format, sizeof(b->format), "%s", var->file.format);
-				b->size = var->file.size;
-				b->state = XRT_CONV_STATE_ABSENT;
-			}
+			struct blob *b = add_blob(&var->file);
 			if (b == NULL) {
 				continue;
+			}
+			for (uint32_t d = 0; d < var->data_count; d++) {
+				struct blob *db = add_blob(&var->data[d]);
+				bool linked = false;
+				for (uint32_t k = 0; k < b->dep_count; k++) {
+					linked = linked || b->deps[k] == db;
+				}
+				if (db != NULL && !linked && b->dep_count < OC_PACK_MAX_DATA_FILES) {
+					b->deps[b->dep_count++] = db;
+				}
 			}
 			char refs[2][192];
 			oc_pack_ref(pack, m, var, refs[0], sizeof(refs[0]));
@@ -539,6 +588,19 @@ source_available(const struct blob *b)
 	char url[1200], path[1200];
 	snprintf(url, sizeof(url), "%s/%s.%s", g_store.blob_base, b->sha256, b->format);
 	return url_to_path(url, path, sizeof(path)) && file_size(path) == (int64_t)b->size;
+}
+
+//! Every file of @p b's variant is in the store, or reachable to fetch.
+static bool
+blob_set_reachable(const struct blob *b)
+{
+	for (uint32_t i = 0; i <= b->dep_count; i++) {
+		const struct blob *f = i == 0 ? b : b->deps[i - 1];
+		if (!blob_present(f) && !source_available(f)) {
+			return false;
+		}
+	}
+	return true;
 }
 
 
@@ -1616,7 +1678,7 @@ usage(void)
 	    "         [--expect-licence permissive|commercial|research] [--expect-download]\n"
 	    "         [--warm-timeout-ms N] [--scratch DIR] [--bench N] [--dump DIR]\n"
 	    "         [--caps splats] [--splat-check expect.json] [--splat-image photo.ppm] [--splat-focal PX]\n"
-	    "         [--splat-out out.ply] [--expect-backend NAME] [--allow-research]\n");
+	    "         [--splat-out out.ply] [--expect-backend NAME] [--expect-model NAME] [--allow-research]\n");
 }
 
 static bool
@@ -1646,7 +1708,7 @@ int
 main(int argc, char **argv)
 {
 	const char *path = NULL, *expect = "ready", *expect_licence = NULL, *pack = NULL, *blob_base = NULL;
-	const char *store = NULL, *caps_sel = NULL, *expect_backend = NULL;
+	const char *store = NULL, *caps_sel = NULL, *expect_backend = NULL, *expect_model = NULL;
 	bool no_warm = false, expect_download = false;
 	uint32_t warm_timeout_ms = 120000, frames = 3;
 	oc_mutex_init(&g_store.lock);
@@ -1710,6 +1772,8 @@ main(int argc, char **argv)
 			g_splat_out = argv[++i];
 		} else if (strcmp(a, "--expect-backend") == 0 && more) {
 			expect_backend = argv[++i];
+		} else if (strcmp(a, "--expect-model") == 0 && more) {
+			expect_model = argv[++i];
 		} else if (strcmp(a, "--allow-research") == 0) {
 			// The provider does not gate on licence (selection does); accepted so a
 			// test reads like the runtime's opt-in.
@@ -1880,6 +1944,16 @@ main(int argc, char **argv)
 		}
 	}
 
+	if (expect_model != NULL) {
+		for (uint32_t i = 0; i < count; i++) {
+			if (cap_selected(caps_sel, caps[i].task)) {
+				check(strcmp(caps[i].model_id, expect_model) == 0,
+				      "cap %u cold model '%s' (expected '%s')", caps[i].cap_id, caps[i].model_id,
+				      expect_model);
+			}
+		}
+	}
+
 	struct xrt_conv_state st;
 	for (uint32_t i = 0; i < count; i++) {
 		memset(&st, 0, sizeof(st));
@@ -1924,7 +1998,7 @@ main(int argc, char **argv)
 			snprintf(ref, sizeof(ref), "%s/%s", g_store.pack_id, caps[i].model_id);
 			oc_lock(&g_store.lock);
 			const struct blob *b = find_blob(ref);
-			const bool reachable = b != NULL && (blob_present(b) || source_available(b));
+			const bool reachable = b != NULL && blob_set_reachable(b);
 			oc_unlock(&g_store.lock);
 			if (!reachable) {
 				printf("SKIPPED: model %s is not available from %s\n", caps[i].model_id,
@@ -2002,6 +2076,11 @@ main(int argc, char **argv)
 		if (expect_backend != NULL) {
 			check(strcmp(caps[i].backend, expect_backend) == 0, "cap %u backend '%s' (expected '%s')",
 			      caps[i].cap_id, caps[i].backend, expect_backend);
+		}
+		if (expect_model != NULL) {
+			check(strcmp(caps[i].model_id, expect_model) == 0,
+			      "cap %u model '%s' after warm (expected '%s')", caps[i].cap_id, caps[i].model_id,
+			      expect_model);
 		}
 		if (caps[i].task == XRT_CONV_TASK_SPLATS_MONO) {
 			run_splat_jobs(iface, inst, &caps[i]);

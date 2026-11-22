@@ -238,6 +238,39 @@ if(OPENCONV_BUILD_TESTS)
 				--splat-check ${_tiny}/expect.json --scratch ${_stores}/splats-ov-scratch)
 			set_tests_properties(splats-openvino-cpu PROPERTIES FIXTURES_REQUIRED tiny_splat SKIP_RETURN_CODE 77)
 		endif()
+		# Setting MODEL: the pick between a pack's full model (defaults.high) and its small
+		# one (defaults.low), and a full model stored as a graph + one external-data file
+		# named by its sha256 (the layout of the full SHARP export).
+		set(_pick ${_tiny}/tiny-pick.models.json)
+		set(_pick_common --blob-base file://${_tiny} --caps splats --allow-research --set EP=cpu)
+		add_test(NAME splats-pick-auto-cpu COMMAND ${_host} ${_bin} --pack ${_pick} ${_pick_common}
+			--store ${_stores}/splats-pick-a --clean-store --expect-model tiny-int4
+			--splat-check ${_tiny}/expect.json)
+		add_test(NAME splats-pick-full-external-data COMMAND ${_host} ${_bin} --pack ${_pick} ${_pick_common}
+			--store ${_stores}/splats-pick-b --clean-store --set MODEL=full --expect-model tiny-full
+			--splat-check ${_tiny}/expect.json)
+		# The store now holds only tiny-full: auto (int4 on a CPU) takes the model that is there ...
+		add_test(NAME splats-pick-fallback COMMAND ${_host} ${_bin} --pack ${_pick} ${_pick_common}
+			--store ${_stores}/splats-pick-b --no-download --expect-model tiny-full
+			--splat-check ${_tiny}/expect.json)
+		# ... and a forced MODEL whose blob is absent fails instead of switching.
+		add_test(NAME splats-pick-forced-absent COMMAND ${_host} ${_bin} --pack ${_pick} ${_pick_common}
+			--store ${_stores}/splats-pick-b --no-download --set MODEL=int4 --expect-model tiny-int4
+			--expect policy)
+		set_tests_properties(splats-pick-auto-cpu PROPERTIES FIXTURES_REQUIRED tiny_splat SKIP_RETURN_CODE 77)
+		set_tests_properties(splats-pick-full-external-data PROPERTIES FIXTURES_REQUIRED tiny_splat
+			FIXTURES_SETUP pick_full_store SKIP_RETURN_CODE 77)
+		set_tests_properties(splats-pick-fallback splats-pick-forced-absent PROPERTIES
+			FIXTURES_REQUIRED "tiny_splat;pick_full_store" SKIP_RETURN_CODE 77)
+		if(OPENCONV_OPENVINO)
+			add_test(NAME splats-pick-full-openvino-cpu COMMAND ${_host} ${_bin} --pack ${_pick}
+				--blob-base file://${_tiny} --store ${_stores}/splats-pick-ov --clean-store --caps splats
+				--set EP=openvino --set OV_DEVICE=cpu --set MODEL=full --expect-backend openvino-cpu
+				--expect-model tiny-full --allow-research --splat-check ${_tiny}/expect.json
+				--scratch ${_stores}/splats-pick-ov-scratch)
+			set_tests_properties(splats-pick-full-openvino-cpu PROPERTIES FIXTURES_REQUIRED tiny_splat
+				SKIP_RETURN_CODE 77)
+		endif()
 	endif()
 	# The real model, on the default backend (OpenVINO GPU where there is one): only
 	# with -DOPENCONV_TEST_SPLAT_MODEL (the user's own export; nothing is fetched).

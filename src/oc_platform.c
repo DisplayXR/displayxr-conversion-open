@@ -22,6 +22,10 @@
 #include <ftw.h>
 #include <signal.h>
 #include <sys/stat.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 #endif
@@ -251,6 +255,14 @@ oc_lib_sym(void *lib, const char *name)
 	return lib != NULL ? (void *)GetProcAddress((HMODULE)lib, name) : NULL;
 }
 
+uint64_t
+oc_system_ram_mb(void)
+{
+	MEMORYSTATUSEX ms;
+	ms.dwLength = sizeof(ms);
+	return GlobalMemoryStatusEx(&ms) ? (uint64_t)(ms.ullTotalPhys >> 20) : 0u;
+}
+
 #else // POSIX
 
 void
@@ -446,6 +458,20 @@ void *
 oc_lib_sym(void *lib, const char *name)
 {
 	return lib != NULL ? dlsym(lib, name) : NULL;
+}
+
+uint64_t
+oc_system_ram_mb(void)
+{
+#if defined(__APPLE__)
+	uint64_t bytes = 0;
+	size_t len = sizeof(bytes);
+	return sysctlbyname("hw.memsize", &bytes, &len, NULL, 0) == 0 ? bytes >> 20 : 0u;
+#else
+	const long pages = sysconf(_SC_PHYS_PAGES);
+	const long page = sysconf(_SC_PAGE_SIZE);
+	return pages > 0 && page > 0 ? ((uint64_t)pages * (uint64_t)page) >> 20 : 0u;
+#endif
 }
 
 #endif

@@ -81,6 +81,16 @@ parse_variant(const struct oc_json *jv, struct oc_pack_variant *v, const char *m
 			copy_str(v->file.sha256, sizeof(v->file.sha256), sha);
 			v->file.size = (uint64_t)size;
 			models++;
+		} else {
+			if (v->data_count >= OC_PACK_MAX_DATA_FILES) {
+				BAD("model %s/%s: more than %d files beside the model file", model, v->id,
+				    OC_PACK_MAX_DATA_FILES);
+			}
+			struct oc_pack_file *d = &v->data[v->data_count++];
+			copy_str(d->role, sizeof(d->role), oc_json_str(f, "role", "data"));
+			copy_str(d->format, sizeof(d->format), oc_json_str(f, "format", "bin"));
+			copy_str(d->sha256, sizeof(d->sha256), sha);
+			d->size = (uint64_t)size;
 		}
 	}
 	if (models != 1) {

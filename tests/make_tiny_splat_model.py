@@ -15,17 +15,27 @@ uniform grey picture of a known size and focal, every Gaussian the provider
 writes is predictable: expect.json carries a sample of them, computed here
 independently of the provider (numpy), for the fake host to compare.
 
+It also writes tiny-pick.models.json, the shape of a pack with two models for
+the setting MODEL to choose between: "tiny-full" (defaults.high) is the same
+graph with its weights in ONE external-data file that the graph names by the
+data's sha256 (the layout export_sharp.py gives the full SHARP model, two files
+side by side in the store), and "tiny-int4" (defaults.low) is the single-file
+model. Both compute the same thing, so expect.json holds for either.
+
 Nothing here is a real model: it exists so CI exercises the splat lane
 (preprocess, inference on ONNX Runtime and on OpenVINO's CPU device,
-unprojection, covariance re-diagonalisation, PLY, facts) without a GPU and
-without any model download. Needs the `onnx` and `numpy` packages; exits 77
-(CTest "skipped") without them.
+unprojection, covariance re-diagonalisation, PLY, facts, the model pick)
+without a GPU and without any model download. Needs the `onnx` and `numpy`
+packages; exits 77 (CTest "skipped") without them.
 """
 
+import copy
 import hashlib
 import json
 import os
+import shutil
 import sys
+import tempfile
 
 try:
     import numpy as np
@@ -130,6 +140,35 @@ def expected(means, scales, quats, opac):
     return {"width": WIDTH, "height": HEIGHT, "focal": FOCAL, "count": N, "tol": 2e-4, "samples": samples}
 
 
+def external_data_model(model, out):
+    """Write @p model as <sha(graph)>.onnx + <sha(data)>.bin, the graph naming the data file by its
+    bare sha256 (what the store's blobs/ directory holds). Returns [(sha, size)] graph first."""
+    from onnx import external_data_helper as edh
+
+    tmp = tempfile.mkdtemp(dir=out)
+    try:
+        graph, data = os.path.join(tmp, "g.onnx"), os.path.join(tmp, "w.data")
+        onnx.save_model(copy.deepcopy(model), graph, save_as_external_data=True, all_tensors_to_one_file=True,
+                        location="w.data", size_threshold=1024, convert_attribute=False)
+        raw = open(data, "rb").read()
+        dsha = hashlib.sha256(raw).hexdigest()
+        g = onnx.load(graph, load_external_data=False)
+        for t in edh._get_all_tensors(g):
+            if edh.uses_external_data(t):
+                for e in t.external_data:
+                    if e.key == "location":
+                        e.value = dsha
+        gbytes = g.SerializeToString()
+        gsha = hashlib.sha256(gbytes).hexdigest()
+        with open(os.path.join(out, f"{gsha}.onnx"), "wb") as f:
+            f.write(gbytes)
+        with open(os.path.join(out, f"{dsha}.bin"), "wb") as f:
+            f.write(raw)
+        return [(gsha, len(gbytes)), (dsha, len(raw))]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     if len(sys.argv) != 2:
         print(__doc__)
@@ -137,7 +176,8 @@ def main():
     out = sys.argv[1]
     os.makedirs(out, exist_ok=True)
     consts = constants(np.random.default_rng(2026))
-    data = build_model(*consts).SerializeToString()
+    model = build_model(*consts)
+    data = model.SerializeToString()
     sha = hashlib.sha256(data).hexdigest()
     with open(os.path.join(out, f"{sha}.onnx"), "wb") as f:
         f.write(data)
@@ -176,7 +216,22 @@ def main():
         json.dump(pack, f, indent=2)
     with open(os.path.join(out, "expect.json"), "w", encoding="utf-8") as f:
         json.dump(expected(*consts), f, indent=1)
-    print(f"tiny splat model {sha} ({len(data)} bytes) in {out}")
+
+    # The two-model pack for the MODEL pick.
+    (gsha, gsize), (dsha, dsize) = external_data_model(model, out)
+    pick = copy.deepcopy(pack)
+    pick["pack"] = "dxr-open-test-splats-pick"
+    small = pick["models"][0]
+    small["name"] = "tiny-int4"
+    full = copy.deepcopy(small)
+    full["name"] = "tiny-full"
+    full["variants"][0]["files"] = [{"role": "model", "format": "onnx", "sha256": gsha, "size": gsize},
+                                    {"role": "data", "format": "bin", "sha256": dsha, "size": dsize}]
+    pick["models"].append(full)
+    pick["defaults"] = {"splats-mono": {"low": "tiny-int4", "medium": "tiny-int4", "high": "tiny-full"}}
+    with open(os.path.join(out, "tiny-pick.models.json"), "w", encoding="utf-8") as f:
+        json.dump(pick, f, indent=2)
+    print(f"tiny splat model {sha} ({len(data)} bytes) in {out}; external-data variant {gsha} + {dsha}")
     return 0
 
 
