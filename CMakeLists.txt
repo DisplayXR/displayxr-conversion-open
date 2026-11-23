@@ -253,6 +253,12 @@ if(OPENCONV_BUILD_TESTS)
 		add_test(NAME splats-pick-fallback COMMAND ${_host} ${_bin} --pack ${_pick} ${_pick_common}
 			--store ${_stores}/splats-pick-b --no-download --expect-model tiny-full
 			--splat-check ${_tiny}/expect.json)
+		# ... the store re-verifies it for longer than the request grace (the runtime's store
+		# re-hashes a stored blob once per process: tens of seconds for a multi-GB model):
+		# WARMING is progress, the provider waits it out ...
+		add_test(NAME splats-pick-slow-verify COMMAND ${_host} ${_bin} --pack ${_pick} ${_pick_common}
+			--store ${_stores}/splats-pick-b --no-download --set MODEL=full --expect-model tiny-full
+			--verify-ms 7000 --expect-verify --splat-check ${_tiny}/expect.json)
 		# ... and a forced MODEL whose blob is absent fails instead of switching.
 		add_test(NAME splats-pick-forced-absent COMMAND ${_host} ${_bin} --pack ${_pick} ${_pick_common}
 			--store ${_stores}/splats-pick-b --no-download --set MODEL=int4 --expect-model tiny-int4
@@ -260,7 +266,7 @@ if(OPENCONV_BUILD_TESTS)
 		set_tests_properties(splats-pick-auto-cpu PROPERTIES FIXTURES_REQUIRED tiny_splat SKIP_RETURN_CODE 77)
 		set_tests_properties(splats-pick-full-external-data PROPERTIES FIXTURES_REQUIRED tiny_splat
 			FIXTURES_SETUP pick_full_store SKIP_RETURN_CODE 77)
-		set_tests_properties(splats-pick-fallback splats-pick-forced-absent PROPERTIES
+		set_tests_properties(splats-pick-fallback splats-pick-slow-verify splats-pick-forced-absent PROPERTIES
 			FIXTURES_REQUIRED "tiny_splat;pick_full_store" SKIP_RETURN_CODE 77)
 		if(OPENCONV_OPENVINO)
 			add_test(NAME splats-pick-full-openvino-cpu COMMAND ${_host} ${_bin} --pack ${_pick}

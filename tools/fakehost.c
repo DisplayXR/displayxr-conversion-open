@@ -16,6 +16,9 @@
  *       --clean-store          delete the pack's blobs and stamps from the store first
  *       --no-download          model_request refuses (download forbidden by policy)
  *       --chunk-ms N           delay per 4 MiB copied, so DOWNLOADING is observable
+ *       --verify-ms N          a stored blob reads INSTALLED until requested, then WARMING (verifying)
+ *                              for N ms: the runtime's store re-hashes a stored blob once per process
+ *       --expect-verify        the provider must report WARMING while the store verifies, then READY
  *       --caps video,mono      the capabilities to warm and convert (default: both)
  *       --frames N             frames per stream (default 3; a reset mid-stream)
  *       --no-warm              describe and readiness only
@@ -255,7 +258,9 @@ struct blob
 	uint32_t dep_count;
 
 	/* Download state, under g_store.lock. */
-	uint32_t state; //!< XRT_CONV_STATE_ABSENT / DOWNLOADING / READY / FAILED
+	uint32_t state;        //!< XRT_CONV_STATE_ABSENT / INSTALLED / WARMING / DOWNLOADING / READY / FAILED
+	bool verified;         //!< --verify-ms: hashed by this "process" (or downloaded by it)
+	uint64_t verify_until; //!< --verify-ms: a requested verify finishes at this oc_now_ms()
 	uint32_t failure_reason;
 	float progress;
 	bool thread_started;
@@ -269,6 +274,7 @@ static struct
 	bool no_download;
 	bool clean; //!< --clean-store: start from an empty store
 	uint32_t chunk_ms;
+	uint32_t verify_ms; //!< --verify-ms
 	char root[384]; //!< short enough that root/blobs/<sha256>.ok fits xrt_conv_model_location::path
 	char blob_base[1024];
 	char pack_id[64]; //!< the --pack's id (refs are "<pack>/<model>")
@@ -399,11 +405,26 @@ download_main(void *arg)
 	}
 	oc_lock(&g_store.lock);
 	b->state = ok ? XRT_CONV_STATE_READY : XRT_CONV_STATE_FAILED;
+	b->verified = ok; // hashed while it was written
 	b->failure_reason = ok ? XRT_CONV_FAIL_NONE : reason;
 	b->progress = ok ? 1.0f : -1.0f;
 	g_store.downloads_done += ok ? 1u : 0u;
 	oc_unlock(&g_store.lock);
 	info("store: %s %s", b->sha256, ok ? "downloaded, verified, stamped" : "download FAILED");
+}
+
+//! The aggregation order of a ref's files (the runtime store's): the worst wins.
+static int
+store_rank(uint32_t state)
+{
+	switch (state) {
+	case XRT_CONV_STATE_FAILED: return 5;
+	case XRT_CONV_STATE_DOWNLOADING: return 4;
+	case XRT_CONV_STATE_ABSENT: return 3;
+	case XRT_CONV_STATE_WARMING: return 2;
+	case XRT_CONV_STATE_INSTALLED: return 1;
+	default: return 0; // READY
+	}
 }
 
 static bool
@@ -418,28 +439,37 @@ host_model_resolve(const char *ref, struct xrt_conv_model_location *out)
 		oc_unlock(&g_store.lock);
 		return false;
 	}
-	// The ref's state over every file of its variant: FAILED > DOWNLOADING > ABSENT > READY.
+	// The ref's state over every file of its variant:
+	// FAILED > DOWNLOADING > ABSENT > WARMING > INSTALLED > READY.
 	uint32_t state = XRT_CONV_STATE_READY, reason = 0;
 	uint64_t total = 0;
 	double done = 0.0;
 	for (uint32_t i = 0; i <= b->dep_count; i++) {
 		struct blob *f = i == 0 ? b : b->deps[i - 1];
 		if (f->state != XRT_CONV_STATE_DOWNLOADING && f->state != XRT_CONV_STATE_FAILED) {
-			f->state = blob_present(f) ? XRT_CONV_STATE_READY
-			                           : XRT_CONV_STATE_ABSENT; // a wiped store reads ABSENT
+			if (!blob_present(f)) {
+				f->state = XRT_CONV_STATE_ABSENT; // a wiped store reads ABSENT
+				f->verified = false;
+				f->verify_until = 0;
+			} else if (g_store.verify_ms == 0 || f->verified) {
+				f->state = XRT_CONV_STATE_READY;
+			} else if (f->verify_until != 0 && oc_now_ms() >= f->verify_until) {
+				f->verified = true; // the requested verify finished
+				f->state = XRT_CONV_STATE_READY;
+			} else {
+				// Stored, not yet hashed by this process: INSTALLED until requested,
+				// then WARMING (verifying; no progress, like the runtime's store).
+				f->state = f->verify_until != 0 ? XRT_CONV_STATE_WARMING : XRT_CONV_STATE_INSTALLED;
+			}
 		}
 		total += f->size;
 		done += f->state == XRT_CONV_STATE_READY ? (double)f->size
 		        : f->state == XRT_CONV_STATE_DOWNLOADING
 		            ? (double)f->size * (f->progress > 0.0f ? f->progress : 0.0f)
 		            : 0.0;
-		if (f->state == XRT_CONV_STATE_FAILED) {
-			state = XRT_CONV_STATE_FAILED;
-			reason = f->failure_reason;
-		} else if (f->state == XRT_CONV_STATE_DOWNLOADING && state != XRT_CONV_STATE_FAILED) {
-			state = XRT_CONV_STATE_DOWNLOADING;
-		} else if (f->state == XRT_CONV_STATE_ABSENT && state == XRT_CONV_STATE_READY) {
-			state = XRT_CONV_STATE_ABSENT;
+		if (store_rank(f->state) > store_rank(state)) {
+			state = f->state;
+			reason = f->state == XRT_CONV_STATE_FAILED ? f->failure_reason : 0;
 		}
 	}
 	if (XRT_CONV_COVERS(out, struct xrt_conv_model_location, state)) {
@@ -471,14 +501,25 @@ host_model_request(const char *ref)
 	oc_lock(&g_store.lock);
 	g_store.requests++;
 	struct blob *b = find_blob(ref);
-	if (b == NULL || g_store.no_download) {
+	bool missing = false;
+	for (uint32_t i = 0; b != NULL && i <= b->dep_count; i++) {
+		const struct blob *f = i == 0 ? b : b->deps[i - 1];
+		missing |= !blob_present(f) && f->state != XRT_CONV_STATE_DOWNLOADING;
+	}
+	if (b == NULL || (g_store.no_download && missing)) {
 		oc_unlock(&g_store.lock);
-		return false; // unknown ref, or forbidden by policy
+		return false; // unknown ref, or a download forbidden by policy
 	}
 	for (uint32_t i = 0; i <= b->dep_count; i++) {
 		struct blob *f = i == 0 ? b : b->deps[i - 1];
-		if (blob_present(f) || f->state == XRT_CONV_STATE_DOWNLOADING) {
-			continue; // present, or one download shared by every request
+		if (blob_present(f)) {
+			if (g_store.verify_ms > 0 && !f->verified && f->verify_until == 0) {
+				f->verify_until = oc_now_ms() + g_store.verify_ms; // a stored blob: hash it
+			}
+			continue;
+		}
+		if (f->state == XRT_CONV_STATE_DOWNLOADING) {
+			continue; // one download shared by every request
 		}
 		if (f->thread_started) {
 			thread_join(f->thread); // a finished, failed attempt
@@ -1670,15 +1711,15 @@ run_splat_jobs(struct xrt_conversion_plugin_iface *iface,
 static void
 usage(void)
 {
-	fprintf(
-	    stderr,
-	    "usage: open-conversion-fakehost <provider> [--set K=V]... [--pack FILE] [--blob-base URL]\n"
-	    "         [--store DIR] [--clean-store] [--no-download] [--chunk-ms N] [--caps video,mono] [--frames N]\n"
-	    "         [--no-warm] [--expect ready|absent|version|policy]\n"
-	    "         [--expect-licence permissive|commercial|research] [--expect-download]\n"
-	    "         [--warm-timeout-ms N] [--scratch DIR] [--bench N] [--dump DIR]\n"
-	    "         [--caps splats] [--splat-check expect.json] [--splat-image photo.ppm] [--splat-focal PX]\n"
-	    "         [--splat-out out.ply] [--expect-backend NAME] [--expect-model NAME] [--allow-research]\n");
+	fprintf(stderr,
+	        "usage: open-conversion-fakehost <provider> [--set K=V]... [--pack FILE] [--blob-base URL]\n"
+	        "         [--store DIR] [--clean-store] [--no-download] [--chunk-ms N] [--verify-ms N] [--caps "
+	        "video,mono] [--frames N]\n"
+	        "         [--no-warm] [--expect ready|absent|version|policy]\n"
+	        "         [--expect-licence permissive|commercial|research] [--expect-download] [--expect-verify]\n"
+	        "         [--warm-timeout-ms N] [--scratch DIR] [--bench N] [--dump DIR]\n"
+	        "         [--caps splats] [--splat-check expect.json] [--splat-image photo.ppm] [--splat-focal PX]\n"
+	        "         [--splat-out out.ply] [--expect-backend NAME] [--expect-model NAME] [--allow-research]\n");
 }
 
 static bool
@@ -1709,7 +1750,7 @@ main(int argc, char **argv)
 {
 	const char *path = NULL, *expect = "ready", *expect_licence = NULL, *pack = NULL, *blob_base = NULL;
 	const char *store = NULL, *caps_sel = NULL, *expect_backend = NULL, *expect_model = NULL;
-	bool no_warm = false, expect_download = false;
+	bool no_warm = false, expect_download = false, expect_verify = false;
 	uint32_t warm_timeout_ms = 120000, frames = 3;
 	oc_mutex_init(&g_store.lock);
 	for (int i = 1; i < argc; i++) {
@@ -1740,6 +1781,10 @@ main(int argc, char **argv)
 			g_store.no_download = true;
 		} else if (strcmp(a, "--chunk-ms") == 0 && more) {
 			g_store.chunk_ms = (uint32_t)strtoul(argv[++i], NULL, 10);
+		} else if (strcmp(a, "--verify-ms") == 0 && more) {
+			g_store.verify_ms = (uint32_t)strtoul(argv[++i], NULL, 10);
+		} else if (strcmp(a, "--expect-verify") == 0) {
+			expect_verify = true;
 		} else if (strcmp(a, "--caps") == 0 && more) {
 			caps_sel = argv[++i];
 		} else if (strcmp(a, "--frames") == 0 && more) {
@@ -2064,6 +2109,12 @@ main(int argc, char **argv)
 			      "cap %u DOWNLOADING progress comes from the host", caps[i].cap_id);
 			check((g_watch.seen & (1u << XRT_CONV_STATE_WARMING)) != 0, "cap %u went through WARMING",
 			      caps[i].cap_id);
+		}
+		if (expect_verify) {
+			check((g_watch.seen & (1u << XRT_CONV_STATE_WARMING)) != 0,
+			      "cap %u reported WARMING while the store verified", caps[i].cap_id);
+			check(t1 - t0 >= g_store.verify_ms, "cap %u waited out the store's %u ms verify (%llu ms)",
+			      caps[i].cap_id, g_store.verify_ms, (unsigned long long)(t1 - t0));
 		}
 		if (st.state != XRT_CONV_STATE_READY) {
 			continue;
