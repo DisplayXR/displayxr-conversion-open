@@ -19,7 +19,7 @@ Xe-class GPU (Linux x86_64 and Windows x64; decided once OpenVINO has listed its
 OpenVINO's CPU device, else ONNX Runtime's CPU EP; explicit `EP` / `OV_DEVICE` / `MODEL` win, and
 one stderr line says what it resolved to and why. Setting `MODEL` (`auto` | `full` | `int4`) picks
 between the pack's full model (`defaults["splats-mono"].high`) and its small one (`.low`):
-`auto` = full when the bound backend is a GPU (OpenVINO GPU, DirectML with ≥ 10 GB VRAM, Core ML)
+`auto` = full when the bound backend is a GPU (OpenVINO GPU, DirectML with ≥ 9 GB VRAM, Core ML)
 and the OS reports ≥ 15 GiB of RAM (a "16 GB" machine), else int4; on DirectML the pack's fp16 model
 (`defaults["splats-mono"].medium`, DirectML variant only, `MODEL=fp16`) comes first when its blob is
 in the store and the adapter has ≥ 6 GB (`oc_rank_auto_model`) — and only among the models whose

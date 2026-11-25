@@ -19,7 +19,7 @@
  *                       on DirectML, its fp16 one (defaults.medium, when it
  *                       has a DirectML variant): auto = full on a GPU backend
  *                       with >= 16 GB of RAM; on DirectML fp16 when it is in
- *                       the store (>= 6 GB VRAM), else full with >= 10 GB VRAM;
+ *                       the store (>= 6 GB VRAM), else full with >= 9 GB VRAM;
  *                       among the models in the store (oc_rank.h).
  *
  * The splat capability runs where oc_rank.h ranks it: ONNX Runtime + DirectML
@@ -561,7 +561,7 @@ splat_fp16_ready_locked(const struct oc_provider *p)
  * names, "int4" = the one .low names, "fp16" = the one .medium names when it is a third
  * model with a DirectML variant (DirectML only; elsewhere fp16 means full). auto =
  * oc_rank_auto_model: on DirectML the fp16 model when its blob is in the store and the
- * adapter has >= 6 GB, else full with >= 10 GB; on another GPU backend (OpenVINO's GPU
+ * adapter has >= 6 GB, else full with >= 9 GB; on another GPU backend (OpenVINO's GPU
  * device, Core ML) full; both with >= 16 GB of RAM; else int4. Only among the models whose
  * blob is in the store: the preferred one absent = the next present one (fp16 only on
  * DirectML; said in pick_note and the INFO line). None present = the preferred one, which
@@ -2810,7 +2810,7 @@ static const struct xrt_component_setting_desc g_settings[] = {
     {"MODEL", XRT_COMPONENT_SETTING_TYPE_ENUM, "auto",
      "auto | full | fp16 | int4: the splat model (full = defaults[splats-mono].high, int4 = .low, fp16 = .medium "
      "on DirectML only; auto = full on a GPU backend with >= 16 GB RAM, on DirectML fp16 when built (>= 6 GB "
-     "VRAM) else full with >= 10 GB VRAM, else int4, among the models in the store; DirectML never runs int4)"},
+     "VRAM) else full with >= 9 GB VRAM, else int4, among the models in the store; DirectML never runs int4)"},
     {"OPENVINO", XRT_COMPONENT_SETTING_TYPE_STRING, "", "absolute path of another OpenVINO runtime folder"},
     {"COREML_UNITS", XRT_COMPONENT_SETTING_TYPE_ENUM, "gpu", "gpu | all | ane | cpu: macOS Core ML compute units"},
     {"COREML_CACHE", XRT_COMPONENT_SETTING_TYPE_BOOL, "1", "0 = no Core ML compiled-model cache"},

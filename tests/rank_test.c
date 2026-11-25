@@ -245,9 +245,10 @@ main(void)
 	add_adapter(&card_9g,
 	            &(struct oc_dxgi_adapter){"NVIDIA GeForce RTX 3080", OC_VENDOR_NVIDIA, 10067, false, 0, 0x710});
 	add_ov(&card_9g, &k_ov_nvidia);
-	// No fp16 model in any pack: 8 GB is under the full model's floor -> the next backend.
+	// No fp16 model in any pack: 8 GB is under the full model's floor -> the next backend;
+	// a "10 GB" card that reports 10067 MB is above the 9 GiB floor and keeps DirectML.
 	expect(&card_8g, "auto", "auto", "auto", OC_SB_OV_CPU, -1, OC_SM_INT4, false);
-	expect(&card_9g, "auto", "auto", "auto", OC_SB_OV_CPU, -1, OC_SM_INT4, false);
+	expect(&card_9g, "auto", "auto", "auto", OC_SB_DML, 0, OC_SM_FULL, false);
 	expect(&card_10g, "auto", "auto", "auto", OC_SB_DML, 0, OC_SM_FULL, false);
 	expect(&small, "auto", "auto", "auto", OC_SB_OV_CPU, -1, OC_SM_INT4, false);
 	// An fp16 model in the pack but not built: the same.

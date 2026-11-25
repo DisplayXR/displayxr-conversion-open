@@ -183,7 +183,7 @@ a DirectML variant (the SHARP pack's `sharp-fp16-1536`) is a candidate on Direct
 
 | `MODEL` | Model |
 |---|---|
-| `auto` (default) | On **DirectML** (with at least 15 GiB of memory, below): **fp16** when its blob is in the store and the adapter has at least **6 GB** of dedicated memory (an estimate: half the fp32 model's measured use plus a desktop); else **full** with at least **10 GB** (measured, [below](#directml-measured-and-diagnosed)); else **int4** (which never runs on DirectML, so DirectML is not chosen). On any other GPU backend (OpenVINO's GPU device; Core ML where a pack lists it): **full** when the OS reports at least 15 GiB of memory (a "16 GB" machine: firmware and an integrated GPU keep a little). Otherwise **int4** (every CPU backend). |
+| `auto` (default) | On **DirectML** (with at least 15 GiB of memory, below): **fp16** when its blob is in the store and the adapter has at least **6 GB** of dedicated memory (an estimate: half the fp32 model's measured use plus a desktop); else **full** with at least **9 GB** (a "10 GB" card reports about 10 050 MB) (measured, [below](#directml-measured-and-diagnosed)); else **int4** (which never runs on DirectML, so DirectML is not chosen). On any other GPU backend (OpenVINO's GPU device; Core ML where a pack lists it): **full** when the OS reports at least 15 GiB of memory (a "16 GB" machine: firmware and an integrated GPU keep a little). Otherwise **int4** (every CPU backend). |
 | `full` | always the full model |
 | `fp16` | the fp16 model on DirectML; the full model anywhere else |
 | `int4` | always the small model |
@@ -252,7 +252,7 @@ described machines by the `splats-rank` test):
 
 | Machine | Backend | `MODEL=auto` |
 |---|---|---|
-| Windows, a **discrete non-Intel** GPU (NVIDIA / AMD, ≥ 2 GB dedicated; the one with the most VRAM), ≥ 16 GB RAM, and ≥ 6 GB VRAM with `sharp-fp16-1536` built, or ≥ 10 GB VRAM | **DirectML** on that adapter (`onnxruntime-dml`) | fp16 when built, else full |
+| Windows, a **discrete non-Intel** GPU (NVIDIA / AMD, ≥ 2 GB dedicated; the one with the most VRAM), ≥ 16 GB RAM, and ≥ 6 GB VRAM with `sharp-fp16-1536` built, or ≥ 9 GB VRAM | **DirectML** on that adapter (`onnxruntime-dml`) | fp16 when built, else full |
 | otherwise, OpenVINO's GPU device is an **Intel Arc / Xe-class** GPU (discrete, named Arc, matrix units, GPU IP ≥ 12.55, or an Iris Xe) | OpenVINO GPU (`openvino-gpu`) | full with ≥ 16 GB RAM, else int4 |
 | otherwise (an NVIDIA / AMD card that OpenVINO reaches through OpenCL, a UHD-class iGPU, no GPU) | OpenVINO CPU (`openvino-cpu`) | int4 |
 | no OpenVINO (macOS) | ONNX Runtime CPU (`onnxruntime-cpu`) | int4 |
@@ -312,7 +312,7 @@ tensor over 1.2 GB (DirectML's limit is 4 GB). So no CPU fallback is expected. T
 explanation is memory: 6.1 GB on a 10 GB card that a desktop already uses is at or over the
 budget Windows gives one process, and what does not fit is kept in system memory, read over
 PCIe at a few percent of the card's bandwidth, which is the size of the slowdown seen. Hence
-the floors (full fp32 ≥ 10 GB, fp16 ≥ 6 GB) and the fp16 build. Unconfirmed until a run with
+the floors (full fp32 ≥ 9 GB, fp16 ≥ 6 GB) and the fp16 build. Unconfirmed until a run with
 the lines below.
 
 Every DirectML splat session and job now logs this process's memory on the adapter (DXGI

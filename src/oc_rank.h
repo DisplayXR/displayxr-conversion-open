@@ -51,8 +51,11 @@ extern "C" {
  *  job of the fp32 model raised a 10 GB card's dedicated use by 6.1 GB (2.6 GB of
  *  weights, the rest activations: DirectML keeps its pooled buffers), to 8.9 of 10 GB
  *  with a desktop running, and ran 35 s where well under 5 s is expected. Below this
- *  the fp16 model (when built) or the next backend serves the job. */
-#define OC_FULL_MODEL_MIN_VRAM_MB (10ull * 1024u)
+ *  the fp16 model (when built) or the next backend serves the job. 9 GiB, not 10: a
+ *  "10 GB" RTX 3080 reports 10051-10067 MB, and even over its memory budget DirectML
+ *  (35 s) beat OpenVINO on its 12900K CPU (61 s int4, 90 s full), so that card must
+ *  keep DirectML. */
+#define OC_FULL_MODEL_MIN_VRAM_MB (9ull * 1024u)
 /*! The fp16 model on DirectML needs at least this much dedicated VRAM. An ESTIMATE, not
  *  a measurement: half the fp32 model's 6.1 GB (fp16 weights and activations), plus a
  *  desktop's ~2-3 GB. */
