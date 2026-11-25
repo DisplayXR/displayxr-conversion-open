@@ -13,9 +13,18 @@
 #include <string.h>
 
 #define OC_SPLAT_CHUNK 8192u         //!< Gaussians per sink write (and per cancel poll)
-#define OC_SPLAT_FLOATS 14u          //!< per PLY vertex
 #define OC_SH_C0 0.28209479177387814 //!< degree-0 spherical-harmonic constant
-#define OC_FOCUS_BINS 1024u
+
+// Nearest-clump focus (docs/sog-camera-block.md): the DisplayXR Gallery's constants, verbatim.
+#define OC_CLUMP_SAMPLE_CAP 40000u
+#define OC_CLUMP_MIN_OPACITY 0.05
+#define OC_CLUMP_MIN_Z 0.05
+#define OC_CLUMP_CENTRAL_FRAC 0.5
+#define OC_CLUMP_N_BINS 120
+#define OC_CLUMP_MIN_MASS_FRAC 0.03
+#define OC_CLUMP_NOISE_FLOOR_FRAC 0.001
+#define OC_CLUMP_PIVOT_MIN_M 0.1
+#define OC_CLUMP_PIVOT_MAX_M 20.0
 
 static const char *const k_props[OC_SPLAT_FLOATS] = {"x",      "y",       "z",       "f_dc_0",  "f_dc_1",
                                                      "f_dc_2", "opacity", "scale_0", "scale_1", "scale_2",
@@ -365,127 +374,194 @@ oc_splat_ply_size(size_t count)
 	return (uint64_t)n + (uint64_t)count * OC_SPLAT_FLOATS * sizeof(float);
 }
 
-//! In the central half of the frame each way (the projective means are x_ndc·z, y_ndc·z, z).
-static bool
-central(const float *m)
+//! One index into the clump crop, ordered by z (ties by position: a stable sort).
+struct zi
 {
-	return m[2] > 0.0f && fabsf(m[0]) < 0.5f * m[2] && fabsf(m[1]) < 0.5f * m[2];
+	double z;
+	size_t i;
+};
+
+static int
+cmp_zi(const void *pa, const void *pb)
+{
+	const struct zi *a = (const struct zi *)pa, *b = (const struct zi *)pb;
+	if (a->z != b->z) {
+		return a->z < b->z ? -1 : 1;
+	}
+	return a->i < b->i ? -1 : (a->i > b->i ? 1 : 0);
 }
 
-//! The focus suggestion and the depth range, from the raw cloud (no unprojection needed for z).
-static void
-measure(const struct oc_splat_raw *raw, const double S[3], struct oc_splat_stats *st)
+//! numpy-style weighted percentile: the first z (ascending) whose cumulative weight reaches p·total.
+static double
+weighted_pct(const struct zi *sorted, const double *weight, size_t n, double p)
 {
-	st->z_min = INFINITY;
-	st->z_max = -INFINITY;
-	float cz_min = INFINITY, cz_max = -INFINITY;
-	for (size_t i = 0; i < raw->count; i++) {
-		const float *m = raw->means + i * 3u;
-		if (!isfinite(m[0]) || !isfinite(m[1]) || !isfinite(m[2]) || m[2] <= 0.0f) {
-			continue;
-		}
-		st->z_min = m[2] < st->z_min ? m[2] : st->z_min;
-		st->z_max = m[2] > st->z_max ? m[2] : st->z_max;
-		if (central(m) && raw->opacities[i] > 0.3f) {
-			cz_min = m[2] < cz_min ? m[2] : cz_min;
-			cz_max = m[2] > cz_max ? m[2] : cz_max;
-		}
-	}
-	if (!(st->z_min <= st->z_max)) {
-		st->z_min = st->z_max = 0.0f;
-	}
-	if (!(cz_min < cz_max)) {
-		return;
-	}
-	// Opacity-weighted histogram of log depth over the central region (half the
-	// frame each way): the 10th percentile is the nearest substantial clump.
-	double hist[OC_FOCUS_BINS] = {0};
-	const double l0 = log(cz_min), l1 = log(cz_max), span = l1 - l0 > 1e-9 ? l1 - l0 : 1e-9;
 	double total = 0.0;
-	for (size_t i = 0; i < raw->count; i++) {
-		const float *m = raw->means + i * 3u;
-		if (!isfinite(m[2]) || m[2] <= 0.0f || !central(m) || !(raw->opacities[i] > 0.3f)) {
-			continue;
-		}
-		uint32_t b = (uint32_t)((log(m[2]) - l0) / span * (OC_FOCUS_BINS - 1));
-		b = b >= OC_FOCUS_BINS ? OC_FOCUS_BINS - 1 : b;
-		hist[b] += raw->opacities[i];
-		total += raw->opacities[i];
+	for (size_t k = 0; k < n; k++) {
+		total += weight[sorted[k].i];
 	}
-	double acc = 0.0;
-	uint32_t pick = 0;
-	for (; pick < OC_FOCUS_BINS; pick++) {
-		acc += hist[pick];
-		if (acc >= 0.1 * total) {
-			break;
+	const double target = p * total;
+	double cw = 0.0;
+	for (size_t k = 0; k < n; k++) {
+		cw += weight[sorted[k].i];
+		if (cw >= target) {
+			return sorted[k].z;
 		}
 	}
-	const double zf = exp(l0 + ((double)pick + 0.5) / (OC_FOCUS_BINS - 1) * span);
-	double sum[3] = {0, 0, 0}, wsum = 0.0;
-	for (size_t i = 0; i < raw->count; i++) {
-		const float *m = raw->means + i * 3u;
-		if (!isfinite(m[0]) || !isfinite(m[1]) || !isfinite(m[2]) || m[2] <= 0.0f ||
-		    fabs(m[2] - zf) > 0.05 * zf || !central(m) || !(raw->opacities[i] > 0.3f)) {
-			continue;
-		}
-		const double w = raw->opacities[i];
-		sum[0] += w * m[0] * S[0];
-		sum[1] += w * m[1] * S[1];
-		sum[2] += w * m[2] * S[2];
-		wsum += w;
-	}
-	if (wsum > 0.0) {
-		st->focus_valid = true;
-		for (int k = 0; k < 3; k++) {
-			st->focus_point[k] = (float)(sum[k] / wsum);
-		}
-	}
+	return sorted[n - 1].z;
 }
 
 bool
-oc_splat_write_ply(const struct oc_splat_raw *raw,
-                   uint32_t w,
-                   uint32_t h,
-                   float focal_px,
-                   oc_splat_write_fn write,
-                   void *write_ctx,
-                   bool (*is_cancelled)(void *ctx),
-                   void *cancel_ctx,
-                   struct oc_splat_stats *stats)
+oc_splat_nearest_clump(
+    const float *rows, size_t count, double f_px, double width, double height, struct oc_splat_focus *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (rows == NULL || count == 0 || !(f_px > 0.0) || !(width > 0.0) || !(height > 0.0)) {
+		return false;
+	}
+	const double cx = width / 2.0, cy = height / 2.0, half = OC_CLUMP_CENTRAL_FRAC / 2.0;
+	const size_t stride = count > OC_CLUMP_SAMPLE_CAP ? (count + OC_CLUMP_SAMPLE_CAP - 1) / OC_CLUMP_SAMPLE_CAP : 1;
+	const size_t cap = (count + stride - 1) / stride;
+	double *invz = (double *)malloc(sizeof(double) * cap);
+	double *weight = (double *)malloc(sizeof(double) * cap);
+	double *zc = (double *)malloc(sizeof(double) * cap);
+	int *bin_of = (int *)malloc(sizeof(int) * cap);
+	struct zi *sorted = (struct zi *)malloc(sizeof(struct zi) * cap);
+	bool ok = false;
+	if (invz == NULL || weight == NULL || zc == NULL || bin_of == NULL || sorted == NULL) {
+		goto done;
+	}
+	size_t n = 0;
+	for (size_t i = 0; i < count; i += stride) {
+		const float *r = rows + i * OC_SPLAT_FLOATS;
+		const double x = r[0], y = r[1], z = r[2];
+		const double op = 1.0 / (1.0 + exp(-(double)r[6])); // the activated opacity
+		if (op < OC_CLUMP_MIN_OPACITY || !(z > OC_CLUMP_MIN_Z)) {
+			continue;
+		}
+		const double u = (f_px * (x / z) + cx) / width - 0.5;
+		const double v = (f_px * (y / z) + cy) / height - 0.5;
+		if (fabs(u) > half || fabs(v) > half) {
+			continue;
+		}
+		zc[n] = z;
+		invz[n] = 1.0 / z;
+		weight[n] = op;
+		n++;
+	}
+	if (n == 0) {
+		goto done;
+	}
+	double lo = invz[0], hi = invz[0];
+	for (size_t k = 1; k < n; k++) {
+		lo = invz[k] < lo ? invz[k] : lo;
+		hi = invz[k] > hi ? invz[k] : hi;
+	}
+	if (!(hi > lo)) {
+		goto done;
+	}
+	const int nb = OC_CLUMP_N_BINS;
+	double bins[OC_CLUMP_N_BINS] = {0}, smooth[OC_CLUMP_N_BINS];
+	for (size_t k = 0; k < n; k++) {
+		int b = (int)floor((invz[k] - lo) / (hi - lo) * nb);
+		b = b > nb - 1 ? nb - 1 : b;
+		bin_of[k] = b;
+		bins[b] += weight[k];
+	}
+	double mass_total = 0.0;
+	for (int b = 0; b < nb; b++) {
+		mass_total += bins[b];
+	}
+	if (!(mass_total > 0.0)) {
+		goto done;
+	}
+	for (int b = 0; b < nb; b++) {
+		const double left = bins[b > 0 ? b - 1 : 0], right = bins[b < nb - 1 ? b + 1 : nb - 1];
+		smooth[b] = (left + bins[b] + right) / 3.0;
+	}
+	const double empty = mass_total * OC_CLUMP_NOISE_FLOOR_FRAC;
+	int i = nb - 1;
+	while (i >= 0) {
+		if (smooth[i] <= empty) {
+			i--;
+			continue;
+		}
+		int j = i;
+		double run = 0.0;
+		while (j >= 0 && smooth[j] > empty) {
+			run += bins[j];
+			j--;
+		}
+		if (run >= mass_total * OC_CLUMP_MIN_MASS_FRAC) {
+			double w_sum = 0.0, v_sum = 0.0;
+			for (size_t k = 0; k < n; k++) {
+				if (bin_of[k] <= i && bin_of[k] >= j + 1) {
+					w_sum += weight[k];
+					v_sum += weight[k] * invz[k];
+				}
+			}
+			const double centroid = w_sum > 0.0 ? v_sum / w_sum : (lo + hi) / 2.0;
+			if (!(centroid > 0.0)) {
+				goto done;
+			}
+			double z = 1.0 / centroid;
+			z = z < OC_CLUMP_PIVOT_MIN_M ? OC_CLUMP_PIVOT_MIN_M
+			                             : (z > OC_CLUMP_PIVOT_MAX_M ? OC_CLUMP_PIVOT_MAX_M : z);
+			for (size_t k = 0; k < n; k++) {
+				sorted[k].z = zc[k];
+				sorted[k].i = k;
+			}
+			qsort(sorted, n, sizeof(*sorted), cmp_zi);
+			out->valid = true;
+			out->z_m = (float)z;
+			out->mass_frac = (float)(run / mass_total);
+			out->near_m = (float)weighted_pct(sorted, weight, n, 0.05);
+			out->far_m = (float)weighted_pct(sorted, weight, n, 0.95);
+			out->n = (uint32_t)n;
+			ok = true;
+			goto done;
+		}
+		i = j;
+	}
+done:
+	free(invz);
+	free(weight);
+	free(zc);
+	free(bin_of);
+	free(sorted);
+	return ok;
+}
+
+bool
+oc_splat_encode(const struct oc_splat_raw *raw,
+                uint32_t w,
+                uint32_t h,
+                float focal_px,
+                float *rows,
+                bool (*is_cancelled)(void *ctx),
+                void *cancel_ctx,
+                struct oc_splat_stats *stats)
 {
 	memset(stats, 0, sizeof(*stats));
-	if (raw == NULL || raw->count == 0 || w == 0 || h == 0 || !(focal_px > 0.0f)) {
+	if (raw == NULL || rows == NULL || raw->count == 0 || w == 0 || h == 0 || !(focal_px > 0.0f)) {
 		return false;
 	}
 	// inv(NDC · K) for K = [f 0 w/2; 0 f h/2; 0 0 1]: a diagonal scale.
 	const double S[3] = {(double)w / (2.0 * focal_px), (double)h / (2.0 * focal_px), 1.0};
-	measure(raw, S, stats);
-
-	char header[1024];
-	int n =
-	    snprintf(header, sizeof(header), "ply\nformat binary_little_endian 1.0\nelement vertex %zu\n", raw->count);
-	for (uint32_t k = 0; k < OC_SPLAT_FLOATS; k++) {
-		n += snprintf(header + n, sizeof(header) - (size_t)n, "property float %s\n", k_props[k]);
-	}
-	n += snprintf(header + n, sizeof(header) - (size_t)n, "end_header\n");
-	if (!write(write_ctx, header, (uint64_t)n)) {
-		return false;
-	}
-	float *buf = (float *)malloc(sizeof(float) * OC_SPLAT_FLOATS * OC_SPLAT_CHUNK);
-	if (buf == NULL) {
-		return false;
-	}
-	bool ok = true;
-	for (size_t base = 0; base < raw->count && ok; base += OC_SPLAT_CHUNK) {
+	stats->z_min = INFINITY;
+	stats->z_max = -INFINITY;
+	for (size_t base = 0; base < raw->count; base += OC_SPLAT_CHUNK) {
 		if (is_cancelled != NULL && is_cancelled(cancel_ctx)) {
-			ok = false;
-			break;
+			return false;
 		}
 		const size_t end = base + OC_SPLAT_CHUNK < raw->count ? base + OC_SPLAT_CHUNK : raw->count;
 		for (size_t i = base; i < end; i++) {
-			float *o = buf + (i - base) * OC_SPLAT_FLOATS;
+			float *o = rows + i * OC_SPLAT_FLOATS;
 			if (gaussian_finite(raw, i)) {
 				encode(raw, i, S, o);
+				if (o[2] > 0.0f) {
+					stats->z_min = o[2] < stats->z_min ? o[2] : stats->z_min;
+					stats->z_max = o[2] > stats->z_max ? o[2] : stats->z_max;
+				}
 			} else {
 				// Kept (the count is a fact of the model's grid) but invisible.
 				memset(o, 0, sizeof(float) * OC_SPLAT_FLOATS);
@@ -495,9 +571,41 @@ oc_splat_write_ply(const struct oc_splat_raw *raw,
 				stats->non_finite++;
 			}
 		}
-		ok = write(write_ctx, buf, (uint64_t)(end - base) * OC_SPLAT_FLOATS * sizeof(float));
-		stats->written = ok ? end : stats->written;
 	}
-	free(buf);
-	return ok;
+	if (!(stats->z_min <= stats->z_max)) {
+		stats->z_min = stats->z_max = 0.0f;
+	}
+	stats->written = raw->count;
+	oc_splat_nearest_clump(rows, raw->count, focal_px, w, h, &stats->focus);
+	return true;
+}
+
+bool
+oc_splat_write_ply_rows(const float *rows,
+                        size_t count,
+                        oc_splat_write_fn write,
+                        void *write_ctx,
+                        bool (*is_cancelled)(void *ctx),
+                        void *cancel_ctx)
+{
+	char header[1024];
+	int n = snprintf(header, sizeof(header), "ply\nformat binary_little_endian 1.0\nelement vertex %zu\n", count);
+	for (uint32_t k = 0; k < OC_SPLAT_FLOATS; k++) {
+		n += snprintf(header + n, sizeof(header) - (size_t)n, "property float %s\n", k_props[k]);
+	}
+	n += snprintf(header + n, sizeof(header) - (size_t)n, "end_header\n");
+	if (!write(write_ctx, header, (uint64_t)n)) {
+		return false;
+	}
+	for (size_t base = 0; base < count; base += OC_SPLAT_CHUNK) {
+		if (is_cancelled != NULL && is_cancelled(cancel_ctx)) {
+			return false;
+		}
+		const size_t end = base + OC_SPLAT_CHUNK < count ? base + OC_SPLAT_CHUNK : count;
+		if (!write(write_ctx, rows + base * OC_SPLAT_FLOATS,
+		           (uint64_t)(end - base) * OC_SPLAT_FLOATS * sizeof(float))) {
+			return false;
+		}
+	}
+	return true;
 }

@@ -11,7 +11,7 @@ depth capabilities — `DEPTH_VIDEO` (temporal, a small streaming video-depth mo
 `DEPTH_MONO` (a small still-depth model) — run through ONNX Runtime (DirectML on Windows, Core ML
 on macOS for the models whose pack variant lists `coreml`, CPU everywhere). The runtime composes
 views from them; this repo never declares `VIEWS_*`. A third, `SPLATS_MONO` (ADR-057, job lane:
-photo → 3DGS PLY), serves whatever model a pack names for `splats-mono` (none in the default
+photo → 3DGS PLY or SOG v2 with a camera block), serves whatever model a pack names for `splats-mono` (none in the default
 pack; a research-only model is its own pack) on the backend `src/oc_rank.c` ranks (a pure
 function, unit-tested by `tests/rank_test.c`): ONNX Runtime + DirectML on a discrete non-Intel
 GPU (Windows; full or fp16 model), else OpenVINO's GPU device only when it is an Intel Arc /
@@ -55,8 +55,13 @@ re-upload of a model (exports are built from the official checkpoint by our own 
 - `src/oc_profile.{c,h}` — `DIAG_PROFILE`: parses ONNX Runtime's node placement report and its
   profiling JSON (pure functions, `tests/profile_test.c`).
 - `src/oc_splat.{c,h}` — the splat capability's CPU work: the antialiased resample into the
-  model's grid, the unprojection + covariance re-diagonalisation, the 3DGS PLY writer, the focus
-  suggestion. `src/oc_tensor.h` — the named-tensor I/O both back ends share.
+  model's grid, the unprojection + covariance re-diagonalisation into 3DGS rows, the PLY writer, the
+  nearest-clump focus (`oc_splat_nearest_clump`, the DisplayXR Gallery's rule, ported exactly).
+- `src/oc_sog.{c,h}` — the SOG v2 writer (stored ZIP, lossless WebP planes via libwebp, Morton order,
+  256-entry codebooks) and the mono camera block. Spec: `docs/sog-camera-block.md` (container, block
+  schema, the focus rule, how a viewer renders it); change it only together with the DisplayXR
+  Gallery's online SOG generator. `cmake/LibWebP.cmake` — libwebp 1.5.0, pinned + hash-checked,
+  compiled from source into the provider (static, hidden symbols). `src/oc_tensor.h` — the named-tensor I/O both back ends share.
 - `src/oc_pack.{c,h}`, `src/oc_json.{c,h}` — the schema-2 pack reader (every `*.models.json` next
   to the binary; a capability's licence class is its own model's) and a strict JSON parser. A
   variant may list `data` files beside its one `model` file (ONNX external weights); the provider
@@ -112,7 +117,8 @@ Rules when touching provider code:
   splat capability to the next backend (re-described), never fails it.
 - Splat facts are measured, never intent: intrinsics actually unprojected through (`GIVEN` or a
   labelled `ASSUMED`), `metric = 0` unless a measured fit says otherwise, the build stamp on every
-  result. The provider never writes a camera block.
+  result. The provider writes a camera block only into its own SOG output (the mono block of
+  `docs/sog-camera-block.md`: the facts it measured, never a guessed baseline); a PLY carries none.
 - A session never outlives the streams' temporal bindings: `release_session()` drops them first.
 
 ## Building (Windows: from a VS 2022 developer prompt)
