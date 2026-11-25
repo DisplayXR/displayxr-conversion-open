@@ -147,6 +147,8 @@ struct oc_cap
 	uint64_t dml_luid;
 	uint64_t dml_vram_mb;
 	bool dml_failed;    //!< SPLATS_MONO: DirectML failed in this process; ranked without it from now on
+	bool fp16_failed;   //!< SPLATS_MONO: the fp16 model failed on DirectML (load, output type): DirectML
+	                    //!< stays, ranked without the fp16 model from now on
 	bool ov_gpu_failed; //!< SPLATS_MONO: OpenVINO's GPU device failed; ranked without it from now on
 	char backend[32];
 	uint64_t device_luid;
@@ -575,7 +577,7 @@ pick_splat_model_locked(struct oc_provider *p, struct oc_cap *c, enum oc_ep ep, 
 	c->pick_forced = false;
 	const struct oc_pack_model *full = p->splat_cand[OC_SPLAT_FULL];
 	const struct oc_pack_model *small = p->splat_cand[OC_SPLAT_SMALL];
-	const bool fp16_here = ep == OC_EP_DML && p->splat_cand[OC_SPLAT_FP16] != NULL;
+	const bool fp16_here = ep == OC_EP_DML && p->splat_cand[OC_SPLAT_FP16] != NULL && !c->fp16_failed;
 	if ((full == NULL || small == NULL || full == small) && !fp16_here) {
 		// One model (or none) for the task: nothing to choose.
 		const uint32_t k = full != NULL ? OC_SPLAT_FULL : OC_SPLAT_SMALL;
@@ -883,6 +885,7 @@ rank_splat_locked(struct oc_provider *p, struct oc_cap *c)
 	    .full_on_dml = full != NULL && oc_pack_variant_for_ep(full, "dml") != NULL,
 	    .fp16_on_dml = fp16 != NULL,
 	    .fp16_ready = splat_fp16_ready_locked(p),
+	    .fp16_failed = c->fp16_failed,
 	    .ov_present = p->ov_present,
 	    .ov_known = p->ov_devices_known || c->ov_gpu_failed,
 	    .ov_gpus = p->ov_gpus,
@@ -894,7 +897,10 @@ rank_splat_locked(struct oc_provider *p, struct oc_cap *c)
 		fprintf(stderr, "[open-conversion] splats-mono: %s\n", ch.fallback);
 	}
 	fprintf(stderr, "[open-conversion] splats-mono: %s%s -> %s; model %s (MODEL=%s, %llu MB RAM)\n",
-	        no_dml ? "DirectML failed, re-ranked: " : "", ch.why, oc_rank_backend_name(ch.backend),
+	        no_dml          ? "DirectML failed, re-ranked: "
+	        : c->fp16_failed ? "the fp16 model failed on DirectML, re-ranked: "
+	                         : "",
+	        ch.why, oc_rank_backend_name(ch.backend),
 	        oc_rank_model_name(ch.model), p->splat_model_setting, (unsigned long long)p->ram_mb);
 	c->ov_provisional = ch.provisional;
 	c->dml_device = -1;
@@ -1430,17 +1436,27 @@ fall_back_to_cpu(struct oc_provider *p, struct oc_cap *c, const char *why)
 	notify(0);
 }
 
-/*! The next backend after @p c's current one failed: OpenVINO GPU → OpenVINO
- *  CPU → ONNX Runtime CPU (re-described each step). Sticky for the process. */
+/*! The next backend after @p c's current one failed with @p r: OpenVINO GPU →
+ *  OpenVINO CPU → ONNX Runtime CPU (re-described each step). Sticky for the process. */
 static void
-fall_back(struct oc_provider *p, struct oc_cap *c, const char *why)
+fall_back(struct oc_provider *p, struct oc_cap *c, enum oc_run_status r, const char *why)
 {
 	if (is_splats(c) && c->ep == OC_EP_DML) {
-		// DirectML could not start or a run failed: the rest of the ranking without it
-		// (OpenVINO, else ONNX Runtime's CPU EP), not straight to the slowest path.
-		fprintf(stderr, "[open-conversion] splats-mono: DirectML unavailable (%s)\n", why);
+		// The fp16 model failed for a reason of its own (it does not load, a wrong output
+		// type; not memory, not a lost device): only that model drops out, DirectML keeps
+		// the full model when the adapter has the memory for it. Otherwise DirectML could
+		// not start or a run failed: the rest of the ranking without it (OpenVINO, else ONNX
+		// Runtime's CPU EP), not straight to the slowest path.
+		const bool fp16_own = !c->fp16_failed && c->model != NULL && c->model == p->splat_cand[OC_SPLAT_FP16] &&
+		                      r != OC_RUN_OUT_OF_MEMORY && r != OC_RUN_DEVICE_LOST;
+		fprintf(stderr, "[open-conversion] splats-mono: %s (%s)\n",
+		        fp16_own ? "the fp16 model failed on DirectML" : "DirectML unavailable", why);
 		oc_lock(&p->lock);
-		c->dml_failed = true;
+		if (fp16_own) {
+			c->fp16_failed = true;
+		} else {
+			c->dml_failed = true;
+		}
 		bind_cap_locked(p, c, rank_splat_locked(p, c));
 		p->generation++;
 		oc_unlock(&p->lock);
@@ -1540,7 +1556,7 @@ prepare_openvino(struct oc_provider *p, struct oc_cap *c)
 		}
 	}
 	if (c->ep == OC_EP_OPENVINO && strcmp(c->ov_device, "GPU") == 0 && p->ov_gpu_count == 0) {
-		fall_back(p, c, "no GPU device");
+		fall_back(p, c, OC_RUN_FAILED, "no GPU device");
 	}
 }
 
@@ -2020,7 +2036,7 @@ resolve:
 		// DirectML / Core ML could not start (driver, feature level, an operator,
 		// a Core ML compile failure): the CPU execution provider serves the same model.
 		release_session(p, c);
-		fall_back(p, c, err);
+		fall_back(p, c, r, err);
 		prepare_openvino(p, c); // DirectML -> OpenVINO: load it and check its devices first
 		m = c->model;
 		if (!runtime_ready(p, c)) {
@@ -2546,6 +2562,7 @@ splat_job(struct oc_provider *p,
 	char err[XRT_CONV_DETAIL_MAX] = "";
 	uint64_t t0 = oc_now_ms();
 	bool ran = false;
+	enum oc_run_status run_status = OC_RUN_FAILED; // ONNX Runtime's verdict (fall_back)
 	if (c->ov_session != NULL) {
 		const enum oc_ov_run r =
 		    oc_ov_run(c->ov_session, ins, 2, outs, 5, cancelled, ctl->ctx, err, sizeof(err));
@@ -2587,6 +2604,7 @@ splat_job(struct oc_provider *p,
 			return XRT_ERROR_ALLOCATION;
 		}
 		ran = r == OC_RUN_OK;
+		run_status = r;
 	}
 	const uint64_t infer_ms = oc_now_ms() - t0;
 	if (!ran) {
@@ -2597,7 +2615,7 @@ splat_job(struct oc_provider *p,
 			// the runtime re-warms there. No silent retry inside a job (§2.4).
 			char why[XRT_CONV_DETAIL_MAX];
 			release_session(p, c);
-			fall_back(p, c, err);
+			fall_back(p, c, run_status, err);
 			snprintf(why, sizeof(why), "%.40s: run failed; re-warms on %.24s", m->name, c->backend);
 			set_state(p, c, XRT_CONV_STATE_FAILED, XRT_CONV_FAIL_DEVICE_LOST, 1, -1.0f, why);
 		}

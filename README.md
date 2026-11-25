@@ -94,14 +94,20 @@ never pre-fetch one); `--verify-store DIR` checks a model store against it.
 - **`sharp-int4-1536`** — the same export with its MatMul weights quantized to 4 bits; one
   0.58 GB file.
 - **`sharp-fp16-1536`** — for **DirectML only** (its one variant lists `dml`): the same export
-  with its static shape arithmetic folded (ONNX Runtime's basic graph optimisation, standard
-  operators only), then converted to float16 with fp32 inputs and outputs. The two encoders and
-  the decoder run in fp16; the Gaussian composer, the initialiser, the prediction head and the
-  instance normalisations stay fp32. Graph + one external-data file named by its SHA-256, like
-  `full`, about 1.3 GB: half the GPU memory of `full`. Against the fp32 model on OpenVINO's CPU
-  (fp32 precision) it runs, in true fp16 on an Intel Arc GPU, at a median relative depth error of
-  0.34 % (p95 2.5 %) — the same as the fp32 model itself on that GPU (0.29 %, p95 2.2 %), because
-  OpenVINO's GPU device computes in fp16 anyway. Not yet measured on DirectML.
+  with its static shape arithmetic folded (in Python, with ONNX's reference operators and only
+  exactly-defined ones: integer arithmetic, IEEE `+ - * / sqrt`, data movement; no ONNX Runtime
+  graph optimiser, whose saved graph differed between Windows and Linux), then converted to
+  float16. Its graph inputs and outputs stay **float32** (the script checks every one against the
+  fp32 model and refuses otherwise). The two encoders and the decoder run in fp16; the Gaussian
+  composer, the initialiser, the prediction head, the Gaussian output heads (geometry, texture),
+  the monodepth head and the instance normalisations stay fp32 (242 nodes). Graph + one
+  external-data file named by its SHA-256, like `full`, about 1.3 GB: half the GPU memory of
+  `full`. Against the fp32 model on ONNX Runtime's CPU EP (one photo): median relative depth
+  error 0.10 % (p95 0.77 %); per-attribute mean |difference| / mean |value|: positions 0.80 %,
+  colours 0.13 %, rotations 0.22 %, opacities 0.21 %, scales 1.5 % (export_sharp.py 1.2.0's
+  fp16 build: 1.40 / 0.20 / 0.33 / 0.34 / 2.7 %, depth 0.26 %). Measured on DirectML (RTX 3080,
+  10 GB, the 1.2.0 build): 8.5 – 10 s a job where the fp32 model, over the card's memory budget,
+  took 16 – 190 s.
 
 The provider picks between them per machine (setting `MODEL`, [below](#which-sharp-build-model)).
 SHARP's weights are licensed **for research only** (Apple Machine Learning Research Model
@@ -138,14 +144,16 @@ produced against the pack and says so if they differ.
 | `sharp-full-1536` | splats-mono | graph (`model`) | `cbe7db8a32a5e1d3af96fbd64841d0e77b8db79f3efba92fda3891e3edc75326` | 6 226 171 | never (built locally) |
 | | | weights (`data`) | `95912399a850769c894d780c1761604ced31ce30e2464a8c3138e796f26e15d0` | 2 615 734 016 | |
 | `sharp-int4-1536` | splats-mono | `model` | `01202f427e5f83ece061a5438e5b6670fbe9ffb26d30f8100bb285eb69f753f9` | 583 477 535 | never (built locally) |
-| `sharp-fp16-1536` | splats-mono | graph (`model`) | `bc910d0d885f3840123d02a7c504c48195e0d3e91da16a42ec1399bae3f62567` | 1 197 831 | never (built locally) |
-| | | weights (`data`) | `8e156871dd80ec9357dc0674788954d1d79bd609a43e8b5154d984a9ec34870d` | 1 326 800 640 | |
+| `sharp-fp16-1536` | splats-mono | graph (`model`) | `dd8c234b5c43b575a05cfe3abf49802f5b09c2e02a8d1381b4aa78701697a150` | 3 738 019 | never (built locally) |
+| | | weights (`data`) | `c4ca19ecc5974480af6c58e23c9a31813d50cd4febcd8be3a6ba0b974bae5499` | 1 310 054 144 | |
 
 Each model's `local_build` block names the script, the version that introduced its recipe and
 whether it is deterministic; `provenance` pins the parent checkpoint (`parent_sha256`,
 `parent_size`). The version written into a blob's metadata is its recipe's, not the script's, so
 an unrelated script change never moves a pinned hash (the int4 and full bytes are unchanged by
-1.2.0, which added fp16; the fp16 build is byte-identical from run to run too, checked twice). The capability is
+1.2.0, which added fp16, and 1.3.0, which rebuilt it). The fp16 recipe (1.3.0) is
+byte-identical from run to run and across `PYTHONHASHSEED` values (checked on Linux); its 1.2.0
+recipe went through ONNX Runtime's optimised-graph writer and gave other bytes on Windows. The capability is
 `RESEARCH_ONLY` and is selected only with `AllowResearchOnly`. The model's tensors, shapes and
 coordinate convention (projective means, unnormalised `wxyz` quaternions, linear-RGB colours)
 are in the pack's `io` block.
@@ -277,9 +285,16 @@ described machines by the `splats-rank` test):
   of any vendor and `cpu` its CPU device, whenever OpenVINO serves the capability; it does not by
   itself select OpenVINO over DirectML (use `EP=openvino` for that). `MODEL=full|int4` is honoured
   on every backend.
-- **Fallbacks:** DirectML that cannot start, runs out of memory or fails a run drops out for the
-  process and the capability re-ranks without it (OpenVINO, else ONNX Runtime CPU); OpenVINO GPU →
-  OpenVINO CPU → ONNX Runtime CPU as before. Each step re-describes the capability.
+- **Fallbacks:** when the **fp16** model fails on DirectML for a reason of its own (it will not
+  load, a wrong output type; not out of memory, not a lost device), only the fp16 model drops out
+  for the process: DirectML keeps the full model when the adapter has the 9 GB it needs. Otherwise
+  DirectML that cannot start, runs out of memory or fails a run drops out for the process and the
+  capability re-ranks without it (OpenVINO, else ONNX Runtime CPU). On Windows the OpenVINO GPU
+  device is a candidate only when a DXGI adapter is an Intel GPU that is not UHD / HD Graphics
+  class: a machine whose only Intel adapter is a UHD 770 (or that has none) goes straight to
+  OpenVINO's CPU device (`MODEL=auto`: int4), never a provisional GPU pick that would compile the
+  full model first. OpenVINO GPU → OpenVINO CPU → ONNX Runtime CPU as before. Each step
+  re-describes the capability.
 - **No silent choice.** One line per ranking on stderr (the runtime's provider log), e.g.
 
   ```

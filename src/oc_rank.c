@@ -113,6 +113,29 @@ oc_rank_ov_gpu_ok(const struct oc_ov_gpu *g, char *why, size_t why_size)
 }
 
 bool
+oc_rank_dxgi_rules_out_ov_gpu(const struct oc_dxgi_adapter *adapters, uint32_t count, char *why, size_t why_size)
+{
+	char dummy[8];
+	if (why == NULL) {
+		why = dummy;
+		why_size = sizeof(dummy);
+	}
+	why[0] = '\0';
+	if (adapters == NULL || count == 0) {
+		return false;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		const struct oc_dxgi_adapter *a = &adapters[i];
+		if (!a->software && a->vendor_id == OC_VENDOR_INTEL && !contains_ci(a->name, "UHD") &&
+		    !contains_ci(a->name, "HD Graphics")) {
+			return false;
+		}
+	}
+	snprintf(why, why_size, "no Intel Arc / Xe-class DXGI adapter, so no OpenVINO GPU device worth using");
+	return true;
+}
+
+bool
 oc_rank_auto_full(bool gpu, uint64_t ram_mb, bool dml, uint64_t dml_vram_mb)
 {
 	if (!gpu || ram_mb < OC_FULL_MODEL_MIN_RAM_MB) {
@@ -209,6 +232,15 @@ ov_branch(const struct oc_splat_env *e, struct oc_splat_choice *o, const char *l
 		return;
 	}
 	if (!e->ov_known) {
+		char no_gpu[96];
+		if (oc_rank_dxgi_rules_out_ov_gpu(e->adapters, e->adapter_count, no_gpu, sizeof(no_gpu))) {
+			// Windows: the adapters already say OpenVINO's GPU device would be another
+			// vendor's card or a UHD-class iGPU. Never a provisional GPU pick here: it
+			// would compile the full model before the device check moves it away.
+			o->backend = OC_SB_OV_CPU;
+			snprintf(o->why, sizeof(o->why), "%.140s; %.100s", lead, no_gpu);
+			return;
+		}
 		o->backend = OC_SB_OV_GPU;
 		o->ov_gpu = -1;
 		o->provisional = true;
@@ -257,6 +289,7 @@ oc_rank_splat(const struct oc_splat_env *e, struct oc_splat_choice *o)
 	const bool force_fp16 = is(e->model, "fp16");
 	const bool force_int4 = is(e->model, "int4");
 	const int disc = e->dml_available ? best_discrete(e) : -1;
+	const bool fp16_ok = e->fp16_on_dml && e->fp16_ready && !e->fp16_failed;
 
 	if (is(e->ep, "cpu")) {
 		snprintf(o->why, sizeof(o->why), "EP=cpu");
@@ -293,8 +326,7 @@ oc_rank_splat(const struct oc_splat_env *e, struct oc_splat_choice *o)
 		const char *skip = NULL;
 		char skip_buf[128];
 		const uint64_t vram = disc >= 0 ? e->adapters[disc].dedicated_mb : 0;
-		const enum oc_splat_model auto_model =
-		    oc_rank_auto_model(true, e->ram_mb, true, vram, e->fp16_on_dml && e->fp16_ready);
+		const enum oc_splat_model auto_model = oc_rank_auto_model(true, e->ram_mb, true, vram, fp16_ok);
 		if (!e->dml_available) {
 			skip = "no DirectML";
 		} else if (disc < 0) {
@@ -310,7 +342,11 @@ oc_rank_splat(const struct oc_splat_env *e, struct oc_splat_choice *o)
 			if (e->ram_mb < OC_FULL_MODEL_MIN_RAM_MB) {
 				skip = "under 16 GB of RAM for the full model";
 			} else {
-				if (e->fp16_on_dml && e->fp16_ready) {
+				if (e->fp16_on_dml && e->fp16_ready && e->fp16_failed) {
+					snprintf(skip_buf, sizeof(skip_buf),
+					         "the fp16 model failed; %llu MB of VRAM, the full model needs %llu MB",
+					         (unsigned long long)vram, (unsigned long long)OC_FULL_MODEL_MIN_VRAM_MB);
+				} else if (fp16_ok) {
 					snprintf(skip_buf, sizeof(skip_buf),
 					         "%llu MB of VRAM: the full model needs %llu MB, the fp16 one %llu MB",
 					         (unsigned long long)vram,
@@ -346,8 +382,8 @@ oc_rank_splat(const struct oc_splat_env *e, struct oc_splat_choice *o)
 		o->model = OC_SM_INT4;
 	} else if (force_fp16) {
 		// fp16 has a DirectML variant only: anywhere else MODEL=fp16 means the full model.
-		o->model = on_dml && e->fp16_on_dml ? OC_SM_FP16 : OC_SM_FULL;
+		o->model = on_dml && e->fp16_on_dml && !e->fp16_failed ? OC_SM_FP16 : OC_SM_FULL;
 	} else {
-		o->model = oc_rank_auto_model(gpu, e->ram_mb, on_dml, vram, e->fp16_on_dml && e->fp16_ready);
+		o->model = oc_rank_auto_model(gpu, e->ram_mb, on_dml, vram, fp16_ok);
 	}
 }

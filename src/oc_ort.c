@@ -163,6 +163,22 @@ contains_ci(const char *hay, const char *needle)
 }
 
 //! Classify an ONNX Runtime error message (it carries the HRESULT for DirectML).
+//! "float16", "float32", ... for an error message.
+static const char *
+elem_type_name(ONNXTensorElementDataType t)
+{
+	switch (t) {
+	case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: return "float32";
+	case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16: return "float16";
+	case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16: return "bfloat16";
+	case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE: return "float64";
+	case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: return "int64";
+	case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32: return "int32";
+	case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8: return "uint8";
+	default: return "not float32";
+	}
+}
+
 static enum oc_run_status
 classify(const char *msg)
 {
@@ -726,9 +742,18 @@ oc_session_run_named(struct oc_session *s,
 		if (!ok) {
 			goto fail;
 		}
-		if (type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || count > out[i].capacity) {
-			snprintf(err, err_size, "output %s: %zu elements of type %d (capacity %zu floats)", out[i].name,
-			         count, (int)type, out[i].capacity);
+		if (type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+			// A model problem, not a device one: e.g. an fp16 build whose graph outputs were
+			// left float16 (export_sharp.py before 1.3.0). Name it so the log says so.
+			snprintf(err, err_size,
+			         "output %s is %s (ONNX element type %d), but this provider reads float32: the model's "
+			         "graph outputs must be float32 (rebuild it with the current export script)",
+			         out[i].name, elem_type_name(type), (int)type);
+			goto fail;
+		}
+		if (count > out[i].capacity) {
+			snprintf(err, err_size, "output %s: %zu elements (capacity %zu floats)", out[i].name, count,
+			         out[i].capacity);
 			goto fail;
 		}
 		TRY(api->GetTensorMutableData(res[i], (void **)&data));

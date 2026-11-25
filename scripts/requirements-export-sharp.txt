@@ -3,9 +3,11 @@
 #
 # Pinned environment for scripts/export_sharp.py. The bytes the pack lists
 # (packs/dxr-open-sharp.models.json) were produced with exactly these versions;
-# torch (the exporter), onnx + protobuf (serialisation), onnxruntime (the int4
-# quantizer and the fp16 variant's graph folding) and onnxconverter-common (the
-# fp16 conversion) decide the bytes. Python 3.12.
+# torch (the exporter), onnx + protobuf (serialisation, shape inference and the
+# fp16 variant's shape folding), numpy, onnxruntime (the int4 quantizer) and
+# onnxconverter-common (the fp16 conversion) decide the bytes. Python 3.12.
+# An environment made for an older export_sharp.py lacks onnxconverter-common:
+# re-run the pip line below in it.
 #
 #   python3.12 -m venv sharp-venv
 #   sharp-venv/bin/pip install -r scripts/requirements-export-sharp.txt

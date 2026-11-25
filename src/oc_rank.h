@@ -17,7 +17,10 @@
  *   2. OpenVINO's GPU device, only when it is an Intel Arc / Xe-class GPU
  *      (never an NVIDIA / AMD device reached through OpenCL, never a UHD-class
  *      iGPU). Before OpenVINO is loaded its devices are unknown: the choice is
- *      then provisional and re-ranked once warm has listed them.
+ *      then provisional and re-ranked once warm has listed them - except on
+ *      Windows, where the DXGI adapters are known up front: no Intel adapter
+ *      outside the UHD / HD Graphics class means no OpenVINO GPU candidate, so
+ *      the CPU device is chosen at once (oc_rank_dxgi_rules_out_ov_gpu).
  *   3. OpenVINO's CPU device.
  *   4. ONNX Runtime's CPU execution provider.
  * EP=dml | openvino | cpu | coreml, OV_DEVICE=gpu | cpu and MODEL=full | fp16 |
@@ -140,6 +143,8 @@ struct oc_splat_env
 	bool full_on_dml; //!< the pack's full splat model has a DirectML variant
 	bool fp16_on_dml; //!< the pack has an fp16 splat model (DirectML variant) ...
 	bool fp16_ready;  //!< ... and its blob is in the store (it is only ever built locally)
+	bool fp16_failed; //!< the fp16 model failed on DirectML in this process for a reason of
+	                  //!< its own (load, output type): ranked as if it were not built
 
 	bool ov_present; //!< OpenVINO located (probe) / loaded (warm)
 	bool ov_known;   //!< ov_gpus is the real device list (OpenVINO loaded)
@@ -170,6 +175,16 @@ oc_rank_dxgi_discrete(const struct oc_dxgi_adapter *a);
  *  @p why (may be NULL) gets the reason it is not. */
 bool
 oc_rank_ov_gpu_ok(const struct oc_ov_gpu *g, char *why, size_t why_size);
+
+/*! Windows (DXGI adapters listed): true when none of them is an Intel GPU outside the
+ *  UHD / HD Graphics class, i.e. OpenVINO's GPU device could only be another vendor's card
+ *  or a UHD-class iGPU, which EP=auto never uses. False when no adapter is listed (Linux,
+ *  macOS: unknown until OpenVINO lists its devices). @p why (may be NULL) gets the reason. */
+bool
+oc_rank_dxgi_rules_out_ov_gpu(const struct oc_dxgi_adapter *adapters,
+                              uint32_t count,
+                              char *why,
+                              size_t why_size);
 
 /*! MODEL=auto: full on a GPU backend with enough RAM (and, on DirectML, enough
  *  VRAM: @p dml_vram_mb, ignored when @p dml is false); int4 otherwise. */

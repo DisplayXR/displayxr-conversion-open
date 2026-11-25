@@ -14,6 +14,7 @@
 static int g_failed = 0;
 static bool g_fp16_on_dml = false; //!< the pack has an fp16 model (DirectML variant)
 static bool g_fp16_ready = false;  //!< ... and its blob is in the store
+static bool g_fp16_failed = false; //!< ... and it failed on DirectML in this process
 
 #define GB(x) ((uint64_t)(x) * 1024u)
 
@@ -108,6 +109,7 @@ expect(const struct machine *m,
 	    .full_on_dml = true,
 	    .fp16_on_dml = g_fp16_on_dml,
 	    .fp16_ready = g_fp16_ready,
+	    .fp16_failed = g_fp16_failed,
 	    .ov_present = m->ov_present,
 	    .ov_known = m->ov_known,
 	    .ov_gpus = m->ov_gpus,
@@ -120,7 +122,8 @@ expect(const struct machine *m,
 	                (c.fallback[0] != '\0') == want_fallback;
 	printf("%s %-34s%s EP=%-8s OV_DEVICE=%-4s MODEL=%-4s -> %s%s%s, model %s | %s%s%s\n", ok ? "ok  " : "FAIL",
 	       m->name,
-	       g_fp16_ready    ? " [fp16 built]"
+	       g_fp16_failed   ? " [fp16 built, failed]"
+	       : g_fp16_ready  ? " [fp16 built]"
 	       : g_fp16_on_dml ? " [fp16 in pack]"
 	                       : "",
 	       ep, ov_device, model, oc_rank_backend_name(c.backend), c.backend == OC_SB_DML ? " #" : "",
@@ -272,6 +275,53 @@ main(void)
 	g_fp16_on_dml = false;
 	g_fp16_ready = false;
 	expect(&card_8g, "auto", "auto", "fp16", OC_SB_OV_CPU, -1, OC_SM_FULL, false); // no fp16 model anywhere
+
+	// The Windows tester's desktop: RTX 3080 (10 GB, reports ~10050 MB) + the 12900K's UHD 770,
+	// 64 GB, OpenVINO located but not loaded yet (its devices unknown).
+	static const struct oc_dxgi_adapter k_uhd770 = {"Intel(R) UHD Graphics 770", OC_VENDOR_INTEL, 128, false, 1,
+	                                                0x800};
+	struct machine tester = mk("rtx3080 10050 MB + uhd770 (probe)", true, GB(64), true, false);
+	add_adapter(&tester,
+	            &(struct oc_dxgi_adapter){"NVIDIA GeForce RTX 3080", OC_VENDOR_NVIDIA, 10050, false, 0, 0x810});
+	add_adapter(&tester, &k_uhd770);
+	g_fp16_on_dml = true;
+	g_fp16_ready = true;
+	expect(&tester, "auto", "auto", "auto", OC_SB_DML, 0, OC_SM_FP16, false);
+	// The fp16 model fails on DirectML (it does not load, a wrong output type): DirectML stays,
+	// with the full model (the card has >= 9 GiB).
+	g_fp16_failed = true;
+	expect(&tester, "auto", "auto", "auto", OC_SB_DML, 0, OC_SM_FULL, false);
+	expect(&tester, "auto", "auto", "fp16", OC_SB_DML, 0, OC_SM_FULL, false);
+	// ... on an 8 GB card the full model does not fit: the next backend, never DirectML int4.
+	expect(&card_8g, "auto", "auto", "auto", OC_SB_OV_CPU, -1, OC_SM_INT4, false);
+	g_fp16_failed = false;
+	// DirectML failed entirely (dml_available false) on the NVIDIA box, before OpenVINO listed
+	// its devices: the only Intel adapter is a UHD 770, so OpenVINO's CPU device at once (int4),
+	// never a provisional OpenVINO GPU pick that compiles the full model first.
+	struct machine tester_nodml = tester;
+	tester_nodml.name = "rtx3080 + uhd770 (DirectML failed)";
+	tester_nodml.windows = false;
+	expect(&tester_nodml, "auto", "auto", "auto", OC_SB_OV_CPU, -1, OC_SM_INT4, false);
+	// The same box with no iGPU at all (desk, OpenVINO not loaded yet).
+	struct machine desk_probe_nodml = desk;
+	desk_probe_nodml.name = "rtx3080-desktop (probe, DirectML failed)";
+	desk_probe_nodml.windows = false;
+	desk_probe_nodml.ov_known = false;
+	desk_probe_nodml.ov_gpu_count = 0;
+	expect(&desk_probe_nodml, "auto", "auto", "auto", OC_SB_OV_CPU, -1, OC_SM_INT4, false);
+	// An Iris Xe / Arc DXGI adapter keeps the provisional OpenVINO GPU pick on Windows.
+	struct machine xe_win = mk("iris xe laptop, windows (probe)", true, GB(32), true, false);
+	add_adapter(&xe_win,
+	            &(struct oc_dxgi_adapter){"Intel(R) Iris(R) Xe Graphics", OC_VENDOR_INTEL, 128, false, 0, 0x900});
+	expect(&xe_win, "auto", "auto", "auto", OC_SB_OV_GPU, -1, OC_SM_FULL, false);
+	// ds1-linux (Intel Arc iGPU, no DXGI): unchanged by all of the above.
+	expect(&arc_probe, "auto", "auto", "auto", OC_SB_OV_GPU, -1, OC_SM_FULL, false);
+	expect(&arc, "auto", "auto", "auto", OC_SB_OV_GPU, -1, OC_SM_FULL, false);
+	g_fp16_failed = true;
+	expect(&arc, "auto", "auto", "auto", OC_SB_OV_GPU, -1, OC_SM_FULL, false);
+	g_fp16_failed = false;
+	g_fp16_on_dml = false;
+	g_fp16_ready = false;
 
 	// Which OpenVINO GPUs EP=auto uses.
 	gpu_ok("Intel(R) Graphics [0xb090] (iGPU)", OC_OV_GPU_TYPE_INTEGRATED, 32, "GPU: vendor=0x8086 arch=v30.1.0",

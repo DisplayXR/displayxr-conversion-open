@@ -17,7 +17,10 @@ function, unit-tested by `tests/rank_test.c`): ONNX Runtime + DirectML on a disc
 GPU (Windows; full or fp16 model), else OpenVINO's GPU device only when it is an Intel Arc /
 Xe-class GPU (Linux x86_64 and Windows x64; decided once OpenVINO has listed its devices), else
 OpenVINO's CPU device, else ONNX Runtime's CPU EP; explicit `EP` / `OV_DEVICE` / `MODEL` win, and
-one stderr line says what it resolved to and why. Setting `MODEL` (`auto` | `full` | `int4`) picks
+one stderr line says what it resolved to and why. A failure of the fp16 model of its own (load,
+output type) drops only that model (DirectML keeps full with ≥ 9 GB); any other DirectML failure
+drops DirectML. On Windows OpenVINO's GPU device is never picked provisionally unless a DXGI
+adapter is an Intel GPU outside the UHD / HD Graphics class (`oc_rank_dxgi_rules_out_ov_gpu`). Setting `MODEL` (`auto` | `full` | `int4`) picks
 between the pack's full model (`defaults["splats-mono"].high`) and its small one (`.low`):
 `auto` = full when the bound backend is a GPU (OpenVINO GPU, DirectML with ≥ 9 GB VRAM, Core ML)
 and the OS reports ≥ 15 GiB of RAM (a "16 GB" machine), else int4; on DirectML the pack's fp16 model
@@ -66,8 +69,10 @@ re-upload of a model (exports are built from the official checkpoint by our own 
 - `packs/dxr-open-default.models.json` — the default pack. `packs/dxr-open-sharp.models.json` — the
   research-only SHARP splat models, `local_build` (never downloaded: the user builds the blobs with
   `scripts/export_sharp.py` from the official checkpoint): `sharp-int4-1536` (one 0.58 GB file,
-  `defaults.low`), `sharp-fp16-1536` (DirectML only: shape arithmetic folded, float16 with fp32 I/O,
-  a 1.2 MB graph + one 1.3 GB data file, `defaults.medium`) and `sharp-full-1536` (fp32: a 6 MB
+  `defaults.low`), `sharp-fp16-1536` (DirectML only: shape arithmetic folded in Python, float16 with fp32 I/O
+  (checked), Gaussian output + monodepth heads fp32, a 3.7 MB graph + one 1.3 GB data file,
+  `defaults.medium`; no ONNX Runtime step in its recipe: ORT's saved optimised graph is not the
+  same bytes on Windows and Linux) and `sharp-full-1536` (fp32: a 6 MB
   graph + one 2.6 GB external-data file the graph names by its sha256, `defaults.high`). `tests/packs/` — test packs.
 - `scripts/check_model_pack.py` — pack validator (also the CI guard that no `prefetch` blob is
   non-commercial); `scripts/fetch_models.py` — dev / CI blob download with hash check;
