@@ -17,7 +17,7 @@
 
 #ifdef _WIN32
 #define COBJMACROS
-#include <dxgi.h>
+#include <dxgi1_4.h>
 #include <dml_provider_factory.h>
 #endif
 
@@ -39,6 +39,8 @@ struct oc_ort
 	OrtLoggingLevel print_level;
 	//! Session creation is one [S] call at a time, so one slot suffices.
 	struct oc_ep_report report;
+	//! Non-NULL while a diagnostics session is created: ort_log parses the placement report into it.
+	struct oc_place_report *capture;
 };
 
 struct oc_session
@@ -49,6 +51,8 @@ struct oc_session
 	OrtMemoryInfo *device_mem; //!< where a temporal cache lives between frames
 	enum oc_ep ep;
 	struct oc_ep_report report;
+	struct oc_place_report *place; //!< diagnostics: the placement report (NULL unless asked for)
+	bool profiling;                //!< diagnostics: ONNX Runtime profiles this session's runs
 };
 
 struct oc_temporal
@@ -119,6 +123,9 @@ ort_log(void *param,
 		if (r.valid) {
 			o->report = r;
 		}
+	}
+	if (o != NULL && o->capture != NULL) {
+		(void)oc_place_feed(o->capture, message);
 	}
 	if (o == NULL || severity >= o->print_level) {
 		fprintf(stderr, "[open-conversion] onnxruntime: %s\n", message);
@@ -356,6 +363,44 @@ oc_dxgi_list_adapters(struct oc_dxgi_adapter *out, uint32_t max)
 #endif
 }
 
+bool
+oc_gpu_memory(uint64_t luid, struct oc_gpu_mem *out)
+{
+	memset(out, 0, sizeof(*out));
+#ifdef _WIN32
+	if (luid == 0) {
+		return false;
+	}
+	IDXGIFactory4 *f = NULL;
+	if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory4, (void **)&f))) {
+		return false;
+	}
+	LUID l;
+	l.LowPart = (DWORD)(luid & 0xffffffffu);
+	l.HighPart = (LONG)(uint32_t)(luid >> 32);
+	IDXGIAdapter3 *a = NULL;
+	bool ok = false;
+	if (SUCCEEDED(IDXGIFactory4_EnumAdapterByLuid(f, l, &IID_IDXGIAdapter3, (void **)&a))) {
+		DXGI_QUERY_VIDEO_MEMORY_INFO local, nonlocal;
+		if (SUCCEEDED(IDXGIAdapter3_QueryVideoMemoryInfo(a, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
+		    SUCCEEDED(
+		        IDXGIAdapter3_QueryVideoMemoryInfo(a, 0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal))) {
+			out->local_usage_mb = local.CurrentUsage >> 20;
+			out->local_budget_mb = local.Budget >> 20;
+			out->nonlocal_usage_mb = nonlocal.CurrentUsage >> 20;
+			out->nonlocal_budget_mb = nonlocal.Budget >> 20;
+			ok = true;
+		}
+		IDXGIAdapter3_Release(a);
+	}
+	IDXGIFactory4_Release(f);
+	return ok;
+#else
+	(void)luid;
+	return false;
+#endif
+}
+
 enum oc_run_status
 oc_session_create(struct oc_ort *ort,
                   const char *path,
@@ -384,6 +429,27 @@ oc_session_create(struct oc_ort *ort,
 	TRY(api->SetInterOpNumThreads(opts, 1));
 	if (threads > 0) {
 		TRY(api->SetIntraOpNumThreads(opts, threads));
+	}
+	if (epc->diag_placement) {
+		// The placement report is logged at VERBOSE by the session's own logger; ort_log
+		// parses it and prints only what ORT_LOG asks for.
+		s->place = (struct oc_place_report *)calloc(1, sizeof(*s->place));
+		if (s->place != NULL) {
+			TRY(api->SetSessionLogSeverityLevel(opts, ORT_LOGGING_LEVEL_VERBOSE));
+		}
+	}
+	if (epc->profile_prefix != NULL && epc->profile_prefix[0] != '\0') {
+#ifdef _WIN32
+		wchar_t wprefix[1024];
+		if (MultiByteToWideChar(CP_UTF8, 0, epc->profile_prefix, -1, wprefix, 1024) == 0) {
+			snprintf(err, err_size, "bad profile path");
+			goto fail;
+		}
+		TRY(api->EnableProfiling(opts, wprefix));
+#else
+		TRY(api->EnableProfiling(opts, epc->profile_prefix));
+#endif
+		s->profiling = true;
 	}
 	if (ep == OC_EP_DML) {
 #ifdef _WIN32
@@ -430,18 +496,24 @@ oc_session_create(struct oc_ort *ort,
 #endif
 	}
 	TRY(api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &s->cpu_mem));
+	ort->capture = s->place;
 #ifdef _WIN32
 	{
 		wchar_t wpath[1024];
 		if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1024) == 0) {
+			ort->capture = NULL;
 			snprintf(err, err_size, "bad model path");
 			goto fail;
 		}
-		TRY(api->CreateSession(ort->env, wpath, opts, &s->session));
+		OrtStatus *cst = api->CreateSession(ort->env, wpath, opts, &s->session);
+		ort->capture = NULL;
+		TRY(cst);
 	}
 #else
 	memset(&ort->report, 0, sizeof(ort->report));
-	TRY(api->CreateSession(ort->env, path, opts, &s->session));
+	OrtStatus *cst = api->CreateSession(ort->env, path, opts, &s->session);
+	ort->capture = NULL;
+	TRY(cst);
 	if (ep == OC_EP_COREML) {
 		s->report = ort->report;
 	}
@@ -474,7 +546,33 @@ oc_session_destroy(struct oc_session *s)
 	if (s->device_mem != NULL) {
 		api->ReleaseMemoryInfo(s->device_mem);
 	}
+	free(s->place);
 	free(s);
+}
+
+const struct oc_place_report *
+oc_session_placement(const struct oc_session *s)
+{
+	return s != NULL ? s->place : NULL;
+}
+
+bool
+oc_session_end_profiling(struct oc_session *s, char *path, size_t path_size)
+{
+	if (s == NULL || !s->profiling || s->session == NULL) {
+		return false;
+	}
+	const OrtApi *api = s->ort->api;
+	s->profiling = false;
+	OrtAllocator *alloc = NULL;
+	char *name = NULL;
+	if (!status_ok(api, api->GetAllocatorWithDefaultOptions(&alloc), NULL, 0) ||
+	    !status_ok(api, api->SessionEndProfiling(s->session, alloc, &name), NULL, 0) || name == NULL) {
+		return false;
+	}
+	oc_copy_str(path, path_size, name);
+	(void)status_ok(api, api->AllocatorFree(alloc, name), NULL, 0);
+	return true;
 }
 
 bool

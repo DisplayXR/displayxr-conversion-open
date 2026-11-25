@@ -20,7 +20,9 @@ the setting MODEL to choose between: "tiny-full" (defaults.high) is the same
 graph with its weights in ONE external-data file that the graph names by the
 data's sha256 (the layout export_sharp.py gives the full SHARP model, two files
 side by side in the store), and "tiny-int4" (defaults.low) is the single-file
-model. Both compute the same thing, so expect.json holds for either.
+model. Both compute the same thing, so expect.json holds for either. A third,
+"tiny-fp16" (defaults.medium), has a DirectML variant only, like the SHARP pack's
+fp16 model: no CPU test may ever pick it.
 
 Nothing here is a real model: it exists so CI exercises the splat lane
 (preprocess, inference on ONNX Runtime and on OpenVINO's CPU device,
@@ -228,7 +230,15 @@ def main():
     full["variants"][0]["files"] = [{"role": "model", "format": "onnx", "sha256": gsha, "size": gsize},
                                     {"role": "data", "format": "bin", "sha256": dsha, "size": dsize}]
     pick["models"].append(full)
-    pick["defaults"] = {"splats-mono": {"low": "tiny-int4", "medium": "tiny-int4", "high": "tiny-full"}}
+    # A third model with a DirectML variant only, as defaults.medium: the shape of the SHARP
+    # pack's fp16 model. Off DirectML the provider never picks it (MODEL=fp16 means full there).
+    fp16 = copy.deepcopy(small)
+    fp16["name"] = "tiny-fp16"
+    fp16["variants"][0]["id"] = "fp16"
+    fp16["variants"][0]["ep"] = ["dml"]
+    fp16["variants"][0]["precision"] = "fp16"
+    pick["models"].append(fp16)
+    pick["defaults"] = {"splats-mono": {"low": "tiny-int4", "medium": "tiny-fp16", "high": "tiny-full"}}
     with open(os.path.join(out, "tiny-pick.models.json"), "w", encoding="utf-8") as f:
         json.dump(pick, f, indent=2)
     print(f"tiny splat model {sha} ({len(data)} bytes) in {out}; external-data variant {gsha} + {dsha}")

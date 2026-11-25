@@ -90,6 +90,7 @@ add_library(${OPENCONV_PROVIDER} MODULE
 	src/oc_ov.c
 	src/oc_pack.c
 	src/oc_platform.c
+	src/oc_profile.c
 	src/oc_rank.c
 	src/oc_splat.c)
 target_include_directories(${OPENCONV_PROVIDER} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -175,6 +176,12 @@ if(OPENCONV_BUILD_TESTS)
 	openconv_warnings(openconv-rank-test)
 	add_test(NAME splats-rank COMMAND openconv-rank-test)
 
+	# The DIAG_PROFILE parsers (ONNX Runtime's placement report and profiling JSON).
+	add_executable(openconv-profile-test tests/profile_test.c src/oc_profile.c)
+	target_include_directories(openconv-profile-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+	openconv_warnings(openconv-profile-test)
+	add_test(NAME diag-profile-parse COMMAND openconv-profile-test)
+
 	# The vendored IPC wire header stays compilable against the vendored ABI header.
 	add_library(openconv-header-check OBJECT tests/header_check.c)
 	target_include_directories(openconv-header-check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -238,6 +245,13 @@ if(OPENCONV_BUILD_TESTS)
 			--blob-base file://${_tiny} --store ${_stores}/splats-cpu --clean-store --caps splats
 			--set EP=cpu --allow-research --splat-check ${_tiny}/expect.json)
 		set_tests_properties(splats-cpu PROPERTIES FIXTURES_REQUIRED tiny_splat SKIP_RETURN_CODE 77)
+		# DIAG_PROFILE: the node placement report, two runs and the profile summary (CPU EP).
+		add_test(NAME splats-diag-profile COMMAND ${_host} ${_bin} --pack ${_tiny}/tiny.models.json
+			--blob-base file://${_tiny} --store ${_stores}/splats-diag --clean-store --caps splats
+			--set EP=cpu --set DIAG_PROFILE=1 --allow-research --splat-check ${_tiny}/expect.json
+			--scratch ${_stores}/splats-diag-scratch)
+		set_tests_properties(splats-diag-profile PROPERTIES FIXTURES_REQUIRED tiny_splat SKIP_RETURN_CODE 77
+			PASS_REGULAR_EXPRESSION "diag: .* node placement .*CPUExecutionProvider: [0-9]+ nodes.*diag: .* first run [0-9]+ ms.*diag: .* profile .*splats-profile.*: 2 run\\(s\\).* top: ")
 		if(OPENCONV_OPENVINO)
 			add_test(NAME splats-openvino-cpu COMMAND ${_host} ${_bin} --pack ${_tiny}/tiny.models.json
 				--blob-base file://${_tiny} --store ${_stores}/splats-ov --clean-store --caps splats
@@ -266,6 +280,10 @@ if(OPENCONV_BUILD_TESTS)
 		add_test(NAME splats-pick-slow-verify COMMAND ${_host} ${_bin} --pack ${_pick} ${_pick_common}
 			--store ${_stores}/splats-pick-b --no-download --set MODEL=full --expect-model tiny-full
 			--verify-ms 7000 --expect-verify --splat-check ${_tiny}/expect.json)
+		# ... MODEL=fp16 off DirectML means the full model (the fp16 one has a DirectML variant only) ...
+		add_test(NAME splats-pick-fp16-off-dml COMMAND ${_host} ${_bin} --pack ${_pick} ${_pick_common}
+			--store ${_stores}/splats-pick-b --no-download --set MODEL=fp16 --expect-model tiny-full
+			--splat-check ${_tiny}/expect.json)
 		# ... and a forced MODEL whose blob is absent fails instead of switching.
 		add_test(NAME splats-pick-forced-absent COMMAND ${_host} ${_bin} --pack ${_pick} ${_pick_common}
 			--store ${_stores}/splats-pick-b --no-download --set MODEL=int4 --expect-model tiny-int4
@@ -273,7 +291,8 @@ if(OPENCONV_BUILD_TESTS)
 		set_tests_properties(splats-pick-auto-cpu PROPERTIES FIXTURES_REQUIRED tiny_splat SKIP_RETURN_CODE 77)
 		set_tests_properties(splats-pick-full-external-data PROPERTIES FIXTURES_REQUIRED tiny_splat
 			FIXTURES_SETUP pick_full_store SKIP_RETURN_CODE 77)
-		set_tests_properties(splats-pick-fallback splats-pick-slow-verify splats-pick-forced-absent PROPERTIES
+		set_tests_properties(splats-pick-fallback splats-pick-slow-verify splats-pick-fp16-off-dml
+			splats-pick-forced-absent PROPERTIES
 			FIXTURES_REQUIRED "tiny_splat;pick_full_store" SKIP_RETURN_CODE 77)
 		if(OPENCONV_OPENVINO)
 			add_test(NAME splats-pick-full-openvino-cpu COMMAND ${_host} ${_bin} --pack ${_pick}

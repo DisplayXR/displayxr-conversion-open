@@ -15,9 +15,12 @@
  *                       packs name for "splats-mono" (none in the default
  *                       pack: a splat model is a separate, user-installed pack).
  *                       Setting MODEL picks between the pack's full model
- *                       (defaults.high) and its small one (defaults.low):
- *                       auto = full on a GPU backend with >= 16 GB of RAM
- *                       (DirectML: >= 6 GB VRAM), among the models in the store.
+ *                       (defaults.high), its small one (defaults.low) and,
+ *                       on DirectML, its fp16 one (defaults.medium, when it
+ *                       has a DirectML variant): auto = full on a GPU backend
+ *                       with >= 16 GB of RAM; on DirectML fp16 when it is in
+ *                       the store (>= 6 GB VRAM), else full with >= 10 GB VRAM;
+ *                       among the models in the store (oc_rank.h).
  *
  * The splat capability runs where oc_rank.h ranks it: ONNX Runtime + DirectML
  * on a discrete non-Intel GPU, else OpenVINO (oc_ov.h) on an Intel Arc / Xe GPU,
@@ -86,6 +89,8 @@
 #define OC_ASSUMED_FOCAL_MM 30.0      //!< no focal given: a 30 mm full-frame equivalent, labelled ASSUMED
 #define OC_SPLAT_FULL 0u              //!< splat_cand index: defaults["splats-mono"].high
 #define OC_SPLAT_SMALL 1u             //!< splat_cand index: defaults["splats-mono"].low
+#define OC_SPLAT_FP16 2u              //!< splat_cand index: .medium, when it is a third model with a DirectML variant
+#define OC_SPLAT_CANDS 3u
 
 #define OC_MAX_STREAMS_VIDEO 2u //!< each holds a temporal cache of ~160 MB (518 px model)
 #define OC_MAX_STREAMS_MONO 4u
@@ -188,7 +193,7 @@ struct oc_provider
 	char quality[16];
 	char ep_setting[16];
 	char ov_device_setting[8];   //!< "auto", "gpu", "cpu"
-	char splat_model_setting[8]; //!< MODEL: "auto", "full", "int4"
+	char splat_model_setting[8]; //!< MODEL: "auto", "full", "fp16", "int4"
 	uint64_t ram_mb;             //!< physical memory (oc_system_ram_mb), 0 = unknown
 	char ov_dir[1100];           //!< the OpenVINO runtime folder
 	char scratch[1100];          //!< the host's per-provider scratch dir; "" = none
@@ -198,6 +203,7 @@ struct oc_provider
 	enum oc_coreml_units coreml_units;
 	char coreml_cache[1100]; //!< under the host's scratch dir; empty = no compiled-model cache
 	bool ov_cache;           //!< keep OpenVINO's compiled models under the scratch dir
+	bool diag_profile;       //!< DIAG_PROFILE: node placement + a profiled second run per splat job
 
 	/* Dependencies. */
 	struct oc_pack *packs[OC_MAX_PACKS]; //!< the default pack first, then the others by name
@@ -225,11 +231,11 @@ struct oc_provider
 	struct oc_dxgi_adapter adapters[OC_RANK_MAX_ADAPTERS];
 	uint32_t adapter_count;
 
-	/* SPLATS_MONO's two candidate models and which of their variants' blobs are in
+	/* SPLATS_MONO's candidate models and which of their variants' blobs are in
 	 * the store (refresh_splat_presence, outside `lock`; read under it). */
-	const struct oc_pack *splat_pack[2];
-	const struct oc_pack_model *splat_cand[2]; //!< [OC_SPLAT_FULL], [OC_SPLAT_SMALL]
-	bool splat_on_disk[2][OC_PACK_MAX_VARIANTS];
+	const struct oc_pack *splat_pack[OC_SPLAT_CANDS];
+	const struct oc_pack_model *splat_cand[OC_SPLAT_CANDS]; //!< [OC_SPLAT_FULL], [_SMALL], [_FP16] (may be NULL)
+	bool splat_on_disk[OC_SPLAT_CANDS][OC_PACK_MAX_VARIANTS];
 
 	/* [S]-only scratch, grown on demand. */
 	float *chw;
@@ -536,14 +542,31 @@ splat_present_locked(const struct oc_provider *p, uint32_t k, enum oc_ep ep)
 	return v != NULL && p->splat_on_disk[k][v - m->variants];
 }
 
+//! The candidate index of @p m (OC_SPLAT_*).
+static uint32_t
+splat_index(enum oc_splat_model m)
+{
+	return m == OC_SM_FULL ? OC_SPLAT_FULL : m == OC_SM_FP16 ? OC_SPLAT_FP16 : OC_SPLAT_SMALL;
+}
+
+/*! Is the fp16 candidate's DirectML blob in the store (last refresh)? Caller holds `lock`. */
+static bool
+splat_fp16_ready_locked(const struct oc_provider *p)
+{
+	return p->splat_cand[OC_SPLAT_FP16] != NULL && splat_present_locked(p, OC_SPLAT_FP16, OC_EP_DML);
+}
+
 /*!
  * SPLATS_MONO's model (setting MODEL): "full" = the model defaults["splats-mono"].high
- * names, "int4" = the one .low names. auto = full when the cap's backend is a GPU
- * (OpenVINO's GPU device, DirectML, Core ML) and the machine has >= 16 GB of RAM (and,
- * on DirectML, the adapter >= 6 GB of VRAM), else int4 (oc_rank_auto_full); and only
- * among the models whose blob is in the store: the preferred one absent and the other
- * present = the other (said in pick_note and the INFO line). Neither present = the
- * preferred one, which then reports what it needs (a local build, a download) the usual way. A forced MODEL never switches. Caller holds `lock` or is in probe.
+ * names, "int4" = the one .low names, "fp16" = the one .medium names when it is a third
+ * model with a DirectML variant (DirectML only; elsewhere fp16 means full). auto =
+ * oc_rank_auto_model: on DirectML the fp16 model when its blob is in the store and the
+ * adapter has >= 6 GB, else full with >= 10 GB; on another GPU backend (OpenVINO's GPU
+ * device, Core ML) full; both with >= 16 GB of RAM; else int4. Only among the models whose
+ * blob is in the store: the preferred one absent = the next present one (fp16 only on
+ * DirectML; said in pick_note and the INFO line). None present = the preferred one, which
+ * then reports what it needs (a local build, a download) the usual way. A forced MODEL never
+ * switches. Caller holds `lock` or is in probe.
  */
 static const struct oc_pack_model *
 pick_splat_model_locked(struct oc_provider *p, struct oc_cap *c, enum oc_ep ep, const struct oc_pack **out_pack)
@@ -552,33 +575,54 @@ pick_splat_model_locked(struct oc_provider *p, struct oc_cap *c, enum oc_ep ep, 
 	c->pick_forced = false;
 	const struct oc_pack_model *full = p->splat_cand[OC_SPLAT_FULL];
 	const struct oc_pack_model *small = p->splat_cand[OC_SPLAT_SMALL];
-	if (full == NULL || small == NULL || full == small) {
+	const bool fp16_here = ep == OC_EP_DML && p->splat_cand[OC_SPLAT_FP16] != NULL;
+	if ((full == NULL || small == NULL || full == small) && !fp16_here) {
 		// One model (or none) for the task: nothing to choose.
 		const uint32_t k = full != NULL ? OC_SPLAT_FULL : OC_SPLAT_SMALL;
 		*out_pack = p->splat_pack[k];
 		return p->splat_cand[k];
 	}
-	uint32_t want;
+	enum oc_splat_model want;
 	if (strcmp(p->splat_model_setting, "full") == 0) {
-		want = OC_SPLAT_FULL;
+		want = OC_SM_FULL;
 		c->pick_forced = true;
 	} else if (strcmp(p->splat_model_setting, "int4") == 0) {
-		want = OC_SPLAT_SMALL;
+		want = OC_SM_INT4;
+		c->pick_forced = true;
+	} else if (strcmp(p->splat_model_setting, "fp16") == 0) {
+		want = fp16_here ? OC_SM_FP16 : OC_SM_FULL;
 		c->pick_forced = true;
 	} else {
 		// The backend the full model would really run on: a model without a variant for
 		// the accelerator runs on the CPU (bind_cap_locked), and that is not a GPU.
-		const enum oc_ep full_ep = oc_pack_variant_for_ep(full, ep_pack_name(ep)) != NULL ? ep : OC_EP_CPU;
-		want = oc_rank_auto_full(backend_is_gpu(p, c, full_ep), p->ram_mb, full_ep == OC_EP_DML, c->dml_vram_mb)
-		           ? OC_SPLAT_FULL
-		           : OC_SPLAT_SMALL;
+		const enum oc_ep full_ep =
+		    full != NULL && oc_pack_variant_for_ep(full, ep_pack_name(ep)) != NULL ? ep : OC_EP_CPU;
+		const bool dml = ep == OC_EP_DML;
+		want = oc_rank_auto_model(dml || backend_is_gpu(p, c, full_ep), p->ram_mb, dml, c->dml_vram_mb,
+		                          fp16_here && splat_fp16_ready_locked(p));
+		if (want == OC_SM_FULL && dml && full_ep != OC_EP_DML) {
+			want = OC_SM_INT4; // no DirectML variant of the full model: it would run on the CPU
+		}
 	}
-	uint32_t k = want;
-	const uint32_t other = want == OC_SPLAT_FULL ? OC_SPLAT_SMALL : OC_SPLAT_FULL;
-	if (!c->pick_forced && !splat_present_locked(p, want, ep) && splat_present_locked(p, other, ep)) {
-		k = other;
-		snprintf(c->pick_note, sizeof(c->pick_note), "%.30s is not in the store; using %.30s",
-		         p->splat_cand[want]->name, p->splat_cand[other]->name);
+	uint32_t k = splat_index(want);
+	if (p->splat_cand[k] == NULL) {
+		k = full != NULL ? OC_SPLAT_FULL : OC_SPLAT_SMALL;
+	}
+	if (!c->pick_forced && !splat_present_locked(p, k, ep)) {
+		// The next present model, in preference order (fp16 only on DirectML).
+		static const uint32_t order[3] = {OC_SPLAT_FP16, OC_SPLAT_FULL, OC_SPLAT_SMALL};
+		for (uint32_t i = 0; i < 3; i++) {
+			const uint32_t o = order[i];
+			if (o == k || p->splat_cand[o] == NULL || (o == OC_SPLAT_FP16 && !fp16_here) ||
+			    !splat_present_locked(p, o, ep)) {
+				continue;
+			}
+			snprintf(c->pick_note, sizeof(c->pick_note), "%.30s is not in the store; using %.30s",
+			         p->splat_cand[k] != NULL ? p->splat_cand[k]->name : "the preferred model",
+			         p->splat_cand[o]->name);
+			k = o;
+			break;
+		}
 	}
 	*out_pack = p->splat_pack[k];
 	return p->splat_cand[k];
@@ -589,9 +633,9 @@ pick_splat_model_locked(struct oc_provider *p, struct oc_cap *c, enum oc_ep ep, 
 static void
 refresh_splat_presence(struct oc_provider *p)
 {
-	bool on_disk[2][OC_PACK_MAX_VARIANTS];
+	bool on_disk[OC_SPLAT_CANDS][OC_PACK_MAX_VARIANTS];
 	memset(on_disk, 0, sizeof(on_disk));
-	for (uint32_t k = 0; k < 2; k++) {
+	for (uint32_t k = 0; k < OC_SPLAT_CANDS; k++) {
 		const struct oc_pack_model *m = p->splat_cand[k];
 		for (uint32_t i = 0; m != NULL && i < m->variant_count; i++) {
 			char ref[192];
@@ -826,6 +870,7 @@ rank_splat_locked(struct oc_provider *p, struct oc_cap *c)
 {
 	const bool no_dml = c->dml_failed;
 	const struct oc_pack_model *full = p->splat_cand[OC_SPLAT_FULL];
+	const struct oc_pack_model *fp16 = p->splat_cand[OC_SPLAT_FP16];
 	const struct oc_splat_env env = {
 	    .ep = no_dml ? "auto" : p->ep_setting,
 	    .ov_device = p->ov_device_setting,
@@ -836,6 +881,8 @@ rank_splat_locked(struct oc_provider *p, struct oc_cap *c)
 	    .adapters = p->adapters,
 	    .adapter_count = p->adapter_count,
 	    .full_on_dml = full != NULL && oc_pack_variant_for_ep(full, "dml") != NULL,
+	    .fp16_on_dml = fp16 != NULL,
+	    .fp16_ready = splat_fp16_ready_locked(p),
 	    .ov_present = p->ov_present,
 	    .ov_known = p->ov_devices_known || c->ov_gpu_failed,
 	    .ov_gpus = p->ov_gpus,
@@ -848,7 +895,7 @@ rank_splat_locked(struct oc_provider *p, struct oc_cap *c)
 	}
 	fprintf(stderr, "[open-conversion] splats-mono: %s%s -> %s; model %s (MODEL=%s, %llu MB RAM)\n",
 	        no_dml ? "DirectML failed, re-ranked: " : "", ch.why, oc_rank_backend_name(ch.backend),
-	        ch.full ? "full" : "int4", p->splat_model_setting, (unsigned long long)p->ram_mb);
+	        oc_rank_model_name(ch.model), p->splat_model_setting, (unsigned long long)p->ram_mb);
 	c->ov_provisional = ch.provisional;
 	c->dml_device = -1;
 	c->dml_luid = 0;
@@ -1029,7 +1076,8 @@ oc_probe(struct xrt_conversion_plugin_instance **out_inst)
 		oc_copy_str(p->ov_device_setting, sizeof(p->ov_device_setting), buf);
 	}
 	oc_copy_str(p->splat_model_setting, sizeof(p->splat_model_setting), "auto");
-	if (setting("MODEL", buf, sizeof(buf)) && (strcmp(buf, "full") == 0 || strcmp(buf, "int4") == 0)) {
+	if (setting("MODEL", buf, sizeof(buf)) &&
+	    (strcmp(buf, "full") == 0 || strcmp(buf, "int4") == 0 || strcmp(buf, "fp16") == 0)) {
 		oc_copy_str(p->splat_model_setting, sizeof(p->splat_model_setting), buf);
 	}
 	p->ram_mb = oc_system_ram_mb();
@@ -1064,6 +1112,7 @@ oc_probe(struct xrt_conversion_plugin_instance **out_inst)
 		             : strcmp(buf, "info") == 0  ? OC_ORT_LOG_INFO
 		                                         : OC_ORT_LOG_WARNING;
 	}
+	p->diag_profile = setting("DIAG_PROFILE", buf, sizeof(buf)) && strtoul(buf, NULL, 10) != 0;
 	p->threads = 4; // a background service: never take every core
 	if (setting("THREADS", buf, sizeof(buf))) {
 		p->threads = (int)strtol(buf, NULL, 10);
@@ -1106,6 +1155,15 @@ oc_probe(struct xrt_conversion_plugin_instance **out_inst)
 	}
 	p->splat_cand[OC_SPLAT_FULL] = tier_model(p, "splats-mono", "high", &p->splat_pack[OC_SPLAT_FULL]);
 	p->splat_cand[OC_SPLAT_SMALL] = tier_model(p, "splats-mono", "low", &p->splat_pack[OC_SPLAT_SMALL]);
+	// The fp16 model: .medium, when it is a third model and DirectML runs it (it has no other variant).
+	p->splat_cand[OC_SPLAT_FP16] = tier_model(p, "splats-mono", "medium", &p->splat_pack[OC_SPLAT_FP16]);
+	if (p->splat_cand[OC_SPLAT_FP16] == p->splat_cand[OC_SPLAT_FULL] ||
+	    p->splat_cand[OC_SPLAT_FP16] == p->splat_cand[OC_SPLAT_SMALL] ||
+	    (p->splat_cand[OC_SPLAT_FP16] != NULL &&
+	     oc_pack_variant_for_ep(p->splat_cand[OC_SPLAT_FP16], "dml") == NULL)) {
+		p->splat_cand[OC_SPLAT_FP16] = NULL;
+		p->splat_pack[OC_SPLAT_FP16] = NULL;
+	}
 	refresh_splat_presence(p);
 
 	struct oc_cap *v = &p->caps[0];
@@ -1566,15 +1624,33 @@ create_session(
 		char dir[1300];
 		const char *cache = ov_cache_dir(p, dir, sizeof(dir));
 		const bool cpu = strcmp(c->ov_device, "CPU") == 0;
+		if (p->diag_profile && is_splats(c)) {
+			fprintf(stderr,
+			        "[open-conversion] diag: DIAG_PROFILE profiles ONNX Runtime sessions; OpenVINO "
+			        "runs are timed only\n");
+		}
 		return oc_ov_session_create(p->ov, path, cpu ? "CPU" : p->ov_gpu_device, cache, cpu ? p->threads : 0,
 		                            &c->ov_session, err, err_size)
 		           ? OC_RUN_OK
 		           : OC_RUN_FAILED;
 	}
+	char profile_prefix[1200];
+	const bool diag = p->diag_profile && is_splats(c);
+	if (diag && p->scratch[0] != '\0' && (oc_make_dir(p->scratch) || oc_file_exists(p->scratch))) {
+		snprintf(profile_prefix, sizeof(profile_prefix), "%s%csplats-profile", p->scratch, OC_PATH_SEP);
+	} else {
+		profile_prefix[0] = '\0';
+		if (diag) {
+			fprintf(stderr,
+			        "[open-conversion] diag: no scratch directory from the host; no profile file\n");
+		}
+	}
 	struct oc_ep_config epc = {
 	    .dml_device = is_splats(c) && c->ep == OC_EP_DML ? c->dml_device : p->dml_device,
 	    .coreml_units = p->coreml_units,
 	    .coreml_cache_dir = NULL,
+	    .diag_placement = diag,
+	    .profile_prefix = profile_prefix[0] != '\0' ? profile_prefix : NULL,
 	};
 	char base[1200];
 	const char *b = c->ep == OC_EP_COREML ? coreml_cache_dir(p, base, sizeof(base)) : NULL;
@@ -1636,6 +1712,83 @@ finish_cache(struct coreml_cache_txn *txn, bool ok)
 		(void)oc_remove_tree(txn->final_dir); // the next warm compiles afresh
 	}
 	txn->fresh = txn->used_hit = false;
+}
+
+/*! One line: this process's memory on the splat capability's DirectML adapter. */
+static bool
+splat_gpu_mem(const struct oc_cap *c, struct oc_gpu_mem *m, char *buf, size_t size)
+{
+	if (c->ep != OC_EP_DML || !oc_gpu_memory(c->dml_luid, m)) {
+		buf[0] = '\0';
+		return false;
+	}
+	snprintf(buf, size, "%llu MB dedicated (budget %llu MB), %llu MB shared", (unsigned long long)m->local_usage_mb,
+	         (unsigned long long)m->local_budget_mb, (unsigned long long)m->nonlocal_usage_mb);
+	return true;
+}
+
+/*! After a splat session loaded: its GPU memory and, with DIAG_PROFILE, where ONNX Runtime
+ *  placed the nodes. */
+static void
+splat_log_load(struct oc_provider *p, struct oc_cap *c, uint64_t load_ms)
+{
+	struct oc_gpu_mem mem;
+	char line[160];
+	if (splat_gpu_mem(c, &mem, line, sizeof(line))) {
+		fprintf(stderr, "[open-conversion] %s: loaded on DirectML in %llu ms; GPU memory: %s\n", c->model->name,
+		        (unsigned long long)load_ms, line);
+	}
+	const struct oc_place_report *pl = oc_session_placement(c->session);
+	if (!p->diag_profile || pl == NULL) {
+		return;
+	}
+	char place[1024];
+	oc_place_format(pl, 8, place, sizeof(place));
+	const uint32_t total = oc_place_total(pl, "");
+	const uint32_t cpu = oc_place_total(pl, "CPUExecutionProvider");
+	fprintf(stderr,
+	        "[open-conversion] diag: %s node placement (%s, after ONNX Runtime's graph optimisation): "
+	        "%u of %u nodes on the CPU EP; %s\n",
+	        c->model->name, c->backend, cpu, total, place);
+}
+
+/*! DIAG_PROFILE, after a splat job's second run: stop profiling, summarise the file. */
+static void
+splat_log_profile(struct oc_provider *p, struct oc_cap *c)
+{
+	char path[1300];
+	if (!oc_session_end_profiling(c->session, path, sizeof(path))) {
+		return; // profiled the first job only (or never: no scratch directory)
+	}
+	FILE *f = fopen(path, "rb");
+	char *text = NULL;
+	size_t len = 0;
+	if (f != NULL) {
+		if (fseek(f, 0, SEEK_END) == 0) {
+			const long n = ftell(f);
+			if (n > 0 && n < (64l << 20) && fseek(f, 0, SEEK_SET) == 0) {
+				text = (char *)malloc((size_t)n);
+				len = text != NULL ? fread(text, 1, (size_t)n, f) : 0;
+			}
+		}
+		fclose(f);
+	}
+	struct oc_profile_summary *sum = (struct oc_profile_summary *)calloc(1, sizeof(*sum));
+	char line[1400];
+	if (sum != NULL && oc_profile_summarize(text, len, sum)) {
+		oc_profile_format(sum, 10, line, sizeof(line));
+	} else {
+		snprintf(line, sizeof(line), "could not read it");
+	}
+	fprintf(stderr, "[open-conversion] diag: %s profile %s: %s\n", c->model->name, path, line);
+	if (c->ep == OC_EP_DML) {
+		fprintf(stderr,
+		        "[open-conversion] diag: on DirectML a kernel's time is its CPU-side recording unless the "
+		        "queue is full; the GPU's own time lands in the node that waits for it (MemcpyToHost)\n");
+	}
+	free(sum);
+	free(text);
+	(void)p;
 }
 
 static xrt_result_t
@@ -1853,6 +2006,9 @@ resolve:
 	if (r == OC_RUN_OK && c->ep == OC_EP_OPENVINO) {
 		fprintf(stderr, "[open-conversion] %s: OpenVINO %s compiled in %llu ms\n", m->name, c->ov_device,
 		        (unsigned long long)load_ms);
+	}
+	if (r == OC_RUN_OK && is_splats(c) && c->session != NULL) {
+		splat_log_load(p, c, load_ms);
 	}
 	if (r != OC_RUN_OK) {
 		release_session(p, c); // before the cache dir it may have mapped is removed
@@ -2388,7 +2544,7 @@ splat_job(struct oc_provider *p,
 		ctl->progress(ctl->ctx, 0.05f, "infer");
 	}
 	char err[XRT_CONV_DETAIL_MAX] = "";
-	const uint64_t t0 = oc_now_ms();
+	uint64_t t0 = oc_now_ms();
 	bool ran = false;
 	if (c->ov_session != NULL) {
 		const enum oc_ov_run r =
@@ -2398,7 +2554,34 @@ splat_job(struct oc_provider *p,
 		}
 		ran = r == OC_OV_RUN_OK;
 	} else {
-		const enum oc_run_status r = oc_session_run_named(c->session, ins, 2, outs, 5, err, sizeof(err));
+		struct oc_gpu_mem mem0, mem1;
+		char before[160], after[160];
+		const bool have_mem = splat_gpu_mem(c, &mem0, before, sizeof(before));
+		enum oc_run_status r = oc_session_run_named(c->session, ins, 2, outs, 5, err, sizeof(err));
+		if (r == OC_RUN_OK && p->diag_profile) {
+			// A second run: the first pays DirectML's first-run allocation and compilation.
+			const uint64_t first_ms = oc_now_ms() - t0;
+			fprintf(stderr, "[open-conversion] diag: %s first run %llu ms (%s); running it again\n",
+			        m->name, (unsigned long long)first_ms, c->backend);
+			t0 = oc_now_ms();
+			r = oc_session_run_named(c->session, ins, 2, outs, 5, err, sizeof(err));
+			if (r == OC_RUN_OK) {
+				splat_log_profile(p, c);
+			}
+		}
+		if (have_mem && r == OC_RUN_OK && splat_gpu_mem(c, &mem1, after, sizeof(after))) {
+			fprintf(stderr, "[open-conversion] %s: GPU memory before the run: %s; after: %s\n", m->name,
+			        before, after);
+			if (mem1.local_usage_mb > mem1.local_budget_mb ||
+			    mem1.nonlocal_usage_mb > mem0.nonlocal_usage_mb + 256u) {
+				fprintf(stderr,
+				        "[open-conversion] %s: over the GPU memory budget: Windows keeps part of the "
+				        "model in "
+				        "system memory, which can make a run many times slower%s\n",
+				        m->name,
+				        c->model == p->splat_cand[OC_SPLAT_FP16] ? "" : " (the fp16 model needs half)");
+			}
+		}
 		if (r == OC_RUN_OUT_OF_MEMORY && c->ep == OC_EP_CPU) {
 			fprintf(stderr, "[open-conversion] %s: inference failed: %s\n", m->name, err);
 			return XRT_ERROR_ALLOCATION;
@@ -2625,15 +2808,18 @@ static const struct xrt_component_setting_desc g_settings[] = {
      "NVIDIA / AMD / UHD one, else CPU; gpu = any GPU device); does not select OpenVINO over DirectML"},
     {"OV_CACHE", XRT_COMPONENT_SETTING_TYPE_BOOL, "1", "0 = no OpenVINO compiled-model cache in the scratch dir"},
     {"MODEL", XRT_COMPONENT_SETTING_TYPE_ENUM, "auto",
-     "auto | full | int4: the splat model (full = defaults[splats-mono].high, int4 = .low; auto = full on a GPU "
-     "backend with >= 16 GB RAM (DirectML: and >= 6 GB VRAM), else int4, among the models in the store; "
-     "DirectML runs the full model only)"},
+     "auto | full | fp16 | int4: the splat model (full = defaults[splats-mono].high, int4 = .low, fp16 = .medium "
+     "on DirectML only; auto = full on a GPU backend with >= 16 GB RAM, on DirectML fp16 when built (>= 6 GB "
+     "VRAM) else full with >= 10 GB VRAM, else int4, among the models in the store; DirectML never runs int4)"},
     {"OPENVINO", XRT_COMPONENT_SETTING_TYPE_STRING, "", "absolute path of another OpenVINO runtime folder"},
     {"COREML_UNITS", XRT_COMPONENT_SETTING_TYPE_ENUM, "gpu", "gpu | all | ane | cpu: macOS Core ML compute units"},
     {"COREML_CACHE", XRT_COMPONENT_SETTING_TYPE_BOOL, "1", "0 = no Core ML compiled-model cache"},
     {"ORT_LOG", XRT_COMPONENT_SETTING_TYPE_ENUM, "warning", "warning | info | verbose"},
     {"THREADS", XRT_COMPONENT_SETTING_TYPE_INT, "4", "CPU inference threads; 0 = every core"},
     {"GRAPH_OPT", XRT_COMPONENT_SETTING_TYPE_ENUM, "extended", "basic | extended | all (ONNX Runtime)"},
+    {"DIAG_PROFILE", XRT_COMPONENT_SETTING_TYPE_BOOL, "0",
+     "1 = splat diagnostics: log ONNX Runtime's node placement, run each job's model twice and log both "
+     "times, GPU memory and the second run's top-10 operators (profile JSON in the scratch dir)"},
     {"PACK", XRT_COMPONENT_SETTING_TYPE_STRING, "",
      "absolute pack manifest paths, ';'-separated (default: every *.models.json next to the binary)"},
     {"ONNXRUNTIME", XRT_COMPONENT_SETTING_TYPE_STRING, "", "absolute path of another ONNX Runtime library"},
