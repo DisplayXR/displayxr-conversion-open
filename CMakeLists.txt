@@ -49,6 +49,7 @@ set(OPENCONV_PROVIDER DisplayXR-OpenConversion)
 set(OPENCONV_PACK "${CMAKE_CURRENT_SOURCE_DIR}/packs/dxr-open-default.models.json")
 
 include(cmake/OnnxRuntime.cmake)
+include(cmake/LibWebP.cmake)
 if(OPENCONV_OPENVINO)
 	include(cmake/OpenVINO.cmake)
 endif()
@@ -92,6 +93,7 @@ add_library(${OPENCONV_PROVIDER} MODULE
 	src/oc_platform.c
 	src/oc_profile.c
 	src/oc_rank.c
+	src/oc_sog.c
 	src/oc_splat.c)
 target_include_directories(${OPENCONV_PROVIDER} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(${OPENCONV_PROVIDER} SYSTEM PRIVATE ${OPENCONV_ORT_INCLUDE_DIR})
@@ -106,6 +108,7 @@ set_target_properties(${OPENCONV_PROVIDER} PROPERTIES PREFIX "" C_VISIBILITY_PRE
 if(APPLE)
 	set_target_properties(${OPENCONV_PROVIDER} PROPERTIES SUFFIX ".dylib")
 endif()
+target_link_libraries(${OPENCONV_PROVIDER} PRIVATE openconv_webp)
 if(WIN32)
 	target_link_libraries(${OPENCONV_PROVIDER} PRIVATE dxgi dxguid)
 else()
@@ -142,6 +145,8 @@ if(OPENCONV_OPENVINO)
 	list(APPEND OPENCONV_ORT_LICENSE_FILES ${OPENCONV_OV_LICENSE_FILES})
 	list(APPEND OPENCONV_ORT_LICENSE_NAMES ${OPENCONV_OV_LICENSE_NAMES})
 endif()
+list(APPEND OPENCONV_ORT_LICENSE_FILES ${OPENCONV_WEBP_LICENSE_FILE})
+list(APPEND OPENCONV_ORT_LICENSE_NAMES libwebp-COPYING.txt)
 list(LENGTH OPENCONV_ORT_LICENSE_FILES _n)
 math(EXPR _last "${_n} - 1")
 foreach(_i RANGE ${_last})
@@ -181,6 +186,18 @@ if(OPENCONV_BUILD_TESTS)
 	target_include_directories(openconv-profile-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 	openconv_warnings(openconv-profile-test)
 	add_test(NAME diag-profile-parse COMMAND openconv-profile-test)
+	# The SOG v2 writer and the nearest-clump focus, on synthetic clouds (no model).
+	add_executable(openconv-sog-test tests/sog_test.c src/oc_sog.c src/oc_splat.c src/oc_json.c)
+	target_include_directories(openconv-sog-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+	target_link_libraries(openconv-sog-test PRIVATE openconv_webp)
+	if(NOT WIN32)
+		target_link_libraries(openconv-sog-test PRIVATE m)
+	endif()
+	if(MSVC)
+		set_property(TARGET openconv-sog-test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+	endif()
+	openconv_warnings(openconv-sog-test)
+	add_test(NAME splats-sog COMMAND openconv-sog-test)
 
 	# The vendored IPC wire header stays compilable against the vendored ABI header.
 	add_library(openconv-header-check OBJECT tests/header_check.c)

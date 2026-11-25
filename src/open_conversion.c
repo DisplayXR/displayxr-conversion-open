@@ -57,6 +57,7 @@
 #include "oc_pack.h"
 #include "oc_platform.h"
 #include "oc_rank.h"
+#include "oc_sog.h"
 #include "oc_splat.h"
 
 #include <math.h>
@@ -196,6 +197,7 @@ struct oc_provider
 	char ep_setting[16];
 	char ov_device_setting[8];   //!< "auto", "gpu", "cpu"
 	char splat_model_setting[8]; //!< MODEL: "auto", "full", "fp16", "int4"
+	uint32_t splat_format;       //!< SPLAT_FORMAT: 0 = what the job asks for, else XRT_CONV_BLOB_* forced
 	uint64_t ram_mb;             //!< physical memory (oc_system_ram_mb), 0 = unknown
 	char ov_dir[1100];           //!< the OpenVINO runtime folder
 	char scratch[1100];          //!< the host's per-provider scratch dir; "" = none
@@ -246,6 +248,8 @@ struct oc_provider
 	size_t map_cap;
 	float *gauss; //!< the splat model's five outputs, back to back
 	size_t gauss_cap;
+	float *rows; //!< the unprojected 3DGS rows (OC_SPLAT_FLOATS each)
+	size_t rows_cap;
 };
 
 static const struct xrt_conversion_plugin_host_iface *g_host = NULL;
@@ -1086,6 +1090,12 @@ oc_probe(struct xrt_conversion_plugin_instance **out_inst)
 	    (strcmp(buf, "full") == 0 || strcmp(buf, "int4") == 0 || strcmp(buf, "fp16") == 0)) {
 		oc_copy_str(p->splat_model_setting, sizeof(p->splat_model_setting), buf);
 	}
+	p->splat_format = 0;
+	if (setting("SPLAT_FORMAT", buf, sizeof(buf))) {
+		p->splat_format = strcmp(buf, "sog") == 0   ? XRT_CONV_BLOB_SOG
+		                  : strcmp(buf, "ply") == 0 ? XRT_CONV_BLOB_PLY_3DGS
+		                                            : 0u;
+	}
 	p->ram_mb = oc_system_ram_mb();
 	// CPU + GPU by default: the measured configuration. "all" / "ane" let Core ML
 	// use the Neural Engine, whose first-use compile runs in a system service
@@ -1237,7 +1247,7 @@ fill_cap(struct oc_provider *p, const struct oc_cap *c, struct xrt_conv_capabili
 		C(depth_measure, 0u);
 		// GIVEN when the job carries a focal length, else a labelled 30 mm equivalent.
 		C(intrinsics_source, XRT_CONV_INTRINSICS_ASSUMED);
-		C(splat_formats, 1u << XRT_CONV_BLOB_PLY_3DGS);
+		C(splat_formats, (1u << XRT_CONV_BLOB_PLY_3DGS) | (1u << XRT_CONV_BLOB_SOG));
 		C(licence_class, c->licence_class);
 		C(commercial_ok, c->commercial_ok);
 		S(licence_spdx, m != NULL ? m->spdx : "");
@@ -2479,13 +2489,22 @@ splat_job(struct oc_provider *p,
 	}
 	const uint32_t requested =
 	    COVERS(in, struct xrt_conv_job_in, requested_blob_format) ? in->requested_blob_format : 0u;
-	if (requested != 0 && requested != XRT_CONV_BLOB_PLY_3DGS) {
+	if (requested != 0 && requested != XRT_CONV_BLOB_PLY_3DGS && requested != XRT_CONV_BLOB_SOG) {
 		// The requested OUTPUT format, not the photo, is the problem: say what to ask for.
 		// (No refusal code names an output format; UNSUPPORTED_INPUT is the job request's.)
 		return splat_refuse(out, XRT_CONV_REFUSAL_UNSUPPORTED_INPUT,
-		                    "output format not supported: this provider writes 3DGS PLY only; pass an output "
-		                    "path ending in .ply",
+		                    "output format not supported: this provider writes 3DGS PLY or SOG; pass an output "
+		                    "path ending in .ply or .sog",
 		                    XRT_ERROR_OUTPUT_UNSUPPORTED);
+	}
+	// SPLAT_FORMAT = sog / ply overrides the request (a test switch: the runtime's lift path asks for PLY).
+	const uint32_t blob_format = p->splat_format != 0 ? p->splat_format
+	                             : requested != 0     ? requested
+	                                                  : XRT_CONV_BLOB_PLY_3DGS;
+	if (p->splat_format != 0 && requested != 0 && requested != p->splat_format) {
+		fprintf(stderr, "[open-conversion] splats-mono: SPLAT_FORMAT=%s overrides the job's request for %s\n",
+		        p->splat_format == XRT_CONV_BLOB_SOG ? "sog" : "ply",
+		        requested == XRT_CONV_BLOB_SOG ? "SOG" : "PLY");
 	}
 	const struct xrt_conv_image *color = find_color(
 	    in->images, COVERS(in, struct xrt_conv_job_in, image_role) ? in->image_role : NULL, in->image_count);
@@ -2632,7 +2651,7 @@ splat_job(struct oc_provider *p,
 		return XRT_SUCCESS;
 	}
 
-	// 3. Postprocess straight into the sink.
+	// 3. Postprocess: unproject into 3DGS rows, measure the focus, then write the blob.
 	if (ctl->progress != NULL) {
 		ctl->progress(ctl->ctx, 0.8f, "write");
 	}
@@ -2645,14 +2664,55 @@ splat_job(struct oc_provider *p,
 	    .count = n,
 	    .colors_linear = strcmp(m->color_space, "srgb") != 0,
 	};
+	if (!grow(&p->rows, &p->rows_cap, n * OC_SPLAT_FLOATS)) {
+		return XRT_ERROR_ALLOCATION;
+	}
 	struct splat_sink ss = {sink, 0};
 	struct oc_splat_stats st;
 	const uint64_t t1 = oc_now_ms();
-	if (!sink->begin(sink->ctx, XRT_CONV_BLOB_PLY_3DGS, oc_splat_ply_size(n))) {
-		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
-	}
-	if (!oc_splat_write_ply(&raw, w, h, focal, splat_sink_write, &ss, cancelled, ctl->ctx, &st)) {
+	if (!oc_splat_encode(&raw, w, h, focal, p->rows, cancelled, ctl->ctx, &st)) {
 		return cancelled(ctl->ctx) ? XRT_SUCCESS : XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	if (blob_format == XRT_CONV_BLOB_SOG) {
+		const struct oc_sog_camera cam = {
+		    .fx = focal,
+		    .fy = focal,
+		    .cx = (float)w * 0.5f,
+		    .cy = (float)h * 0.5f,
+		    .width = w,
+		    .height = h,
+		    .focus = st.focus,
+		};
+		char generator[96];
+		snprintf(generator, sizeof(generator), "displayxr-conversion-open %s", OC_BUILD_COMMIT);
+		struct oc_sog_file sog;
+		char serr[128] = "";
+		if (!oc_sog_write(p->rows, n, &cam, generator, cancelled, ctl->ctx, &sog, serr, sizeof(serr))) {
+			if (cancelled(ctl->ctx)) {
+				return XRT_SUCCESS;
+			}
+			fprintf(stderr, "[open-conversion] %s: %s\n", m->name, serr);
+			return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+		}
+		bool wrote = sink->begin(sink->ctx, XRT_CONV_BLOB_SOG, (uint64_t)sog.size);
+		for (size_t at = 0; wrote && at < sog.size; at += (size_t)4u << 20) {
+			const size_t len = sog.size - at < ((size_t)4u << 20) ? sog.size - at : ((size_t)4u << 20);
+			wrote = splat_sink_write(&ss, sog.data + at, (uint64_t)len);
+		}
+		const size_t sog_size = sog.size;
+		oc_sog_free(&sog);
+		if (!wrote) {
+			return cancelled(ctl->ctx) ? XRT_SUCCESS : XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+		}
+		fprintf(stderr, "[open-conversion] %s: SOG v2, %zu bytes, camera block fx %.3f, focus %s\n", m->name,
+		        sog_size, (double)focal, st.focus.valid ? "nearest-clump" : "none (no clump)");
+	} else {
+		if (!sink->begin(sink->ctx, XRT_CONV_BLOB_PLY_3DGS, oc_splat_ply_size(n))) {
+			return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+		}
+		if (!oc_splat_write_ply_rows(p->rows, n, splat_sink_write, &ss, cancelled, ctl->ctx)) {
+			return cancelled(ctl->ctx) ? XRT_SUCCESS : XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+		}
 	}
 	fprintf(stderr,
 	        "[open-conversion] %s: %zu Gaussians from %ux%u (focal %.1f px, %s) on %s: infer %llu ms, write %llu "
@@ -2667,7 +2727,7 @@ splat_job(struct oc_provider *p,
 		if (COVERS(out, struct xrt_conv_job_out, splat_info)) {
 			struct xrt_conv_splat_info *si = &out->splat_info;
 			memset(si, 0, sizeof(*si));
-			si->blob_format = XRT_CONV_BLOB_PLY_3DGS;
+			si->blob_format = blob_format;
 			si->coords = XRT_CONV_COORDS_OPENCV;
 			si->color_space = XRT_CONV_CS_SRGB; // f_dc carries sRGB values, as 3DGS viewers expect
 			si->metric = 0; // a monocular model's scale, through a focal that may be assumed: not metres
@@ -2683,10 +2743,14 @@ splat_job(struct oc_provider *p,
 			si->splat_count = (uint64_t)n;
 		}
 	}
-	if (sr != NULL && st.focus_valid && COVERS(sr, struct xrt_conv_splat_result, focus_source)) {
-		sr->focus_point[0] = st.focus_point[0];
-		sr->focus_point[1] = st.focus_point[1];
-		sr->focus_point[2] = st.focus_point[2];
+	if (sr != NULL && st.focus.valid && COVERS(sr, struct xrt_conv_splat_result, focus_source)) {
+		// The SOG camera block's focus, number for number (docs/sog-camera-block.md).
+		sr->focus_point[0] = 0.0f;
+		sr->focus_point[1] = 0.0f;
+		sr->focus_point[2] = st.focus.z_m;
+		sr->focus_subject_m = st.focus.z_m;
+		sr->focus_near_m = st.focus.near_m;
+		sr->focus_far_m = st.focus.far_m;
 		sr->focus_source = XRT_CONV_FOCUS_SOURCE_NEAREST_CLUMP; // a suggestion, in the splat's own units
 		sr->valid |= XRT_CONV_SPLAT_VALID_FOCUS;
 	}
@@ -2800,6 +2864,7 @@ oc_destroy(struct xrt_conversion_plugin_instance *inst)
 	free(p->chw);
 	free(p->map);
 	free(p->gauss);
+	free(p->rows);
 	for (uint32_t i = 0; i < p->pack_count; i++) {
 		free(p->packs[i]);
 	}
@@ -2829,6 +2894,9 @@ static const struct xrt_component_setting_desc g_settings[] = {
      "auto | full | fp16 | int4: the splat model (full = defaults[splats-mono].high, int4 = .low, fp16 = .medium "
      "on DirectML only; auto = full on a GPU backend with >= 16 GB RAM, on DirectML fp16 when built (>= 6 GB "
      "VRAM) else full with >= 9 GB VRAM, else int4, among the models in the store; DirectML never runs int4)"},
+    {"SPLAT_FORMAT", XRT_COMPONENT_SETTING_TYPE_ENUM, "request",
+     "request | sog | ply: the splat blob format (request = what the job asks for, PLY when it names none; "
+     "sog / ply = that format for every job, whatever it asks: a switch for testing a consumer)"},
     {"OPENVINO", XRT_COMPONENT_SETTING_TYPE_STRING, "", "absolute path of another OpenVINO runtime folder"},
     {"COREML_UNITS", XRT_COMPONENT_SETTING_TYPE_ENUM, "gpu", "gpu | all | ane | cpu: macOS Core ML compute units"},
     {"COREML_CACHE", XRT_COMPONENT_SETTING_TYPE_BOOL, "1", "0 = no Core ML compiled-model cache"},

@@ -13,7 +13,7 @@ provider per task, owns every thread, queue and policy, and calls this one for p
 |---|---|---|---|---|
 | `cap_id` 1 | `DEPTH_VIDEO`, `TEMPORAL` | stream | Video Depth Anything **Small**, streaming export with an explicit per-stream temporal cache | R32F affine disparity |
 | `cap_id` 2 | `DEPTH_MONO` | stream + job | Depth Anything V2 **Small** | R32F affine disparity |
-| `cap_id` 3 | `SPLATS_MONO` | job | none in the default pack: a separate, research-only splat pack (e.g. SHARP, full or 4-bit, picked per machine) | 3DGS PLY ([below](#photo-to-splats-splats_mono-adr-057)) |
+| `cap_id` 3 | `SPLATS_MONO` | job | none in the default pack: a separate, research-only splat pack (e.g. SHARP, full or 4-bit, picked per machine) | 3DGS PLY or SOG v2 with a camera block ([below](#photo-to-splats-splats_mono-adr-057)) |
 
 - **No views.** The provider declares no `VIEWS_*` capability: the runtime composes
   `VIEWS_MONO` from a depth capability and its reference view synthesis (discovery spec §1.1,
@@ -236,12 +236,23 @@ only that name is found; the pack lists them as `data` files of the same variant
 4. **Postprocess** — unproject through the input's intrinsics, `D = diag(w/2f, h/2f, 1)`:
    `mean' = D·mean`, `cov' = D·R·diag(s²)·Rᵀ·D`, re-diagonalised per Gaussian (the scale
    differs in x and y) into scales and a rotation; linear colours to sRGB degree-0 harmonics,
-   opacity to its logit, scales to logs. Written straight into the sink as a binary
-   little-endian **3DGS PLY** (`x y z f_dc_0..2 opacity scale_0..2 rot_0..3`, 56 bytes per
-   Gaussian), the format every 3DGS viewer and the runtime's spec-3 path read. Any other
-   requested format (SOG, say) is refused (`XRT_CONV_REFUSAL_UNSUPPORTED_INPUT`, reason
-   `output format not supported: this provider writes 3DGS PLY only; pass an output path ending
-   in .ply`; the job fails, the capability stays `READY`).
+   opacity to its logit, scales to logs. Then written in the format the job asks for:
+   - **3DGS PLY** (the default, and what a job naming no format gets): binary little-endian,
+     `x y z f_dc_0..2 opacity scale_0..2 rot_0..3`, 56 bytes per Gaussian, the format every 3DGS
+     viewer and the runtime's spec-3 path read.
+   - **SOG v2** (`XRT_CONV_BLOB_SOG`; `displayxr-cli conv run splats-mono photo.jpg out.sog`):
+     PlayCanvas SOG **version 2** (a stored ZIP of `meta.json` and five lossless WebP planes,
+     degree 0, about a sixth of the PLY's size) with the **mono camera block** in `meta.json`:
+     the intrinsics the cloud was unprojected through and the nearest-clump focus, the block the
+     DisplayXR Gallery's online SOG generator writes. Spec: [docs/sog-camera-block.md](docs/sog-camera-block.md).
+     Version 2 because the native DisplayXR Gaussian Splat viewer refuses version 3; no transcode
+     step (splat-transform would drop the block). The SOG encode adds about 2.5 s to a
+     1.18 M-Gaussian job (the PLY write is about 0.4 s). libwebp 1.5.0 is compiled in.
+   Any other requested format (SPZ, say) is refused (`XRT_CONV_REFUSAL_UNSUPPORTED_INPUT`, reason
+   `output format not supported: this provider writes 3DGS PLY or SOG; pass an output path ending
+   in .ply or .sog`; the job fails, the capability stays `READY`). The setting `SPLAT_FORMAT`
+   (`sog` / `ply`) forces one format for every job whatever it asks: a test switch, since the
+   runtime's `GAUSSIANS` lift path (the browser's photo → splats) asks for PLY.
 
 **Facts, never intent** (`xrt_conv_splat_info` + `xrt_conv_splat_result`, discovery spec §2.6):
 OpenCV axes; `metric = 0` (a monocular model's scale through a focal that may be assumed is not
@@ -249,10 +260,12 @@ metres) and therefore no baseline, near, far or focus distance in metres; the in
 was actually unprojected through (`fx = fy = f`, `cx = w/2`, `cy = h/2`, grid = the input's
 `w × h`, `GIVEN` or `ASSUMED`); the splat count; and a **build stamp** with every result
 (provider version + source revision, `<pack>/<model>@<version>`, the blob's sha256, the backend
-and its version, host `LOCAL`). One **suggestion**, labelled `NEAREST_CLUMP`: the
-opacity-weighted 10th percentile of depth over the central half of the frame, as a point in the
-splat's own units. The provider never writes a camera block; auto-convergence stays runtime
-policy.
+and its version, host `LOCAL`). One **suggestion**, labelled `NEAREST_CLUMP`: the nearest
+substantial clump of the central half of the frame (`oc_splat_nearest_clump`, the rule in
+[docs/sog-camera-block.md](docs/sog-camera-block.md) §3), as the point `(0, 0, Z)` with
+`subject = Z` and the crop's p05 / p95 depth as near / far, in the splat's own units. A SOG
+result carries the same numbers in its camera block; a PLY has no place for one (the runtime's
+`conv camera-block` builds the block from the facts).
 
 ### Where splats-mono runs (`EP`, `OV_DEVICE`)
 
@@ -582,7 +595,8 @@ protocol, without network.
 | `check-model-pack`, `check-model-pack-research` | the pack validator on both packs | no (Python) |
 | `default-ep` (`-DOPENCONV_TEST_GPU=ON`) | both capabilities on the default execution provider (DirectML on Windows, Core ML on macOS) | yes |
 | `splats-tiny-model` | writes a tiny synthetic splat model with the real I/O contract, its pack and the expected output (`tests/make_tiny_splat_model.py`; needs the `onnx` Python package, skipped without it) | no |
-| `splats-cpu` | the splat lane on ONNX Runtime's CPU EP: download → `READY`, three jobs (focal given: every sampled Gaussian equals an independent numpy unprojection; no focal: `ASSUMED` 30 mm equivalent; a SOG request: refused, the cap stays `READY`), PLY header + count, facts, build stamp | no |
+| `splats-cpu` | the splat lane on ONNX Runtime's CPU EP: download → `READY`, four jobs (focal given: every sampled Gaussian equals an independent numpy unprojection; no focal: `ASSUMED` 30 mm equivalent; a SOG request: a stored ZIP with five WebP planes and a version-2 `meta.json` whose count, camera block (opencv, rig camera, no stereo, the facts' fx and focus) match the facts; an SPZ request: refused, the cap stays `READY`), PLY header + count, facts, build stamp | no |
+| `splats-sog` | the SOG writer and the nearest-clump focus on synthetic clouds (no model): a known near clump is found, a sliver under 3 % and transparent Gaussians are skipped, no central Gaussian = no focus, the 20 m clamp; the camera block's exact text; a SOG read back as a reader decodes it (stored ZIP, WebP planes, log 16-bit means, smallest-three quaternions, codebooks, opacity) against the rows; two writes, identical bytes | no |
 | `splats-openvino-cpu` | the same on OpenVINO's CPU device (no GPU needed), backend `openvino-cpu` | no |
 | `splats-rank` | the splat backend ranking on described machines (Intel UHD + RTX 3080 Laptop; RTX 3080 desktop, no iGPU; Intel Arc iGPU only; AMD APU + discrete Radeon; a 4 GB card; an 8 GB card; a 10 GB card reporting 10 240 and 10 067 MB; no GPU), with and without an fp16 model in the pack / in the store, and every explicit setting: backend, adapter, model, fallback line | no |
 | `diag-profile-parse` | the `DIAG_PROFILE` parsers on text in ONNX Runtime's formats: the node placement report (per EP and operator, fused partitions counted as one operator) and the profiling JSON (the last `model_run`'s kernel times by operator and provider) | no |
@@ -628,6 +642,7 @@ environment, else `Settings\<KEY>` under the registry row (Windows) or the manif
 | `OV_DEVICE` | `auto` (default), `gpu`, `cpu` | OpenVINO's device whenever OpenVINO serves the splat capability (`auto` = an Intel Arc / Xe-class GPU, never an NVIDIA / AMD / UHD-class one, else the CPU; `gpu` = its GPU device, any vendor); it does not select OpenVINO over DirectML |
 | `OV_CACHE` | `0` | no OpenVINO compiled-model cache, even when the host provides a scratch directory |
 | `MODEL` | `auto` (default), `full`, `fp16`, `int4` | the splat model when a pack names two or three: `full` = `defaults["splats-mono"].high`, `int4` = `.low`, `fp16` = `.medium` on DirectML (elsewhere it means full); `auto` = on DirectML fp16 when built (≥ 6 GB VRAM), else full (≥ 10 GB VRAM); full on another GPU backend; ≥ 16 GB of memory for either; else int4; among the models in the store ([details](#which-sharp-build-model)) |
+| `SPLAT_FORMAT` | `request` (default), `sog`, `ply` | the splat blob format: `request` = what the job asks for (PLY when it names none); `sog` / `ply` = that format for every job whatever it asks (a test switch: the runtime's lift path asks for PLY) |
 | `OPENVINO` | absolute path | another OpenVINO runtime folder (default: `openvino/` next to the binary) |
 | `COREML_UNITS` | `gpu` (default), `all`, `ane`, `cpu` | macOS: the Core ML compute units (CPU + GPU, + the Neural Engine, CPU + Neural Engine, CPU only) |
 | `COREML_CACHE` | `0` | macOS: no compiled-model cache, even when the host provides a scratch directory |

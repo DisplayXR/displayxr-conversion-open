@@ -772,8 +772,8 @@ validate_splat_cap(const struct xrt_conv_capability *c, uint32_t index)
 	check(c->lanes == XRT_CONV_LANE_JOB, "cap %u: SPLATS_MONO is job-only (0x%x)", index, c->lanes);
 	check(c->outputs == XRT_CONV_OUT_SPLAT_BLOB, "cap %u: outputs SPLAT_BLOB only (0x%x)", index, c->outputs);
 	check(c->input_kinds == XRT_CONV_INPUT_MONO, "cap %u: one photo in", index);
-	check(c->splat_formats == (1u << XRT_CONV_BLOB_PLY_3DGS), "cap %u: declares PLY 3DGS (0x%x)", index,
-	      c->splat_formats);
+	check(c->splat_formats == ((1u << XRT_CONV_BLOB_PLY_3DGS) | (1u << XRT_CONV_BLOB_SOG)),
+	      "cap %u: declares PLY 3DGS + SOG (0x%x)", index, c->splat_formats);
 	check(c->max_streams == 0 && c->max_views == 0, "cap %u: no streams, no views", index);
 	check((c->flags & XRT_CONV_CAP_USES_MODEL_STORE) != 0, "cap %u: USES_MODEL_STORE", index);
 	check((c->import_memory_kinds & XRT_CONV_MEM_CPU) != 0, "cap %u: imports XRT_CONV_MEM_CPU", index);
@@ -1306,6 +1306,62 @@ static const char *g_splat_check = NULL; //!< --splat-check: expected values (te
 static const char *g_splat_image = NULL; //!< --splat-image: a binary PPM (P6) photo
 static float g_splat_focal = 0.0f;       //!< --splat-focal: a GIVEN focal for the first job
 static const char *g_splat_out = NULL;   //!< --splat-out: write the first job's PLY here
+static const char *g_sog_out = NULL;     //!< --sog-out: write the SOG job's file here
+static const char *g_facts_out = NULL;   //!< --facts-out: the SOG job's facts (the runtime's facts JSON keys)
+
+//! A stored ZIP member's bytes (SOG: every member is stored), or NULL.
+static const uint8_t *
+zip_member(const uint8_t *z, size_t n, const char *name, size_t *size)
+{
+	const size_t nl = strlen(name);
+	for (size_t at = 0; at + 30 <= n;) {
+		if (!(z[at] == 'P' && z[at + 1] == 'K' && z[at + 2] == 3 && z[at + 3] == 4)) {
+			return NULL;
+		}
+		const uint32_t method = z[at + 8] | (uint32_t)z[at + 9] << 8;
+		const uint32_t csize =
+		    z[at + 18] | (uint32_t)z[at + 19] << 8 | (uint32_t)z[at + 20] << 16 | (uint32_t)z[at + 21] << 24;
+		const uint32_t fl = z[at + 26] | (uint32_t)z[at + 27] << 8, xl = z[at + 28] | (uint32_t)z[at + 29] << 8;
+		const size_t data = at + 30 + fl + xl;
+		if (data + csize > n) {
+			return NULL;
+		}
+		if (fl == nl && memcmp(z + at + 30, name, nl) == 0) {
+			*size = csize;
+			return method == 0 ? z + data : NULL;
+		}
+		at = data + csize;
+	}
+	return NULL;
+}
+
+//! The facts JSON the runtime writes for a job (conv_splat_facts_to_json's keys, the fields this job has).
+static void
+write_facts(const char *path, const struct xrt_conv_splat_info *si, const struct xrt_conv_splat_result *sr)
+{
+	FILE *f = fopen_utf8(path, "wb");
+	if (f == NULL) {
+		check(false, "open %s", path);
+		return;
+	}
+	fprintf(f, "{\n  \"build\": {\"provider\": \"%s\", \"model_id\": \"%s\", \"runtime\": \"%s\"},\n",
+	        sr->build_provider, sr->build_model_id, sr->build_runtime);
+	fprintf(f,
+	        "  \"coords\": \"opencv\",\n  \"intrinsics\": {\"fx\": %.7g, \"fy\": %.7g, \"cx\": %.7g, "
+	        "\"cy\": %.7g, \"width\": %u, \"height\": %u, \"source\": \"%s\"},\n",
+	        (double)si->fx, (double)si->fy, (double)si->cx, (double)si->cy, si->grid_width, si->grid_height,
+	        si->intrinsics_source == XRT_CONV_INTRINSICS_GIVEN ? "given" : "assumed");
+	fprintf(f, "  \"metric\": false,\n  \"splat_count\": %llu", (unsigned long long)si->splat_count);
+	if (sr->valid & XRT_CONV_SPLAT_VALID_FOCUS) {
+		fprintf(f,
+		        ",\n  \"focus_suggestion\": {\"point\": [%.7g, %.7g, %.7g], \"subject_m\": %.7g, "
+		        "\"near_m\": %.7g, \"far_m\": %.7g, \"source\": \"nearest-clump\"}",
+		        (double)sr->focus_point[0], (double)sr->focus_point[1], (double)sr->focus_point[2],
+		        (double)sr->focus_subject_m, (double)sr->focus_near_m, (double)sr->focus_far_m);
+	}
+	fprintf(f, "\n}\n");
+	check(fclose(f) == 0, "wrote %s", path);
+}
 
 struct mem_sink
 {
@@ -1684,12 +1740,81 @@ run_splat_jobs(struct xrt_conversion_plugin_iface *iface,
 		      want);
 	}
 
-	// 3. A format it does not write: refused (job fails, no blob), the cap stays READY.
+	// 3. SOG: a stored ZIP with a version-2 meta.json, five WebP planes and the camera block.
 	r = splat_job_once(iface, inst, cap, rgba, W, H, focal, XRT_CONV_BLOB_SOG, &ms, &out, &sr, &t);
+	check(r == XRT_SUCCESS && ms.begun && ms.format == XRT_CONV_BLOB_SOG && !ms.failed &&
+	          out.splat_info.blob_format == XRT_CONV_BLOB_SOG,
+	      "a SOG request writes a SOG blob (result %d, format %u, %zu bytes, %.0f ms)", (int)r, ms.format, ms.size,
+	      t);
+	if (r == XRT_SUCCESS && ms.format == XRT_CONV_BLOB_SOG) {
+		static const char *const planes[] = {"means_l.webp", "means_u.webp", "quats.webp", "scales.webp",
+		                                     "sh0.webp"};
+		for (int i = 0; i < 5; i++) {
+			size_t sz = 0;
+			const uint8_t *d = zip_member(ms.data, ms.size, planes[i], &sz);
+			check(d != NULL && sz > 12 && memcmp(d, "RIFF", 4) == 0 && memcmp(d + 8, "WEBP", 4) == 0,
+			      "SOG member %s: a stored WebP (%zu bytes)", planes[i], sz);
+		}
+		size_t msz = 0;
+		const uint8_t *md = zip_member(ms.data, ms.size, "meta.json", &msz);
+		check(md != NULL && msz <= 65536, "SOG meta.json stored, %zu bytes (<= 64 KiB)", msz);
+		char *mtext = md != NULL ? (char *)malloc(msz + 1) : NULL; // oc_json takes a length; NUL for safety
+		struct oc_json *meta = NULL;
+		if (mtext != NULL) {
+			memcpy(mtext, md, msz);
+			mtext[msz] = 0;
+			char err[160] = "";
+			meta = oc_json_parse(mtext, msz, err, sizeof(err));
+			check(meta != NULL, "meta.json parses (%s)", err);
+		}
+		if (meta != NULL) {
+			const struct oc_json *cam = oc_json_get(meta, "camera");
+			const struct oc_json *in = cam != NULL ? oc_json_get(cam, "intrinsics") : NULL;
+			const struct oc_json *fo = cam != NULL ? oc_json_get(cam, "focus") : NULL;
+			check(oc_json_num(meta, "version", 0) == 2 &&
+			          (uint64_t)oc_json_num(meta, "count", 0) == out.splat_info.splat_count,
+			      "meta.json: version 2, count %llu", (unsigned long long)out.splat_info.splat_count);
+			check(cam != NULL && strcmp(oc_json_str(cam, "convention", ""), "opencv") == 0 &&
+			          strcmp(oc_json_str(cam, "rig", ""), "camera") == 0 &&
+			          oc_json_get(cam, "stereo") == NULL && in != NULL &&
+			          (float)oc_json_num(in, "fx", 0) == out.splat_info.fx &&
+			          (uint32_t)oc_json_num(in, "width", 0) == W &&
+			          (uint32_t)oc_json_num(in, "height", 0) == H,
+			      "camera block: opencv, rig camera, no stereo, fx %.3f, %ux%u", (double)out.splat_info.fx,
+			      W, H);
+			if (sr.valid & XRT_CONV_SPLAT_VALID_FOCUS) {
+				const struct oc_json *pt = fo != NULL ? oc_json_get(fo, "point") : NULL;
+				check(pt != NULL && oc_json_at(pt, 2) != NULL &&
+				          (float)oc_json_at(pt, 2)->number == sr.focus_point[2] &&
+				          (float)oc_json_num(fo, "subject_m", 0) == sr.focus_subject_m &&
+				          strcmp(oc_json_str(fo, "source", ""), "nearest-clump") == 0,
+				      "camera block focus = the facts' focus suggestion (z %.4g)",
+				      (double)sr.focus_point[2]);
+			} else {
+				check(fo == NULL, "no clump: the camera block has no focus");
+			}
+			info("SOG camera block: fx %.3f, focus %s z %.4g, near %.4g, far %.4g",
+			     (double)out.splat_info.fx, fo != NULL ? oc_json_str(fo, "source", "?") : "none",
+			     (double)sr.focus_point[2], (double)sr.focus_near_m, (double)sr.focus_far_m);
+		}
+		oc_json_free(meta);
+		free(mtext);
+		if (g_sog_out != NULL) {
+			FILE *f = fopen_utf8(g_sog_out, "wb");
+			check(f != NULL && fwrite(ms.data, 1, ms.size, f) == ms.size && fclose(f) == 0, "wrote %s",
+			      g_sog_out);
+		}
+		if (g_facts_out != NULL) {
+			write_facts(g_facts_out, &out.splat_info, &sr);
+		}
+	}
+
+	// 4. A format it does not write: refused (job fails, no blob), the cap stays READY.
+	r = splat_job_once(iface, inst, cap, rgba, W, H, focal, XRT_CONV_BLOB_SPZ, &ms, &out, &sr, &t);
 	check(r != XRT_SUCCESS && !ms.begun && sr.refusal_code == XRT_CONV_REFUSAL_UNSUPPORTED_INPUT &&
-	          strstr(sr.refusal_reason, ".ply") != NULL,
-	      "a SOG request is refused with a reason naming .ply (result %d, refusal %u '%s')", (int)r, sr.refusal_code,
-	      sr.refusal_reason);
+	          strstr(sr.refusal_reason, ".sog") != NULL,
+	      "an SPZ request is refused with a reason naming .ply / .sog (result %d, refusal %u '%s')", (int)r,
+	      sr.refusal_code, sr.refusal_reason);
 	struct xrt_conv_state st;
 	memset(&st, 0, sizeof(st));
 	st.struct_size = (uint32_t)sizeof(st);
@@ -1719,7 +1844,8 @@ usage(void)
 	        "         [--expect-licence permissive|commercial|research] [--expect-download] [--expect-verify]\n"
 	        "         [--warm-timeout-ms N] [--scratch DIR] [--bench N] [--dump DIR]\n"
 	        "         [--caps splats] [--splat-check expect.json] [--splat-image photo.ppm] [--splat-focal PX]\n"
-	        "         [--splat-out out.ply] [--expect-backend NAME] [--expect-model NAME] [--allow-research]\n");
+	        "         [--splat-out out.ply] [--sog-out out.sog] [--facts-out facts.json] [--expect-backend NAME] "
+	        "[--expect-model NAME] [--allow-research]\n");
 }
 
 static bool
@@ -1807,6 +1933,10 @@ main(int argc, char **argv)
 		} else if (strcmp(a, "--dump") == 0 && more) {
 			g_dump = argv[++i];
 			mkdir_utf8(g_dump);
+		} else if (strcmp(a, "--sog-out") == 0 && more) {
+			g_sog_out = argv[++i];
+		} else if (strcmp(a, "--facts-out") == 0 && more) {
+			g_facts_out = argv[++i];
 		} else if (strcmp(a, "--splat-check") == 0 && more) {
 			g_splat_check = argv[++i];
 		} else if (strcmp(a, "--splat-image") == 0 && more) {

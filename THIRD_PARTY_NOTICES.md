@@ -1,9 +1,9 @@
 # Third-party components
 
-The provider's own source is [BSL-1.0](LICENSE). It ships next to, and loads at run time, the
-components below; none is linked into the provider binary and none is committed to this
+The provider's own source is [BSL-1.0](LICENSE). It links one component statically (libwebp,
+below) and ships next to, and loads at run time, the others; none is committed to this
 repository (the build fetches them as pinned, hash-checked release archives, see
-`cmake/OnnxRuntime.cmake` and `cmake/OpenVINO.cmake`; the models are fetched by the runtime's
+`cmake/OnnxRuntime.cmake`, `cmake/OpenVINO.cmake` and `cmake/LibWebP.cmake`; the models are fetched by the runtime's
 model store, or built locally by the user for a research-only pack).
 
 ## Inference runtime
@@ -28,6 +28,15 @@ On Windows `onnxruntime.dll` imports the Microsoft Visual C++ 2015-2022 runtime
 (`MSVCP140.dll`, `VCRUNTIME140.dll`, `VCRUNTIME140_1.dll`); the installer that ships the
 provider must make sure it is present. The provider binary itself links the C runtime
 statically.
+
+## Linked into the provider
+
+| Component | Version | Licence | Where it comes from | Platforms |
+|---|---|---|---|---|
+| libwebp (lossless encoder, plus its decoder in the tests) | 1.5.0 | BSD-3-Clause (plus Google's patent grant, `PATENTS`) | the release archive `libwebp-1.5.0.tar.gz` from downloads.webmproject.org, compiled from source into the provider | all |
+
+Used by the splat capability's SOG writer (the lossless WebP planes of a `.sog`). Its licence
+text is installed as `licenses/libwebp-COPYING.txt`.
 
 ## Models (the default pack, `packs/dxr-open-default.models.json`)
 
