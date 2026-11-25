@@ -33,9 +33,11 @@ provider per task, owns every thread, queue and policy, and calls this one for p
   the Core ML execution provider (part of the official osx-arm64 ONNX Runtime build) runs the
   video-depth model on the GPU, with the same fallback; the still-depth model stays on the CPU
   execution provider there (see [macOS: Core ML](#macos-core-ml)). Linux uses the CPU
-  execution provider for depth. The splat capability runs on **OpenVINO** where the provider
-  ships it (Linux x86_64, Windows x64: its GPU device, else its CPU device), else on ONNX
-  Runtime ([OpenVINO](#openvino-the-splat-capabilitys-gpu-path)).
+  execution provider for depth. The splat capability runs on ONNX Runtime + **DirectML** on a
+  discrete NVIDIA / AMD GPU (Windows), else on **OpenVINO** where the provider ships it (Linux
+  x86_64, Windows x64: its GPU device when that is an Intel Arc / Xe-class GPU, else its CPU
+  device), else on ONNX Runtime's CPU execution provider
+  ([where splats run](#where-splats-mono-runs-ep-ov_device)).
 - **Transport:** every capability imports `XRT_CONV_MEM_CPU` (RGBA8 / BGRA8, UNORM or SRGB) and
   writes a CPU R32F target; the runtime copies GPU images for it. The temporal cache stays on
   the inference device between frames.
@@ -167,7 +169,7 @@ When a pack names two splat models, `defaults["splats-mono"].high` (the full one
 
 | `MODEL` | Model |
 |---|---|
-| `auto` (default) | **full** when the backend the capability is bound to is a GPU (OpenVINO's GPU device; DirectML or Core ML where a pack lists them) **and** the OS reports at least 15 GiB of memory (a "16 GB" machine: firmware and an integrated GPU keep a little); otherwise **int4**. |
+| `auto` (default) | **full** when the backend the capability is bound to is a GPU (DirectML, OpenVINO's GPU device; Core ML where a pack lists it) **and** the OS reports at least 15 GiB of memory (a "16 GB" machine: firmware and an integrated GPU keep a little) **and**, on DirectML, the adapter has at least 6 GB of dedicated memory; otherwise **int4** (every CPU backend). |
 | `full` | always the full model |
 | `int4` | always the small model |
 
@@ -202,16 +204,19 @@ only that name is found; the pack lists them as `data` files of the same variant
    wins over everything); otherwise the model's own convention, a 30 mm full-frame equivalent
    (`30 · diag / 43.27` px), **labelled `ASSUMED`**. The provider receives decoded pixels and
    never reads EXIF.
-3. **Inference** — OpenVINO GPU, else OpenVINO CPU, else ONNX Runtime's CPU execution provider
-   (below). The run is asynchronous and polls `is_cancelled` every 100 ms on OpenVINO.
+3. **Inference** — on the backend [ranked below](#where-splats-mono-runs-ep-ov_device): DirectML,
+   OpenVINO GPU, OpenVINO CPU or ONNX Runtime's CPU execution provider. The run is asynchronous
+   and polls `is_cancelled` every 100 ms on OpenVINO; an ONNX Runtime run (DirectML, CPU) is one
+   blocking call, so a cancel takes effect when it returns.
 4. **Postprocess** — unproject through the input's intrinsics, `D = diag(w/2f, h/2f, 1)`:
    `mean' = D·mean`, `cov' = D·R·diag(s²)·Rᵀ·D`, re-diagonalised per Gaussian (the scale
    differs in x and y) into scales and a rotation; linear colours to sRGB degree-0 harmonics,
    opacity to its logit, scales to logs. Written straight into the sink as a binary
    little-endian **3DGS PLY** (`x y z f_dc_0..2 opacity scale_0..2 rot_0..3`, 56 bytes per
    Gaussian), the format every 3DGS viewer and the runtime's spec-3 path read. Any other
-   requested format is refused (`XRT_CONV_REFUSAL_UNSUPPORTED_INPUT`, the job fails, the
-   capability stays `READY`).
+   requested format (SOG, say) is refused (`XRT_CONV_REFUSAL_UNSUPPORTED_INPUT`, reason
+   `output format not supported: this provider writes 3DGS PLY only; pass an output path ending
+   in .ply`; the job fails, the capability stays `READY`).
 
 **Facts, never intent** (`xrt_conv_splat_info` + `xrt_conv_splat_result`, discovery spec §2.6):
 OpenCV axes; `metric = 0` (a monocular model's scale through a focal that may be assumed is not
@@ -223,6 +228,52 @@ and its version, host `LOCAL`). One **suggestion**, labelled `NEAREST_CLUMP`: th
 opacity-weighted 10th percentile of depth over the central half of the frame, as a point in the
 splat's own units. The provider never writes a camera block; auto-convergence stays runtime
 policy.
+
+### Where splats-mono runs (`EP`, `OV_DEVICE`)
+
+`EP=auto` ranks the backends per machine (`src/oc_rank.c`, a pure function unit-tested on
+described machines by the `splats-rank` test):
+
+| Machine | Backend | `MODEL=auto` |
+|---|---|---|
+| Windows, a **discrete non-Intel** GPU (NVIDIA / AMD, ≥ 2 GB dedicated; the one with the most VRAM), ≥ 16 GB RAM, ≥ 6 GB VRAM | **DirectML** on that adapter (`onnxruntime-dml`) | full |
+| otherwise, OpenVINO's GPU device is an **Intel Arc / Xe-class** GPU (discrete, named Arc, matrix units, GPU IP ≥ 12.55, or an Iris Xe) | OpenVINO GPU (`openvino-gpu`) | full with ≥ 16 GB RAM, else int4 |
+| otherwise (an NVIDIA / AMD card that OpenVINO reaches through OpenCL, a UHD-class iGPU, no GPU) | OpenVINO CPU (`openvino-cpu`) | int4 |
+| no OpenVINO (macOS) | ONNX Runtime CPU (`onnxruntime-cpu`) | int4 |
+
+- **DirectML serves the full model only.** The int4 build's 4-bit weights are ONNX Runtime's
+  `MatMulNBits` contrib operator, which is not verified on the DirectML execution provider (an
+  operator DirectML does not take would run on the CPU inside the same session, with a copy each
+  way). The SHARP pack therefore lists `dml` for `sharp-full-1536` only: `EP=auto` ranks DirectML
+  first only when the full model is what would run there, and `MODEL=int4` with `EP=dml` runs the
+  int4 build on the CPU, saying so.
+- **OpenVINO's GPU device is decided after OpenVINO loads** (its first warm lists the devices with
+  `FULL_DEVICE_NAME`, `DEVICE_TYPE`, `DEVICE_ARCHITECTURE`, `GPU_EXECUTION_UNITS_COUNT`,
+  `OPTIMIZATION_CAPABILITIES`). Before that, probe describes `openvino-gpu` provisionally; a GPU
+  device the rule rejects moves the capability to OpenVINO's CPU device (re-described, and
+  `MODEL=auto` re-picks int4). The EU count only separates an Iris Xe from a UHD part of the
+  same generation: newer parts count differently (an Xe3 iGPU reports 32 EUs).
+- **Explicit settings win.** `EP=dml` = DirectML on the discrete adapter (else the first hardware
+  adapter); `EP=openvino` = OpenVINO, its device by `OV_DEVICE` (and by the Intel rule when
+  `auto`); `EP=cpu` = ONNX Runtime's CPU EP. `OV_DEVICE=gpu` forces OpenVINO's (first) GPU device
+  of any vendor and `cpu` its CPU device, whenever OpenVINO serves the capability; it does not by
+  itself select OpenVINO over DirectML (use `EP=openvino` for that). `MODEL=full|int4` is honoured
+  on every backend.
+- **Fallbacks:** DirectML that cannot start, runs out of memory or fails a run drops out for the
+  process and the capability re-ranks without it (OpenVINO, else ONNX Runtime CPU); OpenVINO GPU →
+  OpenVINO CPU → ONNX Runtime CPU as before. Each step re-describes the capability.
+- **No silent choice.** One line per ranking on stderr (the runtime's provider log), e.g.
+
+  ```
+  [open-conversion] DXGI adapter 1: 'NVIDIA GeForce RTX 3080' vendor 0x10de, 10240 MB dedicated, discrete
+  [open-conversion] splats-mono: EP=auto, DirectML on 'NVIDIA GeForce RTX 3080' (discrete, 10240 MB) -> dml; model full (MODEL=auto, 65307 MB RAM)
+  [open-conversion] OpenVINO GPU: Intel(R) UHD Graphics 630 (iGPU) (iGPU, vendor 0x8086, IP 9.5, 24 EUs); not used by EP=auto: 'Intel(R) UHD Graphics 630 (iGPU)' is a UHD-class iGPU
+  [open-conversion] splats-mono: EP=dml, but this ONNX Runtime has no DirectML (Windows only); using onnxruntime-cpu
+  [open-conversion] splats-mono: DirectML unavailable (<the error>)
+  ```
+
+  The capability's `backend` (`displayxr-cli conv list`) and every result's build stamp name the
+  backend that answered; `luid` is the DirectML adapter's.
 
 ## OpenVINO (the splat capability's GPU path)
 
@@ -241,8 +292,9 @@ needs it: `probe` checks that the files are there, nothing more.
   `onnxruntime-openvino` build, which bundles its own OpenVINO), so it would mean replacing the
   pinned ONNX Runtime with a different, larger build, for no extra coverage. Intel's own
   archives are versioned, hash-pinnable and redistributable (Apache-2.0), like ONNX Runtime's.
-- **Device:** `OV_DEVICE` `auto` (default) = the GPU device when OpenVINO reports one, else its
-  CPU device; `gpu` / `cpu` force one. The GPU device drives the system's OpenCL driver (Linux:
+- **Device:** `OV_DEVICE` `auto` (default) = the GPU device when it is an Intel Arc / Xe-class GPU
+  ([the rule](#where-splats-mono-runs-ep-ov_device)), else its CPU device; `gpu` / `cpu` force
+  one. The GPU device drives the system's OpenCL driver (Linux:
   `libOpenCL.so.1` + Intel's compute runtime, e.g. Ubuntu `ocl-icd-libopencl1` +
   `intel-opencl-icd`); without it OpenVINO reports no GPU and the capability runs on its CPU
   device.
@@ -452,6 +504,7 @@ protocol, without network.
 | `splats-tiny-model` | writes a tiny synthetic splat model with the real I/O contract, its pack and the expected output (`tests/make_tiny_splat_model.py`; needs the `onnx` Python package, skipped without it) | no |
 | `splats-cpu` | the splat lane on ONNX Runtime's CPU EP: download → `READY`, three jobs (focal given: every sampled Gaussian equals an independent numpy unprojection; no focal: `ASSUMED` 30 mm equivalent; a SOG request: refused, the cap stays `READY`), PLY header + count, facts, build stamp | no |
 | `splats-openvino-cpu` | the same on OpenVINO's CPU device (no GPU needed), backend `openvino-cpu` | no |
+| `splats-rank` | the splat backend ranking on described machines (Intel UHD + RTX 3080 Laptop; RTX 3080 desktop, no iGPU; Intel Arc iGPU only; AMD APU + discrete Radeon; a 4 GB card; no GPU) and every explicit setting: backend, adapter, model, fallback line | no |
 | `splats-pick-auto-cpu` | a two-model pack (`tiny-full` = high, `tiny-int4` = low) on the CPU: `MODEL=auto` picks `tiny-int4` | no |
 | `splats-pick-full-external-data` | `MODEL=full`: `tiny-full`, stored as a graph + an external-data file named by its sha256, downloads both files and runs (the full SHARP layout) | no |
 | `splats-pick-fallback` | the store holds only `tiny-full`, downloads off: `auto` (int4 on a CPU) takes `tiny-full` and says so | no |
@@ -488,10 +541,10 @@ environment, else `Settings\<KEY>` under the registry row (Windows) or the manif
 |---|---|---|
 | `ENABLE` | `0` | `probe` declines |
 | `QUALITY` | `low`, `medium` (default), `high` | which model `defaults[task]` names for the depth capabilities (low = the 364-px video model); the splat capability uses `MODEL` instead |
-| `EP` | `auto` (default), `cpu`, `dml`, `coreml`, `openvino` | `cpu` forces the CPU execution provider; `auto` = DirectML on Windows, Core ML on macOS (each falls back to the CPU), and OpenVINO for the splat capability where it ships (`openvino` is the same for it; the depth capabilities never use OpenVINO) |
-| `OV_DEVICE` | `auto` (default), `gpu`, `cpu` | the OpenVINO device of the splat capability (`auto` = the GPU when OpenVINO reports one) |
+| `EP` | `auto` (default), `cpu`, `dml`, `coreml`, `openvino` | `cpu` forces the CPU execution provider; for depth `auto` = DirectML on Windows, Core ML on macOS (each falls back to the CPU); for the splat capability `auto` = DirectML on a discrete non-Intel GPU, else OpenVINO's Intel Arc / Xe GPU, else OpenVINO's CPU device, else ONNX Runtime's CPU EP ([details](#where-splats-mono-runs-ep-ov_device)); `openvino` forces OpenVINO for it (the depth capabilities never use OpenVINO) |
+| `OV_DEVICE` | `auto` (default), `gpu`, `cpu` | OpenVINO's device whenever OpenVINO serves the splat capability (`auto` = an Intel Arc / Xe-class GPU, never an NVIDIA / AMD / UHD-class one, else the CPU; `gpu` = its GPU device, any vendor); it does not select OpenVINO over DirectML |
 | `OV_CACHE` | `0` | no OpenVINO compiled-model cache, even when the host provides a scratch directory |
-| `MODEL` | `auto` (default), `full`, `int4` | the splat model when a pack names two: `full` = `defaults["splats-mono"].high`, `int4` = `.low`; `auto` = full on a GPU backend with ≥ 16 GB of memory, else int4, among the models in the store ([details](#which-sharp-build-model)) |
+| `MODEL` | `auto` (default), `full`, `int4` | the splat model when a pack names two: `full` = `defaults["splats-mono"].high`, `int4` = `.low`; `auto` = full on a GPU backend with ≥ 16 GB of memory (DirectML: and ≥ 6 GB of VRAM), else int4, among the models in the store ([details](#which-sharp-build-model)) |
 | `OPENVINO` | absolute path | another OpenVINO runtime folder (default: `openvino/` next to the binary) |
 | `COREML_UNITS` | `gpu` (default), `all`, `ane`, `cpu` | macOS: the Core ML compute units (CPU + GPU, + the Neural Engine, CPU + Neural Engine, CPU only) |
 | `COREML_CACHE` | `0` | macOS: no compiled-model cache, even when the host provides a scratch directory |

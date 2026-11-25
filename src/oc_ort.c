@@ -320,6 +320,42 @@ oc_dml_pick_adapter(uint64_t preferred_luid, uint64_t avoid_luid, int *out_index
 #endif
 }
 
+uint32_t
+oc_dxgi_list_adapters(struct oc_dxgi_adapter *out, uint32_t max)
+{
+#ifdef _WIN32
+	IDXGIFactory1 *f = NULL;
+	if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f))) {
+		return 0;
+	}
+	uint32_t n = 0;
+	IDXGIAdapter1 *a = NULL;
+	for (UINT i = 0; n < max && IDXGIFactory1_EnumAdapters1(f, i, &a) == S_OK; i++) {
+		DXGI_ADAPTER_DESC1 d;
+		if (SUCCEEDED(IDXGIAdapter1_GetDesc1(a, &d))) {
+			struct oc_dxgi_adapter *o = &out[n++];
+			memset(o, 0, sizeof(*o));
+			if (WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, o->name, (int)sizeof(o->name), NULL,
+			                        NULL) == 0) {
+				snprintf(o->name, sizeof(o->name), "adapter %u", (unsigned)i);
+			}
+			o->vendor_id = d.VendorId;
+			o->dedicated_mb = (uint64_t)d.DedicatedVideoMemory >> 20;
+			o->software = (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+			o->index = (int)i;
+			o->luid = ((uint64_t)(uint32_t)d.AdapterLuid.HighPart << 32) | d.AdapterLuid.LowPart;
+		}
+		IDXGIAdapter1_Release(a);
+	}
+	IDXGIFactory1_Release(f);
+	return n;
+#else
+	(void)out;
+	(void)max;
+	return 0;
+#endif
+}
+
 enum oc_run_status
 oc_session_create(struct oc_ort *ort,
                   const char *path,

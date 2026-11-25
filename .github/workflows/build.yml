@@ -137,6 +137,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
           if (-not (Test-Path out\DisplayXROpenConversionSetup-0.0.0-ci.exe)) { throw "installer not produced" }
 
+      # The unsigned CI installer, so a PR can be tried on a Windows box before a release (it writes
+      # the ADR-054 allowlist row for its own DLL, which a hand-copied DLL would lack).
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: open-conversion-installer-windows
+          path: out/DisplayXROpenConversionSetup-0.0.0-ci.exe
+          if-no-files-found: error
+
       - uses: actions/upload-artifact@v4
         with:
           name: open-conversion-${{ matrix.os }}

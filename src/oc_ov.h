@@ -21,6 +21,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "oc_rank.h"
 #include "oc_tensor.h"
 
 #ifdef __cplusplus
@@ -62,11 +63,12 @@ oc_ov_load(const char *dir, struct oc_ov **out, char *detail, size_t detail_size
 const char *
 oc_ov_version(const struct oc_ov *ov);
 
-/*! True when OpenVINO reports a device whose name starts with @p prefix
- *  ("GPU" matches "GPU", "GPU.0", "GPU.1"). @p full gets the first match's
- *  full name (FULL_DEVICE_NAME) when not NULL. */
-bool
-oc_ov_has_device(struct oc_ov *ov, const char *prefix, char *full, size_t full_size);
+/*! Every OpenVINO GPU device ("GPU", "GPU.0", "GPU.1", ...) with its
+ *  FULL_DEVICE_NAME, DEVICE_TYPE and GPU_EXECUTION_UNITS_COUNT (what the GPU
+ *  plug-in reports; a missing property stays unknown / 0), into @p out (at
+ *  most @p max). Returns the count. */
+uint32_t
+oc_ov_list_gpus(struct oc_ov *ov, struct oc_ov_gpu *out, uint32_t max);
 
 /*! Read and compile the model at @p path (UTF-8, absolute) for @p device
  *  ("GPU" / "CPU"). @p cache_dir (NULL = none) is OpenVINO's compiled-model
