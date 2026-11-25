@@ -80,8 +80,8 @@ never pre-fetch one); `--verify-store DIR` checks a model store against it.
 
 ### SHARP (image → Gaussian splats), built on your machine
 
-`packs/dxr-open-sharp.models.json` lists two builds of Apple's SHARP single-image splat model
-(task `splats-mono`), both exported to ONNX from the same official checkpoint:
+`packs/dxr-open-sharp.models.json` lists three builds of Apple's SHARP single-image splat model
+(task `splats-mono`), all exported to ONNX from the same official checkpoint:
 
 - **`sharp-full-1536`** — the fp32 export as it comes out of PyTorch (numerically the PyTorch
   model: on ONNX Runtime's CPU every output is within 2e-4 relative L2 of PyTorch's and the median
@@ -93,6 +93,22 @@ never pre-fetch one); `--verify-store DIR` checks a model store against it.
   only when both are present and verified. (ONNX's protobuf cannot hold 2.6 GB in one file.)
 - **`sharp-int4-1536`** — the same export with its MatMul weights quantized to 4 bits; one
   0.58 GB file.
+- **`sharp-fp16-1536`** — for **DirectML only** (its one variant lists `dml`): the same export
+  with its static shape arithmetic folded (in Python, with ONNX's reference operators and only
+  exactly-defined ones: integer arithmetic, IEEE `+ - * / sqrt`, data movement; no ONNX Runtime
+  graph optimiser, whose saved graph differed between Windows and Linux), then converted to
+  float16. Its graph inputs and outputs stay **float32** (the script checks every one against the
+  fp32 model and refuses otherwise). The whole graph runs in fp16 except onnxconverter-common's
+  default block list (in this graph: its two `Resize` nodes): the full-resolution convolutions of
+  the decoders and the Gaussian heads are where the time and the memory are, and keeping them fp32
+  (export_sharp.py 1.3.0) cost about 2.6× on DirectML and went over a 10 GB card's memory budget.
+  Graph + one external-data file named by its SHA-256, like `full`, about 1.3 GB: half the GPU
+  memory of `full`. Against the fp32 model on ONNX Runtime's CPU EP (one photo): median relative
+  depth error 0.10 % (p95 1.4 %); per-attribute mean |difference| / mean |value|: positions
+  0.78 %, colours 0.20 %, rotations 0.32 %, opacities 0.34 %, scales 2.1 %; no non-finite value.
+  Measured on DirectML (RTX 3080, 10 GB, this recipe): about **1.2 s** of inference and **5.6 GB**
+  of dedicated memory (within the budget), about 2 s for the whole job, where the fp32 model, over
+  the card's memory budget, took 16 – 190 s.
 
 The provider picks between them per machine (setting `MODEL`, [below](#which-sharp-build-model)).
 SHARP's weights are licensed **for research only** (Apple Machine Learning Research Model
@@ -103,12 +119,13 @@ yourself from the official checkpoint:
 ```
 python3.12 -m venv sharp-venv
 sharp-venv/bin/pip install -r scripts/requirements-export-sharp.txt
-sharp-venv/bin/python scripts/export_sharp.py --accept-research-license [--variant int4|full|both]
+sharp-venv/bin/python scripts/export_sharp.py --accept-research-license [--variant int4|full|fp16|both]
 ```
 
 `--variant` defaults to the build this machine's provider will pick by itself (the `MODEL=auto`
-rule below) and says which and why; `both` builds both from one export (one checkpoint download
-serves both).
+rule below) and says which and why; `both` builds `full` and `int4` from one export (one
+checkpoint download serves both). `fp16` is never a default: build it on a DirectML machine
+(a discrete NVIDIA / AMD card) when you want it; the provider then prefers it there.
 
 The script downloads `sharp_2572gikvuh.pt` from the official `apple/Sharp` Hugging Face
 repository at a pinned revision (or takes `--checkpoint FILE`), refuses any file whose size and
@@ -128,11 +145,16 @@ produced against the pack and says so if they differ.
 | `sharp-full-1536` | splats-mono | graph (`model`) | `cbe7db8a32a5e1d3af96fbd64841d0e77b8db79f3efba92fda3891e3edc75326` | 6 226 171 | never (built locally) |
 | | | weights (`data`) | `95912399a850769c894d780c1761604ced31ce30e2464a8c3138e796f26e15d0` | 2 615 734 016 | |
 | `sharp-int4-1536` | splats-mono | `model` | `01202f427e5f83ece061a5438e5b6670fbe9ffb26d30f8100bb285eb69f753f9` | 583 477 535 | never (built locally) |
+| `sharp-fp16-1536` | splats-mono | graph (`model`) | `69a094fa7e2b2a479f02a6c77dda5edc7fdf6de647741055c533b5c171f534cc` | 3 676 447 | never (built locally) |
+| | | weights (`data`) | `d3a96e008fdb4cc872c268b9541e905cb602353e8fb785c4a47ee54a29e92e05` | 1 308 059 008 | |
 
 Each model's `local_build` block names the script, the version that introduced its recipe and
 whether it is deterministic; `provenance` pins the parent checkpoint (`parent_sha256`,
 `parent_size`). The version written into a blob's metadata is its recipe's, not the script's, so
-an unrelated script change never moves a pinned hash (the int4 bytes are unchanged). The capability is
+an unrelated script change never moves a pinned hash (the int4 and full bytes are unchanged by
+1.2.0, which added fp16, and 1.3.0 / 1.4.0, which rebuilt it). The fp16 recipe (1.4.0) is
+byte-identical from run to run and across `PYTHONHASHSEED` values (checked on Linux); its 1.2.0
+recipe went through ONNX Runtime's optimised-graph writer and gave other bytes on Windows. The capability is
 `RESEARCH_ONLY` and is selected only with `AllowResearchOnly`. The model's tensors, shapes and
 coordinate convention (projective means, unnormalised `wxyz` quaternions, linear-RGB colours)
 are in the pack's `io` block.
@@ -165,16 +187,19 @@ tasks do not include it, and its warm runs no warm-up inference).
 ### Which SHARP build (`MODEL`)
 
 When a pack names two splat models, `defaults["splats-mono"].high` (the full one) and `.low`
-(the small one), setting **`MODEL`** picks between them:
+(the small one), setting **`MODEL`** picks between them; a third model named by `.medium` that has
+a DirectML variant (the SHARP pack's `sharp-fp16-1536`) is a candidate on DirectML only:
 
 | `MODEL` | Model |
 |---|---|
-| `auto` (default) | **full** when the backend the capability is bound to is a GPU (DirectML, OpenVINO's GPU device; Core ML where a pack lists it) **and** the OS reports at least 15 GiB of memory (a "16 GB" machine: firmware and an integrated GPU keep a little) **and**, on DirectML, the adapter has at least 6 GB of dedicated memory; otherwise **int4** (every CPU backend). |
+| `auto` (default) | On **DirectML** (with at least 15 GiB of memory, below): **fp16** when its blob is in the store and the adapter has at least **6 GB** of dedicated memory (an estimate: half the fp32 model's measured use plus a desktop); else **full** with at least **9 GB** (a "10 GB" card reports about 10 050 MB) (measured, [below](#directml-measured-and-diagnosed)); else **int4** (which never runs on DirectML, so DirectML is not chosen). On any other GPU backend (OpenVINO's GPU device; Core ML where a pack lists it): **full** when the OS reports at least 15 GiB of memory (a "16 GB" machine: firmware and an integrated GPU keep a little). Otherwise **int4** (every CPU backend). |
 | `full` | always the full model |
+| `fp16` | the fp16 model on DirectML; the full model anywhere else |
 | `int4` | always the small model |
 
 `auto` chooses only among the models whose blobs are in the model store: when the preferred one
-is absent and the other is present it uses the other and says so (an INFO line and the
+is absent and another is present (fp16, then full, then int4; fp16 only on DirectML) it uses that
+one and says so (an INFO line and the
 capability's ready detail, `… is not in the store; using …`); when neither is present it names
 the preferred one, which reports that it needs its local build (`ABSENT`, as before). A forced
 `MODEL` whose blob is absent fails with that reason (`MODEL=full, but it is not in the model
@@ -236,17 +261,19 @@ described machines by the `splats-rank` test):
 
 | Machine | Backend | `MODEL=auto` |
 |---|---|---|
-| Windows, a **discrete non-Intel** GPU (NVIDIA / AMD, ≥ 2 GB dedicated; the one with the most VRAM), ≥ 16 GB RAM, ≥ 6 GB VRAM | **DirectML** on that adapter (`onnxruntime-dml`) | full |
+| Windows, a **discrete non-Intel** GPU (NVIDIA / AMD, ≥ 2 GB dedicated; the one with the most VRAM), ≥ 16 GB RAM, and ≥ 6 GB VRAM with `sharp-fp16-1536` built, or ≥ 9 GB VRAM | **DirectML** on that adapter (`onnxruntime-dml`) | fp16 when built, else full |
 | otherwise, OpenVINO's GPU device is an **Intel Arc / Xe-class** GPU (discrete, named Arc, matrix units, GPU IP ≥ 12.55, or an Iris Xe) | OpenVINO GPU (`openvino-gpu`) | full with ≥ 16 GB RAM, else int4 |
 | otherwise (an NVIDIA / AMD card that OpenVINO reaches through OpenCL, a UHD-class iGPU, no GPU) | OpenVINO CPU (`openvino-cpu`) | int4 |
 | no OpenVINO (macOS) | ONNX Runtime CPU (`onnxruntime-cpu`) | int4 |
 
-- **DirectML serves the full model only.** The int4 build's 4-bit weights are ONNX Runtime's
-  `MatMulNBits` contrib operator, which is not verified on the DirectML execution provider (an
-  operator DirectML does not take would run on the CPU inside the same session, with a copy each
-  way). The SHARP pack therefore lists `dml` for `sharp-full-1536` only: `EP=auto` ranks DirectML
-  first only when the full model is what would run there, and `MODEL=int4` with `EP=dml` runs the
-  int4 build on the CPU, saying so.
+- **DirectML serves the full and fp16 models only.** The int4 build's 4-bit weights are ONNX
+  Runtime's `MatMulNBits` contrib operator, which is not verified on the DirectML execution
+  provider (an operator DirectML does not take would run on the CPU inside the same session, with a
+  copy each way). The SHARP pack therefore lists `dml` for `sharp-full-1536` and
+  `sharp-fp16-1536` only: `EP=auto` ranks DirectML first only when one of them is what would run
+  there, and `MODEL=int4` with `EP=dml` runs the int4 build on the CPU, saying so. The ranking
+  runs at probe: build `sharp-fp16-1536` and the next provider start (the service's next
+  conversion-host spawn) takes it.
 - **OpenVINO's GPU device is decided after OpenVINO loads** (its first warm lists the devices with
   `FULL_DEVICE_NAME`, `DEVICE_TYPE`, `DEVICE_ARCHITECTURE`, `GPU_EXECUTION_UNITS_COUNT`,
   `OPTIMIZATION_CAPABILITIES`). Before that, probe describes `openvino-gpu` provisionally; a GPU
@@ -259,9 +286,16 @@ described machines by the `splats-rank` test):
   of any vendor and `cpu` its CPU device, whenever OpenVINO serves the capability; it does not by
   itself select OpenVINO over DirectML (use `EP=openvino` for that). `MODEL=full|int4` is honoured
   on every backend.
-- **Fallbacks:** DirectML that cannot start, runs out of memory or fails a run drops out for the
-  process and the capability re-ranks without it (OpenVINO, else ONNX Runtime CPU); OpenVINO GPU →
-  OpenVINO CPU → ONNX Runtime CPU as before. Each step re-describes the capability.
+- **Fallbacks:** when the **fp16** model fails on DirectML for a reason of its own (it will not
+  load, a wrong output type; not out of memory, not a lost device), only the fp16 model drops out
+  for the process: DirectML keeps the full model when the adapter has the 9 GB it needs. Otherwise
+  DirectML that cannot start, runs out of memory or fails a run drops out for the process and the
+  capability re-ranks without it (OpenVINO, else ONNX Runtime CPU). On Windows the OpenVINO GPU
+  device is a candidate only when a DXGI adapter is an Intel GPU that is not UHD / HD Graphics
+  class: a machine whose only Intel adapter is a UHD 770 (or that has none) goes straight to
+  OpenVINO's CPU device (`MODEL=auto`: int4), never a provisional GPU pick that would compile the
+  full model first. OpenVINO GPU → OpenVINO CPU → ONNX Runtime CPU as before. Each step
+  re-describes the capability.
 - **No silent choice.** One line per ranking on stderr (the runtime's provider log), e.g.
 
   ```
@@ -274,6 +308,52 @@ described machines by the `splats-rank` test):
 
   The capability's `backend` (`displayxr-cli conv list`) and every result's build stamp name the
   backend that answered; `luid` is the DirectML adapter's.
+
+### DirectML: measured, and diagnosed
+
+One measurement so far (a desktop RTX 3080, 10 GB, Windows, ONNX Runtime 1.24.4 + DirectML
+1.15.4 as shipped): `sharp-full-1536` on a 3840×2160 photo (1 179 648 Gaussians) took **42.3 s**
+for the first job and **35.2 s** for the next, and raised the card's dedicated memory by
+**6.1 GB** over idle, to 8.9 of 10 GB with a desktop running. The same job runs in 6-13 s
+end to end (2.3-2.7 s of it inference) on OpenVINO's GPU device on an Intel Arc iGPU, and the
+model's authors report well under a second on a standard GPU. So DirectML was 10-30× slower than
+it should be. What the graph rules out: the export has 5 314 nodes, 2 375 of them `Constant` and most of
+the rest the traced attention's shape arithmetic (`Shape` → `Slice` → `Cast` → `Sqrt`, per
+block); ONNX Runtime folds that at load (basic level: 2 504 nodes left, all standard ONNX
+operators: Gemm / MatMul, Softmax, LayerNormalization, Erf, Conv, ConvTranspose,
+InstanceNormalization, Resize linear, Slice / Reshape / Transpose / Concat / Split and a few
+element-wise ops), every one of which the DirectML EP implements; no `NonZero`, `ScatterND`,
+`GatherND`, `TopK`, `GridSample` or `Einsum`, no dynamic shape (the input is fixed), and no
+tensor over 1.2 GB (DirectML's limit is 4 GB). So no CPU fallback is expected. The leading
+explanation is memory: 6.1 GB on a 10 GB card that a desktop already uses is at or over the
+budget Windows gives one process, and what does not fit is kept in system memory, read over
+PCIe at a few percent of the card's bandwidth, which is the size of the slowdown seen. Hence
+the floors (full fp32 ≥ 9 GB, fp16 ≥ 6 GB) and the fp16 build. Confirmed with the lines below:
+the all-fp16 build (export_sharp.py 1.4.0) runs the same photo on the same card in about 1.2 s
+of inference at 5.6 GB dedicated, within the budget (about 2 s for the whole job).
+
+Every DirectML splat session and job now logs this process's memory on the adapter (DXGI
+`QueryVideoMemoryInfo`: dedicated use and budget, shared use) after the load and before / after
+each run, plus a warning when the run ends over the budget or grew shared memory by more than
+256 MB:
+
+```
+[open-conversion] sharp-full-1536: loaded on DirectML in 5210 ms; GPU memory: 2731 MB dedicated (budget 6900 MB), 210 MB shared
+[open-conversion] sharp-full-1536: GPU memory before the run: ...; after: ...
+[open-conversion] sharp-full-1536: over the GPU memory budget: Windows keeps part of the model in system memory, which can make a run many times slower (the fp16 model needs half)
+```
+
+Setting **`DIAG_PROFILE=1`** adds, for the splat capability on ONNX Runtime (DirectML or CPU):
+ONNX Runtime's node placement after its graph optimisation, counted per execution provider and
+operator (`... N of M nodes on the CPU EP; DmlExecutionProvider: ... (DmlFusedNode k, MemcpyToHost
+1, ...); CPUExecutionProvider: ...`); each job runs the model **twice** and logs both times (the
+first pays DirectML's first-run allocation and compilation; `infer` is the second); and for the
+first job a profiling JSON (`<scratch dir>/splats-profile_<time>.json`, the path is logged) with a
+one-line summary of the second run: both run times and the top-10 operators by time, per
+provider. On DirectML a node's time is its CPU-side recording unless the queue is full, so the
+GPU's own time collects in the node that waits for it (`MemcpyToHost`): a large `MemcpyToHost`
+with every node on DirectML says the GPU itself is slow (memory), CPU-placed nodes with big
+times say a fallback.
 
 ## OpenVINO (the splat capability's GPU path)
 
@@ -355,7 +435,7 @@ and better, so it is the default there; on the CPU the int4 build is the faster,
 Research-only weights are **never bundled, mirrored or pre-fetched** (ADR-057 §5), and the
 installers download no model. A SHARP pack's blob is built on the user's machine from Apple's
 official checkpoint by `scripts/export_sharp.py` (it downloads the checkpoint, verifies its
-SHA-256, exports it, keeps it fp32 and / or 4-bit-quantises it, and writes the bytes the pack
+SHA-256, exports it, keeps it fp32, 4-bit-quantises it or converts it to fp16, and writes the bytes the pack
 pins into the model store);
 see that script for its requirements and the licence it asks you to accept. A pack whose model has
 a downloadable source is fetched the usual way, `displayxr-cli conv models fetch <pack>
@@ -504,11 +584,14 @@ protocol, without network.
 | `splats-tiny-model` | writes a tiny synthetic splat model with the real I/O contract, its pack and the expected output (`tests/make_tiny_splat_model.py`; needs the `onnx` Python package, skipped without it) | no |
 | `splats-cpu` | the splat lane on ONNX Runtime's CPU EP: download → `READY`, three jobs (focal given: every sampled Gaussian equals an independent numpy unprojection; no focal: `ASSUMED` 30 mm equivalent; a SOG request: refused, the cap stays `READY`), PLY header + count, facts, build stamp | no |
 | `splats-openvino-cpu` | the same on OpenVINO's CPU device (no GPU needed), backend `openvino-cpu` | no |
-| `splats-rank` | the splat backend ranking on described machines (Intel UHD + RTX 3080 Laptop; RTX 3080 desktop, no iGPU; Intel Arc iGPU only; AMD APU + discrete Radeon; a 4 GB card; no GPU) and every explicit setting: backend, adapter, model, fallback line | no |
-| `splats-pick-auto-cpu` | a two-model pack (`tiny-full` = high, `tiny-int4` = low) on the CPU: `MODEL=auto` picks `tiny-int4` | no |
+| `splats-rank` | the splat backend ranking on described machines (Intel UHD + RTX 3080 Laptop; RTX 3080 desktop, no iGPU; Intel Arc iGPU only; AMD APU + discrete Radeon; a 4 GB card; an 8 GB card; a 10 GB card reporting 10 240 and 10 067 MB; no GPU), with and without an fp16 model in the pack / in the store, and every explicit setting: backend, adapter, model, fallback line | no |
+| `diag-profile-parse` | the `DIAG_PROFILE` parsers on text in ONNX Runtime's formats: the node placement report (per EP and operator, fused partitions counted as one operator) and the profiling JSON (the last `model_run`'s kernel times by operator and provider) | no |
+| `splats-diag-profile` | `DIAG_PROFILE=1` on the CPU EP: the placement line, two runs per job and the profile summary line, end to end | no |
+| `splats-pick-auto-cpu` | a three-model pack (`tiny-full` = high, `tiny-int4` = low, `tiny-fp16` = medium with a DirectML variant only) on the CPU: `MODEL=auto` picks `tiny-int4`, never `tiny-fp16` | no |
 | `splats-pick-full-external-data` | `MODEL=full`: `tiny-full`, stored as a graph + an external-data file named by its sha256, downloads both files and runs (the full SHARP layout) | no |
 | `splats-pick-fallback` | the store holds only `tiny-full`, downloads off: `auto` (int4 on a CPU) takes `tiny-full` and says so | no |
 | `splats-pick-slow-verify` | the same store, re-verified by the host for 7 s (longer than the 5 s request grace; the runtime's store re-hashes a stored blob once per process): the provider waits through `WARMING`, then runs | no |
+| `splats-pick-fp16-off-dml` | the pack also names `tiny-fp16` (`defaults.medium`, a DirectML variant only, the SHARP fp16 shape): `MODEL=fp16` off DirectML takes `tiny-full` | no |
 | `splats-pick-forced-absent` | the same store, `MODEL=int4`: `ABSENT` with the reason, never switched to `tiny-full` | no |
 | `splats-pick-full-openvino-cpu` | `MODEL=full` on OpenVINO's CPU device: OpenVINO finds the external data the same way | no |
 | `splats-default-ep` (`-DOPENCONV_TEST_GPU=ON -DOPENCONV_TEST_SPLAT_MODEL=<.onnx> [-DOPENCONV_TEST_SPLAT_IMAGE=<.ppm>]`) | a real splat model you built yourself, on the default backend (OpenVINO GPU where there is one); nothing is fetched | yes (yours) |
@@ -544,13 +627,14 @@ environment, else `Settings\<KEY>` under the registry row (Windows) or the manif
 | `EP` | `auto` (default), `cpu`, `dml`, `coreml`, `openvino` | `cpu` forces the CPU execution provider; for depth `auto` = DirectML on Windows, Core ML on macOS (each falls back to the CPU); for the splat capability `auto` = DirectML on a discrete non-Intel GPU, else OpenVINO's Intel Arc / Xe GPU, else OpenVINO's CPU device, else ONNX Runtime's CPU EP ([details](#where-splats-mono-runs-ep-ov_device)); `openvino` forces OpenVINO for it (the depth capabilities never use OpenVINO) |
 | `OV_DEVICE` | `auto` (default), `gpu`, `cpu` | OpenVINO's device whenever OpenVINO serves the splat capability (`auto` = an Intel Arc / Xe-class GPU, never an NVIDIA / AMD / UHD-class one, else the CPU; `gpu` = its GPU device, any vendor); it does not select OpenVINO over DirectML |
 | `OV_CACHE` | `0` | no OpenVINO compiled-model cache, even when the host provides a scratch directory |
-| `MODEL` | `auto` (default), `full`, `int4` | the splat model when a pack names two: `full` = `defaults["splats-mono"].high`, `int4` = `.low`; `auto` = full on a GPU backend with ≥ 16 GB of memory (DirectML: and ≥ 6 GB of VRAM), else int4, among the models in the store ([details](#which-sharp-build-model)) |
+| `MODEL` | `auto` (default), `full`, `fp16`, `int4` | the splat model when a pack names two or three: `full` = `defaults["splats-mono"].high`, `int4` = `.low`, `fp16` = `.medium` on DirectML (elsewhere it means full); `auto` = on DirectML fp16 when built (≥ 6 GB VRAM), else full (≥ 10 GB VRAM); full on another GPU backend; ≥ 16 GB of memory for either; else int4; among the models in the store ([details](#which-sharp-build-model)) |
 | `OPENVINO` | absolute path | another OpenVINO runtime folder (default: `openvino/` next to the binary) |
 | `COREML_UNITS` | `gpu` (default), `all`, `ane`, `cpu` | macOS: the Core ML compute units (CPU + GPU, + the Neural Engine, CPU + Neural Engine, CPU only) |
 | `COREML_CACHE` | `0` | macOS: no compiled-model cache, even when the host provides a scratch directory |
 | `ORT_LOG` | `warning` (default), `info`, `verbose` | how much of ONNX Runtime's log is printed (`verbose` shows the Core ML node assignment) |
 | `THREADS` | integer (default 4) | CPU intra-op threads; 0 = ONNX Runtime's default (every core) |
 | `GRAPH_OPT` | `basic`, `extended` (default), `all` | ONNX Runtime graph optimisation (`all` fails to load the fp16 still-depth model on the CPU execution provider of 1.24.4) |
+| `DIAG_PROFILE` | `1` | splat diagnostics on ONNX Runtime: node placement per execution provider, two runs per job with both times, and the first job's profile JSON in the scratch directory with a top-10 operator line ([details](#directml-measured-and-diagnosed)) |
 | `PACK` | absolute paths, `;`-separated | the pack manifests (default: `dxr-open-default.models.json` and every other `*.models.json` next to the binary) |
 | `ONNXRUNTIME` | absolute path | another ONNX Runtime library (default: next to the binary) |
 
@@ -565,7 +649,15 @@ A `vX.Y.Z` tag builds and attaches (unsigned):
   (ADR-054 N4b: the runtime's provenance gate enforces on Windows and refuses an unsigned,
   non-allowlisted component — 0.1.0 shipped without the row and was never loaded). It downloads
   no model; the runtime model store fetches blobs by URL and SHA-256 on first use. The uninstaller
-  removes only this provider's row, its allowlist row and files, never the model store.
+  removes only this provider's row, its allowlist row and files, never the model store. It does
+  **not** stop or start `displayxr-service`, by the runtime's installer contract (discovery spec
+  §3.8): the provider runs in its own `displayxr-conversion-host`, which the service respawns from
+  the new binary once the row's `Version` changes and the maintenance mutex is released
+  (§3.8.1). A host still mapping the old DLL makes the file copy fail, which aborts the install
+  (`AllowSkipFiles off`); closing it with Restart Manager first, as the Leia conversion
+  installer does, is not done yet. If `displayxr-cli conv list` still shows the old version
+  after an install, restarting the service (non-elevated: `explorer.exe "<runtime>\displayxr-service.exe"`)
+  is the workaround; please report it with the service log.
 - `displayxr-open-conversion-<version>-linux-x86_64.tar.gz` (CPU, + OpenVINO for the splat
   capability): `install.sh` copies the payload (including `openvino/`) to
   `${XDG_DATA_HOME:-~/.local/share}/DisplayXR/OpenConversion` and writes the JSON manifest, whose

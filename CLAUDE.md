@@ -14,14 +14,22 @@ views from them; this repo never declares `VIEWS_*`. A third, `SPLATS_MONO` (ADR
 photo → 3DGS PLY), serves whatever model a pack names for `splats-mono` (none in the default
 pack; a research-only model is its own pack) on the backend `src/oc_rank.c` ranks (a pure
 function, unit-tested by `tests/rank_test.c`): ONNX Runtime + DirectML on a discrete non-Intel
-GPU (Windows; full model only), else OpenVINO's GPU device only when it is an Intel Arc /
+GPU (Windows; full or fp16 model), else OpenVINO's GPU device only when it is an Intel Arc /
 Xe-class GPU (Linux x86_64 and Windows x64; decided once OpenVINO has listed its devices), else
 OpenVINO's CPU device, else ONNX Runtime's CPU EP; explicit `EP` / `OV_DEVICE` / `MODEL` win, and
-one stderr line says what it resolved to and why. Setting `MODEL` (`auto` | `full` | `int4`) picks
+one stderr line says what it resolved to and why. A failure of the fp16 model of its own (load,
+output type) drops only that model (DirectML keeps full with ≥ 9 GB); any other DirectML failure
+drops DirectML. On Windows OpenVINO's GPU device is never picked provisionally unless a DXGI
+adapter is an Intel GPU outside the UHD / HD Graphics class (`oc_rank_dxgi_rules_out_ov_gpu`). Setting `MODEL` (`auto` | `full` | `int4`) picks
 between the pack's full model (`defaults["splats-mono"].high`) and its small one (`.low`):
-`auto` = full when the bound backend is a GPU (OpenVINO GPU, DirectML with ≥ 6 GB VRAM, Core ML)
-and the OS reports ≥ 15 GiB of RAM (a "16 GB" machine), else int4 — and only among the models
-whose blobs are in the store (`pick_splat_model_locked`, re-picked at every warm).
+`auto` = full when the bound backend is a GPU (OpenVINO GPU, DirectML with ≥ 9 GB VRAM, Core ML)
+and the OS reports ≥ 15 GiB of RAM (a "16 GB" machine), else int4; on DirectML the pack's fp16 model
+(`defaults["splats-mono"].medium`, DirectML variant only, `MODEL=fp16`) comes first when its blob is
+in the store and the adapter has ≥ 6 GB (`oc_rank_auto_model`) — and only among the models whose
+blobs are in the store (`pick_splat_model_locked`, re-picked at every warm). Setting `DIAG_PROFILE=1`
+logs ONNX Runtime's node placement, runs each splat job twice and writes a profile JSON with a
+top-10 operator line (`src/oc_profile.{c,h}`, pure parsers unit-tested by `tests/profile_test.c`);
+every DirectML splat job logs DXGI memory use and budget.
 
 **Public repository.** No internal data anywhere (code, comments, commit messages, docs): no
 dataset names or paths, no internal measurements, no vendor-module internals, no product or
@@ -44,6 +52,8 @@ re-upload of a model (exports are built from the official checkpoint by our own 
 - `src/oc_rank.{c,h}` — the splat capability's backend ranking (DXGI adapters + OpenVINO GPU
   devices + settings → backend, adapter / device, model), a pure function; `oc_dxgi_list_adapters`
   (oc_ort.c) and `oc_ov_list_gpus` (oc_ov.c) feed it.
+- `src/oc_profile.{c,h}` — `DIAG_PROFILE`: parses ONNX Runtime's node placement report and its
+  profiling JSON (pure functions, `tests/profile_test.c`).
 - `src/oc_splat.{c,h}` — the splat capability's CPU work: the antialiased resample into the
   model's grid, the unprojection + covariance re-diagonalisation, the 3DGS PLY writer, the focus
   suggestion. `src/oc_tensor.h` — the named-tensor I/O both back ends share.
@@ -59,14 +69,17 @@ re-upload of a model (exports are built from the official checkpoint by our own 
 - `packs/dxr-open-default.models.json` — the default pack. `packs/dxr-open-sharp.models.json` — the
   research-only SHARP splat models, `local_build` (never downloaded: the user builds the blobs with
   `scripts/export_sharp.py` from the official checkpoint): `sharp-int4-1536` (one 0.58 GB file,
-  `defaults.low`/`.medium`) and `sharp-full-1536` (fp32: a 6 MB graph + one 2.6 GB external-data
-  file the graph names by its sha256, `defaults.high`). `tests/packs/` — test packs.
+  `defaults.low`), `sharp-fp16-1536` (DirectML only: shape arithmetic folded in Python, all-float16 except the
+  converter's default block list (Resize), fp32 I/O (checked), a 3.7 MB graph + one 1.3 GB data file,
+  `defaults.medium`; no ONNX Runtime step in its recipe: ORT's saved optimised graph is not the
+  same bytes on Windows and Linux) and `sharp-full-1536` (fp32: a 6 MB
+  graph + one 2.6 GB external-data file the graph names by its sha256, `defaults.high`). `tests/packs/` — test packs.
 - `scripts/check_model_pack.py` — pack validator (also the CI guard that no `prefetch` blob is
   non-commercial); `scripts/fetch_models.py` — dev / CI blob download with hash check;
   `scripts/rewrite_video_depth_coreml.py` — rebuilds the video-depth blobs for Core ML (scalar
   `Gather` → `Slice` + `Squeeze`), from the pack's blobs by sha256 (needs `onnx`).
 - `scripts/export_sharp.py` (+ `scripts/requirements-export-sharp.txt`, pinned) — builds the SHARP
-  blobs (`--variant int4|full|both`; default = what this machine's `MODEL=auto` would pick) from
+  blobs (`--variant int4|full|fp16|both`; default = what this machine's `MODEL=auto` would pick; fp16 never) from
   Apple's official checkpoint (hash-pinned, refuses any other) and writes them into the model
   store. Both outputs are byte-deterministic. The version written into a blob's metadata is its
   recipe's (`VARIANTS`), not `SCRIPT_VERSION`, so an unrelated script change never moves a pinned

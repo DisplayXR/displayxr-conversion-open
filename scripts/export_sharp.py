@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: BSL-1.0
 """Build the local SHARP (image -> Gaussian splats) ONNX models from Apple's official checkpoint.
 
-    export_sharp.py --accept-research-license [--variant int4|full|both] [--checkpoint FILE]
+    export_sharp.py --accept-research-license [--variant int4|full|fp16|both] [--checkpoint FILE]
                     [--ml-sharp DIR] [--work DIR] [--store DIR | --no-store] [--keep-fp32]
                     [--check IMAGE]
 
@@ -31,6 +31,16 @@ What it does, in order:
      symmetric): only the weights of MatMul nodes with a constant weight become 4-bit
      (com.microsoft MatMulNBits); Conv weights, every other weight and every activation stay
      fp32. One self-contained .onnx file (about 0.58 GB).
+   - `fp16` (`sharp-fp16-1536`, DirectML only): the fp32 export with its static shape
+     arithmetic folded first (in Python, exactly-defined operators only: see fold_static), then
+     converted to float16 (onnxconverter-common) with fp32 inputs and outputs (checked: every
+     graph input and output keeps the fp32 model's type). The whole graph runs in fp16 except
+     onnxconverter-common's default block list (Resize, Range, Min / Max, CumSum, ...): the
+     full-resolution convolutions of the decoders and the heads are where the time and the
+     memory are, and keeping any of them fp32 costs about 2.6x on DirectML. Graph + one
+     external-data file named by its SHA-256, like `full` (about 1.3 GB). Half the GPU memory
+     of `full`. No ONNX Runtime step: its optimised-graph output is not the same bytes on
+     every OS.
    The fp32 intermediate is deleted unless --keep-fp32.
 5. Writes the result into the DisplayXR model store (blobs/<sha256> plus its .ok stamp, the
    store's own write protocol; for `full` the data file first, the graph last), so the
@@ -68,7 +78,7 @@ import sys
 import tempfile
 import urllib.request
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.4.0"
 
 # The official checkpoint (Apple, research-only). Same bytes as Apple's CDN copy.
 CHECKPOINT_NAME = "sharp_2572gikvuh.pt"
@@ -94,7 +104,19 @@ PACK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pack
 VARIANTS = {
     "int4": ("sharp-int4-1536", "1.0.0"),
     "full": ("sharp-full-1536", "1.1.0"),
+    "fp16": ("sharp-fp16-1536", "1.4.0"),
 }
+# fp16: static shape arithmetic is folded in Python (fold_static) before the conversion, with
+# operators whose result is exactly defined (integer arithmetic, IEEE + - * / sqrt, data
+# movement): no ONNX Runtime graph optimiser, whose saved graph is not the same bytes on every
+# OS, and no transcendental functions, whose last bit depends on the C library.
+FOLD_OPS = frozenset((
+    "Shape", "Constant", "Identity", "Cast", "Slice", "Gather", "Concat", "Unsqueeze", "Squeeze",
+    "Reshape", "Expand", "ConstantOfShape", "Range", "Transpose", "Tile", "Where", "Equal", "Less",
+    "Greater", "LessOrEqual", "GreaterOrEqual", "Not", "And", "Or", "Add", "Sub", "Mul", "Div",
+    "Mod", "Neg", "Abs", "Floor", "Ceil", "Sqrt", "Reciprocal", "Min", "Max",
+))
+FOLD_MAX_ELEMENTS = 4096  # shape arithmetic, never a weight or an activation
 STORE_OWNER_MARKER = "displayxr-runtime.owner"
 GPU_RAM_FLOOR_GB = 16  # the provider's MODEL=auto rule: full needs a GPU and this much memory
 
@@ -296,20 +318,16 @@ def quantize_int4(fp32_path, out_path, provenance):
     return out_path
 
 
-def write_full(fp32_path, out_dir, provenance):
-    """The fp32 export as <sha(graph)> + <sha(data)>: the graph names its one data file by the
-    data's SHA-256, so the two files find each other inside the store's blobs/ directory."""
+def write_split(model, out_dir, label):
+    """@p model as <sha(graph)> + <sha(data)>: the graph names its one data file by the data's
+    SHA-256, so the two files find each other inside the store's blobs/ directory. Consumes
+    @p model (its tensors move into the data file)."""
     import onnx
     from onnx import external_data_helper as edh
 
-    log("writing the full (fp32) model: one graph + one external-data file ...")
     if os.path.isdir(out_dir):
         shutil.rmtree(out_dir)
     os.makedirs(out_dir)
-    model = onnx.load(fp32_path)
-    del model.metadata_props[:]
-    for k, v in provenance.items():
-        model.metadata_props.add(key=k, value=v)
     graph, data = os.path.join(out_dir, "graph.onnx"), os.path.join(out_dir, "weights.data")
     onnx.save_model(model, graph, save_as_external_data=True, all_tensors_to_one_file=True,
                     location=os.path.basename(data), size_threshold=1024, convert_attribute=False)
@@ -329,8 +347,220 @@ def write_full(fp32_path, out_dir, provenance):
     graph_sha, graph_size = sha256_file(graph), os.path.getsize(graph)
     final = os.path.join(out_dir, graph_sha)
     os.replace(graph, final)
-    log(f"full ok: {n} external tensors in one data file ({data_size} bytes), graph {graph_size} bytes")
+    log(f"{label} ok: {n} external tensors in one data file ({data_size} bytes), graph {graph_size} bytes")
     return [("data", os.path.join(out_dir, data_sha), data_sha, data_size), ("model", final, graph_sha, graph_size)]
+
+
+def provenance_for(variant):
+    """The metadata written into @p variant's model (part of its bytes)."""
+    name, recipe = VARIANTS[variant]
+    return {
+        "dxr.model": name,
+        "dxr.converter": f"displayxr-conversion-open scripts/export_sharp.py {recipe}",
+        "dxr.parent.url": CHECKPOINT_URL,
+        "dxr.parent.sha256": CHECKPOINT_SHA256,
+        "dxr.code": f"apple/ml-sharp@{ML_SHARP_COMMIT}",
+        "dxr.license": "apple-amlr (research only) " + LICENSE_URL,
+    }
+
+
+def set_provenance(model, provenance):
+    del model.metadata_props[:]
+    for k, v in provenance.items():
+        model.metadata_props.add(key=k, value=v)
+
+
+def write_full(fp32_path, out_dir, provenance):
+    """The fp32 export as one graph + one external-data file (write_split)."""
+    import onnx
+
+    log("writing the full (fp32) model: one graph + one external-data file ...")
+    model = onnx.load(fp32_path)
+    set_provenance(model, provenance)
+    return write_split(model, out_dir, "full")
+
+
+def fold_static(model, base_dir):
+    """Fold @p model's static shape arithmetic in place, in Python: every node of FOLD_OPS whose
+    inputs are all known (small initializers, small Constants, the Shape of a tensor whose shape
+    shape inference fixed) and whose outputs have at most FOLD_MAX_ELEMENTS elements is
+    evaluated with ONNX's reference implementation and replaced by initializers named after its
+    outputs. The traced attention computes its scale as Shape -> Slice -> Cast -> Sqrt per block;
+    a float16 copy of that arithmetic has no CPU kernel to fold it at load time. Every step is
+    a function of the graph alone (node order in, node order out): no hash order, no ONNX
+    Runtime, no transcendental, so the bytes are the same on every OS. Returns the folded
+    node count."""
+    import itertools
+
+    import numpy as np
+    import onnx
+    from onnx import helper, numpy_helper
+    from onnx.reference import ReferenceEvaluator
+
+    g = model.graph
+    shapes = {}
+    for v in itertools.chain(g.input, g.value_info, g.output):
+        dims = v.type.tensor_type.shape.dim
+        if v.type.tensor_type.HasField("shape") and all(d.HasField("dim_value") for d in dims):
+            shapes[v.name] = [d.dim_value for d in dims]
+    for t in g.initializer:
+        shapes[t.name] = list(t.dims)
+
+    def numel(name):
+        s = shapes.get(name)
+        return None if s is None else int(np.prod(s, dtype=np.int64))
+
+    known = {}
+    for t in g.initializer:
+        if numel(t.name) <= FOLD_MAX_ELEMENTS:
+            known[t.name] = numpy_helper.to_array(t, base_dir)
+    opset = [o for o in model.opset_import if o.domain in ("", "ai.onnx")]
+    folded = []
+    for node in g.node:
+        if node.op_type not in FOLD_OPS or node.domain not in ("", "ai.onnx"):
+            continue
+        ins = [x for x in node.input if x]
+        if node.op_type == "Shape":
+            s = shapes.get(node.input[0])
+            if s is None:
+                continue
+            a = {at.name: at.i for at in node.attribute}
+            start, end = a.get("start", 0), a.get("end", len(s))
+            outs = [np.array(s[slice(start, end)], dtype=np.int64)]
+        else:
+            if any(x not in known for x in ins):
+                continue
+            if node.op_type == "Constant" and any(
+                    at.type == onnx.AttributeProto.TENSOR and (int(np.prod(at.t.dims, dtype=np.int64)) > FOLD_MAX_ELEMENTS
+                                                              or at.t.data_location == onnx.TensorProto.EXTERNAL)
+                    for at in node.attribute):
+                continue  # a weight, not shape arithmetic
+            if node.op_type != "Constant" and any(numel(o) is None or numel(o) > FOLD_MAX_ELEMENTS
+                                                  for o in node.output):
+                continue
+            one = helper.make_graph(
+                [node], "fold",
+                [helper.make_tensor_value_info(x, helper.np_dtype_to_tensor_dtype(known[x].dtype),
+                                               known[x].shape) for x in dict.fromkeys(ins)],
+                [helper.make_tensor_value_info(o, onnx.TensorProto.UNDEFINED, None) for o in node.output])
+            outs = ReferenceEvaluator(helper.make_model(one, opset_imports=opset)).run(
+                None, {x: known[x] for x in dict.fromkeys(ins)})
+            outs = [np.asarray(o) for o in outs]
+            if any(o.size > FOLD_MAX_ELEMENTS for o in outs):
+                continue
+        for o, v in zip(node.output, outs):
+            known[o] = v
+        folded.append(node)
+    if not folded:
+        return 0
+    gone = {id(n) for n in folded}
+    kept = [n for n in g.node if id(n) not in gone]
+    used = set(itertools.chain.from_iterable(n.input for n in kept)) | {o.name for o in g.output}
+    produced = [o for n in folded for o in n.output if o in used]
+    old_inits = [t for t in g.initializer if t.name in used]
+    del g.node[:]
+    g.node.extend(kept)
+    del g.initializer[:]
+    g.initializer.extend(old_inits)
+    g.initializer.extend(numpy_helper.from_array(known[o], o) for o in produced)
+    stale = set(produced)
+    vis = [v for v in g.value_info if v.name not in stale and v.name in used]
+    del g.value_info[:]
+    g.value_info.extend(vis)
+    return len(folded)
+
+
+def io_types(model):
+    return {v.name: v.type.tensor_type.elem_type for v in list(model.graph.input) + list(model.graph.output)}
+
+
+def convert_fp16(fp32_path, work, out_dir, provenance):
+    """fp32 export -> fold_static -> float16 (fp32 I/O; only onnxconverter-common's default block
+    list stays fp32) -> write_split."""
+    import onnx
+    from onnx import external_data_helper as edh
+    from onnx import shape_inference
+    from onnxconverter_common import float16
+
+    log("folding the static shape arithmetic, converting to float16 ...")
+    fp32_dir = os.path.dirname(os.path.abspath(fp32_path))
+    # Shape inference on the graph alone (protobuf cannot serialise > 2 GB), then the weights.
+    model = shape_inference.infer_shapes(onnx.load(fp32_path, load_external_data=False))
+    want_io = io_types(model)
+    nfold = fold_static(model, fp32_dir)
+    edh.load_external_data_for_model(model, fp32_dir)
+    block_ops = set(float16.DEFAULT_OP_BLOCK_LIST)
+    blocked = [n.name for n in model.graph.node if n.op_type in block_ops]
+    # An initializer shared by an fp32 node and a converted one would stay fp32 for both
+    # (onnxconverter-common keeps any initializer a blocked node reads): give the fp32 nodes a copy.
+    blocked_set = set(blocked)
+    inits = {i.name: i for i in model.graph.initializer}
+    users = {}
+    for n in model.graph.node:
+        for k, x in enumerate(n.input):
+            if x in inits:
+                users.setdefault(x, []).append((n, k))
+    split = 0
+    for name in sorted(users):
+        us = users[name]
+        if len({n.name in blocked_set for n, _ in us}) == 2 and inits[name].data_type == onnx.TensorProto.FLOAT:
+            copy = onnx.TensorProto()
+            copy.CopyFrom(inits[name])
+            copy.name = name + "__fp32"
+            model.graph.initializer.append(copy)
+            for n, k in us:
+                if n.name in blocked_set:
+                    n.input[k] = copy.name
+            split += 1
+    del inits, users
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # one "value truncated" line per clipped tiny weight
+        model = float16.convert_float_to_float16(model, keep_io_types=True, disable_shape_infer=True,
+                                                 op_block_list=list(float16.DEFAULT_OP_BLOCK_LIST))
+    g = model.graph
+    # A graph output produced by a blocked (fp32) node: onnxconverter-common's cast-after-blocked
+    # pass walks graph.output too, so it retypes that output to float16 and appends a Cast to it,
+    # although keep_io_types promised fp32. Undo: the producer writes the output again, in fp32.
+    producer = {o: n for n in g.node for o in n.output}
+    consumers = {x for n in g.node for x in n.input}
+    for out in g.output:
+        if out.type.tensor_type.elem_type == want_io[out.name]:
+            continue
+        cast = producer.get(out.name)
+        src = cast.input[0] if cast is not None and cast.op_type == "Cast" else None
+        up = producer.get(src)
+        if up is None or out.name in consumers:
+            fail(f"fp16: output {out.name} became type {out.type.tensor_type.elem_type} and cannot be restored")
+        up.output[list(up.output).index(src)] = out.name
+        g.node.remove(cast)
+        for v in [v for v in g.value_info if v.name == src]:
+            g.value_info.remove(v)
+        out.type.tensor_type.elem_type = want_io[out.name]
+    # onnxconverter-common retypes a Cast's output to float16 but can leave its 'to' at float
+    # (value_info only: a graph output keeps the type keep_io_types gave it).
+    outputs = {o.name for o in g.output}
+    vi = {v.name: v for v in g.value_info}
+    for n in g.node:
+        if n.op_type == "Cast" and n.output[0] not in outputs:
+            v = vi.get(n.output[0])
+            for a in n.attribute:
+                if (a.name == "to" and a.i == onnx.TensorProto.FLOAT and v is not None
+                        and v.type.tensor_type.elem_type == onnx.TensorProto.FLOAT16):
+                    a.i = onnx.TensorProto.FLOAT16
+    got_io = io_types(model)
+    if got_io != want_io:
+        bad = {k: (want_io.get(k), v) for k, v in got_io.items() if want_io.get(k) != v}
+        fail(f"fp16: graph inputs/outputs changed type (name: (fp32 model, fp16 model)): {bad}")
+    n16 = sum(1 for i in g.initializer if i.data_type == onnx.TensorProto.FLOAT16)
+    n32 = sum(1 for i in g.initializer if i.data_type == onnx.TensorProto.FLOAT)
+    log(f"fp16: {nfold} static nodes folded; {len(blocked)} nodes kept fp32 (default block list: "
+        f"{', '.join(sorted({n.op_type for n in g.node if n.name in set(blocked)}))}), "
+        f"{split} shared initializers split, {n16} fp16 / {n32} fp32 "
+        f"initializers, {sum(1 for n in g.node if n.op_type == 'Cast')} Cast nodes; inputs and outputs fp32")
+    set_provenance(model, provenance)
+    return write_split(model, out_dir, "fp16")
 
 
 # ---------------------------------------------------------------------------- machine
@@ -557,12 +787,24 @@ def check_model(name, model_path, inputs, ref):
 # ---------------------------------------------------------------------------- main
 
 
+def missing_packages(variants):
+    """The pip names of the packages @p variants need that cannot be imported here."""
+    import importlib.util
+
+    need = [("torch", "torch"), ("onnx", "onnx"), ("onnxruntime", "onnxruntime"), ("numpy", "numpy"),
+            ("PIL", "pillow"), ("timm", "timm"), ("onnxscript", "onnxscript")]
+    if "fp16" in variants:
+        need.append(("onnxconverter_common", "onnxconverter-common"))
+    return [pip for mod, pip in need if importlib.util.find_spec(mod) is None]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--accept-research-license", action="store_true",
                     help=f"confirm you accept Apple's research-only model licence ({LICENSE_URL})")
-    ap.add_argument("--variant", choices=["int4", "full", "both"],
-                    help="what to build (default: the variant this machine's provider picks, MODEL=auto)")
+    ap.add_argument("--variant", choices=["int4", "full", "fp16", "both"],
+                    help="what to build (default: the variant this machine's provider picks, MODEL=auto; "
+                         "both = full + int4; fp16 is for DirectML only and is never a default)")
     ap.add_argument("--checkpoint", help=f"the official {CHECKPOINT_NAME} (downloaded into --work when omitted)")
     ap.add_argument("--ml-sharp", help=f"a clean apple/ml-sharp checkout at {ML_SHARP_COMMIT[:12]} (cloned when omitted)")
     ap.add_argument("--work", default=os.path.join(os.path.expanduser("~"), "displayxr-sharp-export"),
@@ -585,13 +827,30 @@ def main():
     else:
         variants = ["full", "int4"] if args.variant == "both" else [args.variant]
 
+    missing = missing_packages(variants)
+    if missing:
+        req = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements-export-sharp.txt")
+        print(f"export_sharp.py {SCRIPT_VERSION} needs Python packages this environment does not have: "
+              f"{', '.join(missing)}.\nInstall the pinned set into this environment (it also fixes the "
+              f"versions the pack's hashes need):\n\n    {sys.executable} -m pip install -r {req}\n",
+              file=sys.stderr)
+        return 2
+
+    import importlib.metadata
+
     import numpy
     import onnx
     import onnxruntime
     import torch
 
+    try:
+        occ = importlib.metadata.version("onnxconverter-common")
+    except importlib.metadata.PackageNotFoundError:
+        occ = "absent"
+
     versions = (f"python {platform.python_version()}, torch {torch.__version__}, onnx {onnx.__version__}, "
-                f"onnxruntime {onnxruntime.__version__}, numpy {numpy.__version__}")
+                f"onnxruntime {onnxruntime.__version__}, onnxconverter-common {occ}, "
+                f"numpy {numpy.__version__}")
     log(f"export_sharp.py {SCRIPT_VERSION}: {versions}")
 
     work = os.path.abspath(args.work)
@@ -616,17 +875,12 @@ def main():
     # variant -> [(role, path, sha256, size)], the model-role file last
     built = {}
     for variant in variants:
-        name, recipe = VARIANTS[variant]
-        provenance = {
-            "dxr.model": name,
-            "dxr.converter": f"displayxr-conversion-open scripts/export_sharp.py {recipe}",
-            "dxr.parent.url": CHECKPOINT_URL,
-            "dxr.parent.sha256": CHECKPOINT_SHA256,
-            "dxr.code": f"apple/ml-sharp@{ML_SHARP_COMMIT}",
-            "dxr.license": "apple-amlr (research only) " + LICENSE_URL,
-        }
+        name = VARIANTS[variant][0]
+        provenance = provenance_for(variant)
         if variant == "full":
             built[variant] = write_full(fp32, os.path.join(work, name), provenance)
+        elif variant == "fp16":
+            built[variant] = convert_fp16(fp32, work, os.path.join(work, name), provenance)
         else:
             path = quantize_int4(fp32, os.path.join(work, f"{name}.onnx"), provenance)
             built[variant] = [("model", path, sha256_file(path), os.path.getsize(path))]

@@ -113,12 +113,60 @@ oc_rank_ov_gpu_ok(const struct oc_ov_gpu *g, char *why, size_t why_size)
 }
 
 bool
+oc_rank_dxgi_rules_out_ov_gpu(const struct oc_dxgi_adapter *adapters, uint32_t count, char *why, size_t why_size)
+{
+	char dummy[8];
+	if (why == NULL) {
+		why = dummy;
+		why_size = sizeof(dummy);
+	}
+	why[0] = '\0';
+	if (adapters == NULL || count == 0) {
+		return false;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		const struct oc_dxgi_adapter *a = &adapters[i];
+		if (!a->software && a->vendor_id == OC_VENDOR_INTEL && !contains_ci(a->name, "UHD") &&
+		    !contains_ci(a->name, "HD Graphics")) {
+			return false;
+		}
+	}
+	snprintf(why, why_size, "no Intel Arc / Xe-class DXGI adapter, so no OpenVINO GPU device worth using");
+	return true;
+}
+
+bool
 oc_rank_auto_full(bool gpu, uint64_t ram_mb, bool dml, uint64_t dml_vram_mb)
 {
 	if (!gpu || ram_mb < OC_FULL_MODEL_MIN_RAM_MB) {
 		return false;
 	}
 	return !dml || dml_vram_mb >= OC_FULL_MODEL_MIN_VRAM_MB;
+}
+
+enum oc_splat_model
+oc_rank_auto_model(bool gpu, uint64_t ram_mb, bool dml, uint64_t dml_vram_mb, bool fp16_ready)
+{
+	if (!gpu || ram_mb < OC_FULL_MODEL_MIN_RAM_MB) {
+		return OC_SM_INT4;
+	}
+	if (!dml) {
+		return OC_SM_FULL;
+	}
+	if (fp16_ready && dml_vram_mb >= OC_FP16_MODEL_MIN_VRAM_MB) {
+		return OC_SM_FP16;
+	}
+	return dml_vram_mb >= OC_FULL_MODEL_MIN_VRAM_MB ? OC_SM_FULL : OC_SM_INT4;
+}
+
+const char *
+oc_rank_model_name(enum oc_splat_model m)
+{
+	switch (m) {
+	case OC_SM_FULL: return "full";
+	case OC_SM_FP16: return "fp16";
+	default: return "int4";
+	}
 }
 
 //! The discrete adapter with the most dedicated memory; -1 = none.
@@ -184,6 +232,15 @@ ov_branch(const struct oc_splat_env *e, struct oc_splat_choice *o, const char *l
 		return;
 	}
 	if (!e->ov_known) {
+		char no_gpu[96];
+		if (oc_rank_dxgi_rules_out_ov_gpu(e->adapters, e->adapter_count, no_gpu, sizeof(no_gpu))) {
+			// Windows: the adapters already say OpenVINO's GPU device would be another
+			// vendor's card or a UHD-class iGPU. Never a provisional GPU pick here: it
+			// would compile the full model before the device check moves it away.
+			o->backend = OC_SB_OV_CPU;
+			snprintf(o->why, sizeof(o->why), "%.140s; %.100s", lead, no_gpu);
+			return;
+		}
 		o->backend = OC_SB_OV_GPU;
 		o->ov_gpu = -1;
 		o->provisional = true;
@@ -209,7 +266,7 @@ ov_branch(const struct oc_splat_env *e, struct oc_splat_choice *o, const char *l
 		const struct oc_ov_gpu *g = &e->ov_gpus[best];
 		o->backend = OC_SB_OV_GPU;
 		o->ov_gpu = best;
-		snprintf(o->why, sizeof(o->why), "%.90s; OpenVINO %.10s '%.80s' (Intel %s, IP %u.%u)", lead, g->device,
+		snprintf(o->why, sizeof(o->why), "%.100s; OpenVINO %.10s '%.80s' (Intel %s, IP %u.%u)", lead, g->device,
 		         g->name,
 		         g->type == OC_OV_GPU_TYPE_DISCRETE     ? "discrete"
 		         : g->type == OC_OV_GPU_TYPE_INTEGRATED ? "integrated"
@@ -218,7 +275,7 @@ ov_branch(const struct oc_splat_env *e, struct oc_splat_choice *o, const char *l
 		return;
 	}
 	o->backend = OC_SB_OV_CPU;
-	snprintf(o->why, sizeof(o->why), "%.90s; %.150s", lead, reject);
+	snprintf(o->why, sizeof(o->why), "%.140s; %.110s", lead, reject);
 }
 
 void
@@ -229,8 +286,10 @@ oc_rank_splat(const struct oc_splat_env *e, struct oc_splat_choice *o)
 	o->ov_gpu = -1;
 	o->backend = OC_SB_ORT_CPU;
 	const bool force_full = is(e->model, "full");
+	const bool force_fp16 = is(e->model, "fp16");
 	const bool force_int4 = is(e->model, "int4");
 	const int disc = e->dml_available ? best_discrete(e) : -1;
+	const bool fp16_ok = e->fp16_on_dml && e->fp16_ready && !e->fp16_failed;
 
 	if (is(e->ep, "cpu")) {
 		snprintf(o->why, sizeof(o->why), "EP=cpu");
@@ -262,25 +321,51 @@ oc_rank_splat(const struct oc_splat_env *e, struct oc_splat_choice *o)
 			snprintf(o->why, sizeof(o->why), "EP=openvino unavailable");
 		}
 	} else {
-		// auto. DirectML serves the full model only (see oc_rank.h), so it ranks first
-		// only when the full model is what would run there.
+		// auto. DirectML serves the full and fp16 models only (see oc_rank.h), so it
+		// ranks first only when one of them is what would run there.
 		const char *skip = NULL;
+		char skip_buf[128];
+		const uint64_t vram = disc >= 0 ? e->adapters[disc].dedicated_mb : 0;
+		const enum oc_splat_model auto_model = oc_rank_auto_model(true, e->ram_mb, true, vram, fp16_ok);
 		if (!e->dml_available) {
 			skip = "no DirectML";
 		} else if (disc < 0) {
 			skip = "no discrete non-Intel GPU";
-		} else if (!e->full_on_dml) {
-			skip = "the full model has no DirectML variant";
 		} else if (force_int4) {
 			skip = "MODEL=int4 does not run on DirectML";
-		} else if (!force_full && !oc_rank_auto_full(true, e->ram_mb, true, e->adapters[disc].dedicated_mb)) {
-			skip = e->ram_mb < OC_FULL_MODEL_MIN_RAM_MB ? "under 16 GB of RAM for the full model"
-			                                            : "under 6 GB of VRAM for the full model";
+		} else if (force_fp16 && !e->fp16_on_dml) {
+			skip = "MODEL=fp16, but no pack has an fp16 model";
+		} else if (force_full && !e->full_on_dml) {
+			skip = "the full model has no DirectML variant";
+		} else if (!force_full && !force_fp16 &&
+		           (auto_model == OC_SM_INT4 || (auto_model == OC_SM_FULL && !e->full_on_dml))) {
+			if (e->ram_mb < OC_FULL_MODEL_MIN_RAM_MB) {
+				skip = "under 16 GB of RAM for the full model";
+			} else {
+				if (e->fp16_on_dml && e->fp16_ready && e->fp16_failed) {
+					snprintf(skip_buf, sizeof(skip_buf),
+					         "the fp16 model failed; %llu MB of VRAM, the full model needs %llu MB",
+					         (unsigned long long)vram, (unsigned long long)OC_FULL_MODEL_MIN_VRAM_MB);
+				} else if (fp16_ok) {
+					snprintf(skip_buf, sizeof(skip_buf),
+					         "%llu MB of VRAM: the full model needs %llu MB, the fp16 one %llu MB",
+					         (unsigned long long)vram,
+					         (unsigned long long)OC_FULL_MODEL_MIN_VRAM_MB,
+					         (unsigned long long)OC_FP16_MODEL_MIN_VRAM_MB);
+				} else {
+					snprintf(skip_buf, sizeof(skip_buf),
+					         "%llu MB of VRAM: the full model needs %llu MB%s",
+					         (unsigned long long)vram,
+					         (unsigned long long)OC_FULL_MODEL_MIN_VRAM_MB,
+					         e->fp16_on_dml ? " and the fp16 model is not built" : "");
+				}
+				skip = skip_buf;
+			}
 		}
 		if (skip == NULL) {
 			dml_on(e, o, disc, "EP=auto");
 		} else if (e->ov_present) {
-			char lead[96];
+			char lead[192];
 			snprintf(lead, sizeof(lead), "EP=auto (DirectML: %s)", skip);
 			ov_branch(e, o, lead);
 		} else {
@@ -289,8 +374,16 @@ oc_rank_splat(const struct oc_splat_env *e, struct oc_splat_choice *o)
 	}
 
 	const bool gpu = o->backend == OC_SB_DML || o->backend == OC_SB_OV_GPU || o->backend == OC_SB_COREML;
-	const uint64_t vram = o->backend == OC_SB_DML ? e->adapters[o->adapter].dedicated_mb : 0;
-	o->full = force_full   ? true
-	          : force_int4 ? false
-	                       : oc_rank_auto_full(gpu, e->ram_mb, o->backend == OC_SB_DML, vram);
+	const bool on_dml = o->backend == OC_SB_DML;
+	const uint64_t vram = on_dml ? e->adapters[o->adapter].dedicated_mb : 0;
+	if (force_full) {
+		o->model = OC_SM_FULL;
+	} else if (force_int4) {
+		o->model = OC_SM_INT4;
+	} else if (force_fp16) {
+		// fp16 has a DirectML variant only: anywhere else MODEL=fp16 means the full model.
+		o->model = on_dml && e->fp16_on_dml && !e->fp16_failed ? OC_SM_FP16 : OC_SM_FULL;
+	} else {
+		o->model = oc_rank_auto_model(gpu, e->ram_mb, on_dml, vram, fp16_ok);
+	}
 }

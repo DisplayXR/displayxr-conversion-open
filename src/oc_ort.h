@@ -18,6 +18,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "oc_profile.h"
 #include "oc_rank.h"
 #include "oc_tensor.h"
 
@@ -62,6 +63,21 @@ struct oc_ep_config
 	int dml_device;                    //!< DirectML: the DXGI adapter index
 	enum oc_coreml_units coreml_units; //!< Core ML: compute units
 	const char *coreml_cache_dir;      //!< Core ML: compiled-model cache directory; NULL = none
+	/*! Diagnostics (setting DIAG_PROFILE): capture ONNX Runtime's node placement report
+	 *  (the session logs at VERBOSE while it is created; nothing extra is printed). */
+	bool diag_placement;
+	/*! Diagnostics: non-NULL = ONNX Runtime profiles every run of the session into
+	 *  "<prefix>_<timestamp>.json" (oc_session_end_profiling names the file). */
+	const char *profile_prefix;
+};
+
+/*! One process's view of a GPU's memory (DXGI QueryVideoMemoryInfo), in MB. */
+struct oc_gpu_mem
+{
+	uint64_t local_usage_mb;     //!< this process, in the adapter's own (dedicated) memory
+	uint64_t local_budget_mb;    //!< what the OS lets this process keep resident there now
+	uint64_t nonlocal_usage_mb;  //!< this process, in system memory the GPU reaches over the bus
+	uint64_t nonlocal_budget_mb; //!< ... and its budget
 };
 
 /*! What the provider prints of ONNX Runtime's log (stderr). The environment
@@ -127,6 +143,11 @@ oc_dml_pick_adapter(uint64_t preferred_luid, uint64_t avoid_luid, int *out_index
 uint32_t
 oc_dxgi_list_adapters(struct oc_dxgi_adapter *out, uint32_t max);
 
+/*! Windows: this process's memory on the adapter with @p luid. false when not
+ *  available (other OSes, an old DXGI, an unknown LUID). */
+bool
+oc_gpu_memory(uint64_t luid, struct oc_gpu_mem *out);
+
 /*! Create a session for the model file at @p path (UTF-8, absolute; the
  *  verified blob the host resolved). @p threads 0 = ONNX Runtime's default.
  *  Core ML partitions the graph: what it cannot take runs on the CPU EP in
@@ -151,6 +172,17 @@ oc_session_destroy(struct oc_session *s);
  *  partitioning. false when not reported. */
 bool
 oc_session_ep_nodes(const struct oc_session *s, uint32_t *taken, uint32_t *total, uint32_t *partitions);
+
+/*! The node placement report captured at creation (oc_ep_config::diag_placement);
+ *  NULL when it was not asked for. */
+const struct oc_place_report *
+oc_session_placement(const struct oc_session *s);
+
+/*! Stop profiling (oc_ep_config::profile_prefix) and write the file; @p path gets its
+ *  name. false when the session was not profiling or ONNX Runtime refused. A session
+ *  profiles until this is called (once). */
+bool
+oc_session_end_profiling(struct oc_session *s, char *path, size_t path_size);
 
 /*! One image → one map. @p chw is [1,3,h,w] float; @p out receives the first
  *  output's out_w × out_h floats (the caller checked the model's output
