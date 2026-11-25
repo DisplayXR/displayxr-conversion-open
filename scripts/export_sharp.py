@@ -34,13 +34,13 @@ What it does, in order:
    - `fp16` (`sharp-fp16-1536`, DirectML only): the fp32 export with its static shape
      arithmetic folded first (in Python, exactly-defined operators only: see fold_static), then
      converted to float16 (onnxconverter-common) with fp32 inputs and outputs (checked: every
-     graph input and output keeps the fp32 model's type). The encoders and the decoder run in
-     fp16; the Gaussian composer, the initialiser, the prediction head (logs, reciprocals,
-     sigmoids on per-pixel values), the Gaussian output heads (geometry, texture), the
-     monodepth head, the instance normalisations and onnxconverter-common's default block list
-     stay fp32. Graph + one external-data file named by its SHA-256, like `full` (about 1.3 GB).
-     Half the GPU memory of `full`; about 0.1 % median depth error against it. No ONNX Runtime
-     step: its optimised-graph output is not the same bytes on every OS.
+     graph input and output keeps the fp32 model's type). The whole graph runs in fp16 except
+     onnxconverter-common's default block list (Resize, Range, Min / Max, CumSum, ...): the
+     full-resolution convolutions of the decoders and the heads are where the time and the
+     memory are, and keeping any of them fp32 costs about 2.6x on DirectML. Graph + one
+     external-data file named by its SHA-256, like `full` (about 1.3 GB). Half the GPU memory
+     of `full`. No ONNX Runtime step: its optimised-graph output is not the same bytes on
+     every OS.
    The fp32 intermediate is deleted unless --keep-fp32.
 5. Writes the result into the DisplayXR model store (blobs/<sha256> plus its .ok stamp, the
    store's own write protocol; for `full` the data file first, the graph last), so the
@@ -78,7 +78,7 @@ import sys
 import tempfile
 import urllib.request
 
-SCRIPT_VERSION = "1.3.0"
+SCRIPT_VERSION = "1.4.0"
 
 # The official checkpoint (Apple, research-only). Same bytes as Apple's CDN copy.
 CHECKPOINT_NAME = "sharp_2572gikvuh.pt"
@@ -104,18 +104,8 @@ PACK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pack
 VARIANTS = {
     "int4": ("sharp-int4-1536", "1.0.0"),
     "full": ("sharp-full-1536", "1.1.0"),
-    "fp16": ("sharp-fp16-1536", "1.3.0"),
+    "fp16": ("sharp-fp16-1536", "1.4.0"),
 }
-# fp16: the node-name prefixes that run in float16 (the two encoders and the decoder). Any
-# other node of the upstream model ("/m/...": the initialiser, the prediction head, the
-# Gaussian composer, the depth inversion) and every InstanceNormalization stays fp32.
-FP16_PREFIXES = ("/m/monodepth_model/", "/m/feature_model/")
-# ... except these heads inside them, which stay fp32 too: the Gaussian output heads (the
-# geometry and texture heads that feed the per-Gaussian deltas) and the monodepth head (the
-# disparity it ends in). Measured: they halve the fp16 model's drift from fp32 in scales,
-# opacities and rotations for about 20 % more DirectML time.
-FP32_HEAD_PREFIXES = ("/m/feature_model/geometry_head/", "/m/feature_model/texture_head/",
-                      "/m/monodepth_model/head/")
 # fp16: static shape arithmetic is folded in Python (fold_static) before the conversion, with
 # operators whose result is exactly defined (integer arithmetic, IEEE + - * / sqrt, data
 # movement): no ONNX Runtime graph optimiser, whose saved graph is not the same bytes on every
@@ -480,23 +470,13 @@ def fold_static(model, base_dir):
     return len(folded)
 
 
-def keep_fp32(node):
-    if node.op_type in ("Constant", "Identity"):
-        return False
-    if node.op_type == "InstanceNormalization":
-        return True
-    if node.name.startswith(FP32_HEAD_PREFIXES):
-        return True
-    return node.name.startswith("/m/") and not node.name.startswith(FP16_PREFIXES)
-
-
 def io_types(model):
     return {v.name: v.type.tensor_type.elem_type for v in list(model.graph.input) + list(model.graph.output)}
 
 
 def convert_fp16(fp32_path, work, out_dir, provenance):
-    """fp32 export -> fold_static -> float16 (fp32 I/O; keep_fp32 nodes and onnxconverter-common's
-    default block list stay fp32) -> write_split."""
+    """fp32 export -> fold_static -> float16 (fp32 I/O; only onnxconverter-common's default block
+    list stays fp32) -> write_split."""
     import onnx
     from onnx import external_data_helper as edh
     from onnx import shape_inference
@@ -509,7 +489,8 @@ def convert_fp16(fp32_path, work, out_dir, provenance):
     want_io = io_types(model)
     nfold = fold_static(model, fp32_dir)
     edh.load_external_data_for_model(model, fp32_dir)
-    blocked = [n.name for n in model.graph.node if keep_fp32(n)]
+    block_ops = set(float16.DEFAULT_OP_BLOCK_LIST)
+    blocked = [n.name for n in model.graph.node if n.op_type in block_ops]
     # An initializer shared by an fp32 node and a converted one would stay fp32 for both
     # (onnxconverter-common keeps any initializer a blocked node reads): give the fp32 nodes a copy.
     blocked_set = set(blocked)
@@ -537,8 +518,7 @@ def convert_fp16(fp32_path, work, out_dir, provenance):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # one "value truncated" line per clipped tiny weight
         model = float16.convert_float_to_float16(model, keep_io_types=True, disable_shape_infer=True,
-                                                 op_block_list=list(float16.DEFAULT_OP_BLOCK_LIST),
-                                                 node_block_list=blocked)
+                                                 op_block_list=list(float16.DEFAULT_OP_BLOCK_LIST))
     g = model.graph
     # A graph output produced by a blocked (fp32) node: onnxconverter-common's cast-after-blocked
     # pass walks graph.output too, so it retypes that output to float16 and appends a Cast to it,
@@ -575,9 +555,9 @@ def convert_fp16(fp32_path, work, out_dir, provenance):
         fail(f"fp16: graph inputs/outputs changed type (name: (fp32 model, fp16 model)): {bad}")
     n16 = sum(1 for i in g.initializer if i.data_type == onnx.TensorProto.FLOAT16)
     n32 = sum(1 for i in g.initializer if i.data_type == onnx.TensorProto.FLOAT)
-    nheads = sum(1 for n in g.node if n.name.startswith(FP32_HEAD_PREFIXES) and n.op_type not in ("Constant", "Identity"))
-    log(f"fp16: {nfold} static nodes folded; {len(blocked)} nodes kept fp32 ({nheads} of them in the "
-        f"output and monodepth heads), {split} shared initializers split, {n16} fp16 / {n32} fp32 "
+    log(f"fp16: {nfold} static nodes folded; {len(blocked)} nodes kept fp32 (default block list: "
+        f"{', '.join(sorted({n.op_type for n in g.node if n.name in set(blocked)}))}), "
+        f"{split} shared initializers split, {n16} fp16 / {n32} fp32 "
         f"initializers, {sum(1 for n in g.node if n.op_type == 'Cast')} Cast nodes; inputs and outputs fp32")
     set_provenance(model, provenance)
     return write_split(model, out_dir, "fp16")

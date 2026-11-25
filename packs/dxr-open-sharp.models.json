@@ -208,12 +208,12 @@
     },
     {
       "name": "sharp-fp16-1536",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "task": "splats-mono",
       "pipeline_tag": "image-to-3d",
       "local_build": {
         "script": "scripts/export_sharp.py",
-        "script_version": "1.3.0",
+        "script_version": "1.4.0",
         "requirements": "scripts/requirements-export-sharp.txt",
         "deterministic": true,
         "how": "Never downloaded: run `python scripts/export_sharp.py --accept-research-license --variant fp16` (DirectML machines only), which fetches the official checkpoint, verifies it, exports it, folds its shape arithmetic, converts it to float16 (fp32 inputs and outputs) and writes these bytes into the model store."
@@ -281,8 +281,8 @@
         "parent_size": 2809738232,
         "base_model": "apple/Sharp",
         "code": "https://github.com/apple/ml-sharp/tree/aed6527499ef91cba3b54c18d49a870f25947190",
-        "converter": "displayxr-conversion-open scripts/export_sharp.py 1.3.0",
-        "converted_by": "the user, locally: fp32 ONNX export (opset 18); static shape arithmetic folded (in Python with the ONNX reference operators, exactly-defined operators only); float16 conversion (onnxconverter-common, fp32 inputs and outputs; the Gaussian composer, initialiser, prediction head, Gaussian output heads, monodepth head and instance normalisations stay fp32); the graph and one external-data file, which the graph names by its own sha256"
+        "converter": "displayxr-conversion-open scripts/export_sharp.py 1.4.0",
+        "converted_by": "the user, locally: fp32 ONNX export (opset 18); static shape arithmetic folded (in Python with the ONNX reference operators, exactly-defined operators only); float16 conversion of the whole graph (onnxconverter-common, fp32 inputs and outputs; only its default block list, here the two Resize nodes, stays fp32); the graph and one external-data file, which the graph names by its own sha256"
       },
       "prefetch": false,
       "variants": [
@@ -297,14 +297,14 @@
             {
               "role": "model",
               "format": "onnx",
-              "sha256": "dd8c234b5c43b575a05cfe3abf49802f5b09c2e02a8d1381b4aa78701697a150",
-              "size": 3738019
+              "sha256": "69a094fa7e2b2a479f02a6c77dda5edc7fdf6de647741055c533b5c171f534cc",
+              "size": 3676447
             },
             {
               "role": "data",
               "format": "bin",
-              "sha256": "c4ca19ecc5974480af6c58e23c9a31813d50cd4febcd8be3a6ba0b974bae5499",
-              "size": 1310054144
+              "sha256": "d3a96e008fdb4cc872c268b9541e905cb602353e8fb785c4a47ee54a29e92e05",
+              "size": 1308059008
             }
           ]
         }

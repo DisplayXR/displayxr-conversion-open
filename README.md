@@ -98,16 +98,17 @@ never pre-fetch one); `--verify-store DIR` checks a model store against it.
   exactly-defined ones: integer arithmetic, IEEE `+ - * / sqrt`, data movement; no ONNX Runtime
   graph optimiser, whose saved graph differed between Windows and Linux), then converted to
   float16. Its graph inputs and outputs stay **float32** (the script checks every one against the
-  fp32 model and refuses otherwise). The two encoders and the decoder run in fp16; the Gaussian
-  composer, the initialiser, the prediction head, the Gaussian output heads (geometry, texture),
-  the monodepth head and the instance normalisations stay fp32 (242 nodes). Graph + one
-  external-data file named by its SHA-256, like `full`, about 1.3 GB: half the GPU memory of
-  `full`. Against the fp32 model on ONNX Runtime's CPU EP (one photo): median relative depth
-  error 0.10 % (p95 0.77 %); per-attribute mean |difference| / mean |value|: positions 0.80 %,
-  colours 0.13 %, rotations 0.22 %, opacities 0.21 %, scales 1.5 % (export_sharp.py 1.2.0's
-  fp16 build: 1.40 / 0.20 / 0.33 / 0.34 / 2.7 %, depth 0.26 %). Measured on DirectML (RTX 3080,
-  10 GB, the 1.2.0 build): 8.5 – 10 s a job where the fp32 model, over the card's memory budget,
-  took 16 – 190 s.
+  fp32 model and refuses otherwise). The whole graph runs in fp16 except onnxconverter-common's
+  default block list (in this graph: its two `Resize` nodes): the full-resolution convolutions of
+  the decoders and the Gaussian heads are where the time and the memory are, and keeping them fp32
+  (export_sharp.py 1.3.0) cost about 2.6× on DirectML and went over a 10 GB card's memory budget.
+  Graph + one external-data file named by its SHA-256, like `full`, about 1.3 GB: half the GPU
+  memory of `full`. Against the fp32 model on ONNX Runtime's CPU EP (one photo): median relative
+  depth error 0.10 % (p95 1.4 %); per-attribute mean |difference| / mean |value|: positions
+  0.78 %, colours 0.20 %, rotations 0.32 %, opacities 0.34 %, scales 2.1 %; no non-finite value.
+  Measured on DirectML (RTX 3080, 10 GB, this recipe): about **1.2 s** of inference and **5.6 GB**
+  of dedicated memory (within the budget), about 2 s for the whole job, where the fp32 model, over
+  the card's memory budget, took 16 – 190 s.
 
 The provider picks between them per machine (setting `MODEL`, [below](#which-sharp-build-model)).
 SHARP's weights are licensed **for research only** (Apple Machine Learning Research Model
@@ -144,14 +145,14 @@ produced against the pack and says so if they differ.
 | `sharp-full-1536` | splats-mono | graph (`model`) | `cbe7db8a32a5e1d3af96fbd64841d0e77b8db79f3efba92fda3891e3edc75326` | 6 226 171 | never (built locally) |
 | | | weights (`data`) | `95912399a850769c894d780c1761604ced31ce30e2464a8c3138e796f26e15d0` | 2 615 734 016 | |
 | `sharp-int4-1536` | splats-mono | `model` | `01202f427e5f83ece061a5438e5b6670fbe9ffb26d30f8100bb285eb69f753f9` | 583 477 535 | never (built locally) |
-| `sharp-fp16-1536` | splats-mono | graph (`model`) | `dd8c234b5c43b575a05cfe3abf49802f5b09c2e02a8d1381b4aa78701697a150` | 3 738 019 | never (built locally) |
-| | | weights (`data`) | `c4ca19ecc5974480af6c58e23c9a31813d50cd4febcd8be3a6ba0b974bae5499` | 1 310 054 144 | |
+| `sharp-fp16-1536` | splats-mono | graph (`model`) | `69a094fa7e2b2a479f02a6c77dda5edc7fdf6de647741055c533b5c171f534cc` | 3 676 447 | never (built locally) |
+| | | weights (`data`) | `d3a96e008fdb4cc872c268b9541e905cb602353e8fb785c4a47ee54a29e92e05` | 1 308 059 008 | |
 
 Each model's `local_build` block names the script, the version that introduced its recipe and
 whether it is deterministic; `provenance` pins the parent checkpoint (`parent_sha256`,
 `parent_size`). The version written into a blob's metadata is its recipe's, not the script's, so
 an unrelated script change never moves a pinned hash (the int4 and full bytes are unchanged by
-1.2.0, which added fp16, and 1.3.0, which rebuilt it). The fp16 recipe (1.3.0) is
+1.2.0, which added fp16, and 1.3.0 / 1.4.0, which rebuilt it). The fp16 recipe (1.4.0) is
 byte-identical from run to run and across `PYTHONHASHSEED` values (checked on Linux); its 1.2.0
 recipe went through ONNX Runtime's optimised-graph writer and gave other bytes on Windows. The capability is
 `RESEARCH_ONLY` and is selected only with `AllowResearchOnly`. The model's tensors, shapes and
@@ -327,8 +328,9 @@ tensor over 1.2 GB (DirectML's limit is 4 GB). So no CPU fallback is expected. T
 explanation is memory: 6.1 GB on a 10 GB card that a desktop already uses is at or over the
 budget Windows gives one process, and what does not fit is kept in system memory, read over
 PCIe at a few percent of the card's bandwidth, which is the size of the slowdown seen. Hence
-the floors (full fp32 ≥ 9 GB, fp16 ≥ 6 GB) and the fp16 build. Unconfirmed until a run with
-the lines below.
+the floors (full fp32 ≥ 9 GB, fp16 ≥ 6 GB) and the fp16 build. Confirmed with the lines below:
+the all-fp16 build (export_sharp.py 1.4.0) runs the same photo on the same card in about 1.2 s
+of inference at 5.6 GB dedicated, within the budget (about 2 s for the whole job).
 
 Every DirectML splat session and job now logs this process's memory on the adapter (DXGI
 `QueryVideoMemoryInfo`: dedicated use and budget, shared use) after the load and before / after
