@@ -16,12 +16,13 @@
  *                       pack: a splat model is a separate, user-installed pack).
  *                       Setting MODEL picks between the pack's full model
  *                       (defaults.high) and its small one (defaults.low):
- *                       auto = full on a GPU backend with >= 16 GB of RAM,
- *                       among the models actually in the store.
+ *                       auto = full on a GPU backend with >= 16 GB of RAM
+ *                       (DirectML: >= 6 GB VRAM), among the models in the store.
  *
- * The splat capability runs through OpenVINO when the provider ships it
- * (oc_ov.h; its GPU device, else its CPU device, else ONNX Runtime's CPU
- * execution provider). Everything else runs through ONNX Runtime, loaded at
+ * The splat capability runs where oc_rank.h ranks it: ONNX Runtime + DirectML
+ * on a discrete non-Intel GPU, else OpenVINO (oc_ov.h) on an Intel Arc / Xe GPU,
+ * else OpenVINO's CPU device, else ONNX Runtime's CPU execution provider.
+ * Everything else runs through ONNX Runtime, loaded at
  * run time from the provider's own directory: the DirectML execution provider on Windows when a hardware
  * adapter is there, the Core ML execution provider on macOS, the CPU
  * execution provider everywhere else (and as the fallback when DirectML or
@@ -52,6 +53,7 @@
 #include "oc_ov.h"
 #include "oc_pack.h"
 #include "oc_platform.h"
+#include "oc_rank.h"
 #include "oc_splat.h"
 
 #include <math.h>
@@ -82,12 +84,8 @@
 #define OC_CAP_COUNT 3u
 #define OC_MAX_SPLAT_INPUT_EDGE 8192u //!< the runtime downscales above it; the splat model resamples to its grid
 #define OC_ASSUMED_FOCAL_MM 30.0      //!< no focal given: a 30 mm full-frame equivalent, labelled ASSUMED
-/*! MODEL=auto picks the full splat model only with at least this much RAM: "16 GB" as
- *  the OS reports it (firmware and an integrated GPU reserve some of it, so a 16 GB
- *  machine reports a little under 16 GiB). */
-#define OC_FULL_MODEL_MIN_RAM_MB (15u * 1024u)
-#define OC_SPLAT_FULL 0u  //!< splat_cand index: defaults["splats-mono"].high
-#define OC_SPLAT_SMALL 1u //!< splat_cand index: defaults["splats-mono"].low
+#define OC_SPLAT_FULL 0u              //!< splat_cand index: defaults["splats-mono"].high
+#define OC_SPLAT_SMALL 1u             //!< splat_cand index: defaults["splats-mono"].low
 
 #define OC_MAX_STREAMS_VIDEO 2u //!< each holds a temporal cache of ~160 MB (518 px model)
 #define OC_MAX_STREAMS_MONO 4u
@@ -138,7 +136,13 @@ struct oc_cap
 	const struct oc_pack_variant *variant; //!< the blob variant for the EP below
 	char ref[192];                         //!< "<pack>/<model>/<variant>"
 	enum oc_ep ep;
-	char ov_device[8]; //!< OC_EP_OPENVINO: "GPU" or "CPU"
+	char ov_device[8];   //!< OC_EP_OPENVINO: "GPU" or "CPU"
+	bool ov_provisional; //!< SPLATS_MONO on OpenVINO GPU, picked before OpenVINO listed its devices
+	int dml_device;      //!< SPLATS_MONO on DirectML: its own adapter (oc_rank.h), not the depth caps'
+	uint64_t dml_luid;
+	uint64_t dml_vram_mb;
+	bool dml_failed;    //!< SPLATS_MONO: DirectML failed in this process; ranked without it from now on
+	bool ov_gpu_failed; //!< SPLATS_MONO: OpenVINO's GPU device failed; ranked without it from now on
 	char backend[32];
 	uint64_t device_luid;
 	uint32_t licence_class;
@@ -213,8 +217,13 @@ struct oc_provider
 	enum oc_ov_status ov_status;
 	char ov_detail[128];
 	bool ov_devices_known;
-	bool ov_has_gpu;
-	char ov_gpu_name[96];
+	struct oc_ov_gpu ov_gpus[OC_RANK_MAX_OV_GPUS];
+	uint32_t ov_gpu_count;
+	char ov_gpu_device[16]; //!< the OpenVINO GPU device SPLATS_MONO compiles for ("GPU", "GPU.1")
+
+	/* DXGI adapters (Windows; listed once in probe), for SPLATS_MONO's ranking. */
+	struct oc_dxgi_adapter adapters[OC_RANK_MAX_ADAPTERS];
+	uint32_t adapter_count;
 
 	/* SPLATS_MONO's two candidate models and which of their variants' blobs are in
 	 * the store (refresh_splat_presence, outside `lock`; read under it). */
@@ -530,11 +539,11 @@ splat_present_locked(const struct oc_provider *p, uint32_t k, enum oc_ep ep)
 /*!
  * SPLATS_MONO's model (setting MODEL): "full" = the model defaults["splats-mono"].high
  * names, "int4" = the one .low names. auto = full when the cap's backend is a GPU
- * (OpenVINO's GPU device, DirectML, Core ML) and the machine has >= 16 GB of RAM, else
- * int4; and only among the models whose blob is in the store: the preferred one absent
- * and the other present = the other (said in pick_note and the INFO line). Neither
- * present = the preferred one, which then reports what it needs (a local build, a
- * download) the usual way. A forced MODEL never switches. Caller holds `lock` or is in probe.
+ * (OpenVINO's GPU device, DirectML, Core ML) and the machine has >= 16 GB of RAM (and,
+ * on DirectML, the adapter >= 6 GB of VRAM), else int4 (oc_rank_auto_full); and only
+ * among the models whose blob is in the store: the preferred one absent and the other
+ * present = the other (said in pick_note and the INFO line). Neither present = the
+ * preferred one, which then reports what it needs (a local build, a download) the usual way. A forced MODEL never switches. Caller holds `lock` or is in probe.
  */
 static const struct oc_pack_model *
 pick_splat_model_locked(struct oc_provider *p, struct oc_cap *c, enum oc_ep ep, const struct oc_pack **out_pack)
@@ -560,8 +569,9 @@ pick_splat_model_locked(struct oc_provider *p, struct oc_cap *c, enum oc_ep ep, 
 		// The backend the full model would really run on: a model without a variant for
 		// the accelerator runs on the CPU (bind_cap_locked), and that is not a GPU.
 		const enum oc_ep full_ep = oc_pack_variant_for_ep(full, ep_pack_name(ep)) != NULL ? ep : OC_EP_CPU;
-		want = backend_is_gpu(p, c, full_ep) && p->ram_mb >= OC_FULL_MODEL_MIN_RAM_MB ? OC_SPLAT_FULL
-		                                                                              : OC_SPLAT_SMALL;
+		want = oc_rank_auto_full(backend_is_gpu(p, c, full_ep), p->ram_mb, full_ep == OC_EP_DML, c->dml_vram_mb)
+		           ? OC_SPLAT_FULL
+		           : OC_SPLAT_SMALL;
 	}
 	uint32_t k = want;
 	const uint32_t other = want == OC_SPLAT_FULL ? OC_SPLAT_SMALL : OC_SPLAT_FULL;
@@ -622,6 +632,12 @@ bind_cap_locked(struct oc_provider *p, struct oc_cap *c, enum oc_ep ep)
 		if (v == NULL && ep != OC_EP_CPU) {
 			// No variant for the accelerator (the pack decides, per model, which
 			// execution providers a blob is acceptable on): this cap runs on the CPU.
+			if (is_splats(c) && m != prev) {
+				fprintf(stderr,
+				        "[open-conversion] splats-mono: %s has no %s variant in its pack; it runs on "
+				        "onnxruntime-cpu\n",
+				        m->name, ep_display_name(ep));
+			}
 			ep = OC_EP_CPU;
 			v = oc_pack_variant_for_ep(m, "cpu");
 		}
@@ -633,7 +649,7 @@ bind_cap_locked(struct oc_provider *p, struct oc_cap *c, enum oc_ep ep)
 	            : ep == OC_EP_COREML   ? "onnxruntime-coreml"
 	            : ep == OC_EP_OPENVINO ? (ov_gpu ? "openvino-gpu" : "openvino-cpu")
 	                                   : "onnxruntime-cpu");
-	c->device_luid = ep == OC_EP_DML ? p->dml_luid : 0;
+	c->device_luid = ep != OC_EP_DML ? 0 : is_splats(c) ? c->dml_luid : p->dml_luid;
 	if (is_splats(c) && m != NULL && m != prev) {
 		fprintf(stderr, "[open-conversion] splats-mono: MODEL=%s -> %s (%s, %llu MB RAM)%s%s\n",
 		        p->splat_model_setting, m->name, c->backend, (unsigned long long)p->ram_mb,
@@ -797,18 +813,58 @@ choose_ep(struct oc_provider *p)
 	return OC_EP_DML;
 }
 
-/*! The splat capability's backend: OpenVINO when the provider ships it (its
- *  GPU device unless OV_DEVICE says cpu; warm checks the device is really
- *  there), else the ONNX Runtime EP the depth capabilities use. */
+/*!
+ * The splat capability's backend (oc_rank.h): DirectML on a discrete non-Intel GPU,
+ * else OpenVINO's GPU device when it is an Intel Arc / Xe-class GPU, else OpenVINO's
+ * CPU device, else ONNX Runtime's CPU EP; explicit settings win. Sets the cap's
+ * OpenVINO device and DirectML adapter and logs one line saying what it resolved to
+ * and why (plus one when a requested backend is not available). DirectML is left
+ * out once it failed in this process (sticky). Caller holds `lock` or is in probe.
+ */
 static enum oc_ep
-choose_splat_ep(struct oc_provider *p, struct oc_cap *c)
+rank_splat_locked(struct oc_provider *p, struct oc_cap *c)
 {
-	oc_copy_str(c->ov_device, sizeof(c->ov_device), strcmp(p->ov_device_setting, "cpu") == 0 ? "CPU" : "GPU");
-	if (strcmp(p->ep_setting, "cpu") == 0 || strcmp(p->ep_setting, "dml") == 0 ||
-	    strcmp(p->ep_setting, "coreml") == 0) {
-		return p->default_ep;
+	const bool no_dml = c->dml_failed;
+	const struct oc_pack_model *full = p->splat_cand[OC_SPLAT_FULL];
+	const struct oc_splat_env env = {
+	    .ep = no_dml ? "auto" : p->ep_setting,
+	    .ov_device = p->ov_device_setting,
+	    .model = p->splat_model_setting,
+	    .ram_mb = p->ram_mb,
+	    .dml_available = !no_dml && oc_ort_has_dml(p->ort),
+	    .coreml_available = oc_ort_has_coreml(p->ort),
+	    .adapters = p->adapters,
+	    .adapter_count = p->adapter_count,
+	    .full_on_dml = full != NULL && oc_pack_variant_for_ep(full, "dml") != NULL,
+	    .ov_present = p->ov_present,
+	    .ov_known = p->ov_devices_known || c->ov_gpu_failed,
+	    .ov_gpus = p->ov_gpus,
+	    .ov_gpu_count = c->ov_gpu_failed ? 0u : p->ov_gpu_count,
+	};
+	struct oc_splat_choice ch;
+	oc_rank_splat(&env, &ch);
+	if (ch.fallback[0] != '\0') {
+		fprintf(stderr, "[open-conversion] splats-mono: %s\n", ch.fallback);
 	}
-	return p->ov_present ? OC_EP_OPENVINO : p->default_ep; // "auto" and "openvino"
+	fprintf(stderr, "[open-conversion] splats-mono: %s%s -> %s; model %s (MODEL=%s, %llu MB RAM)\n",
+	        no_dml ? "DirectML failed, re-ranked: " : "", ch.why, oc_rank_backend_name(ch.backend),
+	        ch.full ? "full" : "int4", p->splat_model_setting, (unsigned long long)p->ram_mb);
+	c->ov_provisional = ch.provisional;
+	c->dml_device = -1;
+	c->dml_luid = 0;
+	c->dml_vram_mb = 0;
+	oc_copy_str(p->ov_gpu_device, sizeof(p->ov_gpu_device), ch.ov_gpu >= 0 ? p->ov_gpus[ch.ov_gpu].device : "GPU");
+	switch (ch.backend) {
+	case OC_SB_DML:
+		c->dml_device = p->adapters[ch.adapter].index;
+		c->dml_luid = p->adapters[ch.adapter].luid;
+		c->dml_vram_mb = p->adapters[ch.adapter].dedicated_mb;
+		return OC_EP_DML;
+	case OC_SB_OV_GPU: oc_copy_str(c->ov_device, sizeof(c->ov_device), "GPU"); return OC_EP_OPENVINO;
+	case OC_SB_OV_CPU: oc_copy_str(c->ov_device, sizeof(c->ov_device), "CPU"); return OC_EP_OPENVINO;
+	case OC_SB_COREML: return OC_EP_COREML;
+	default: return OC_EP_CPU;
+	}
 }
 
 /*! Readiness of a cold cap from the store, without loading anything. */
@@ -1041,6 +1097,13 @@ oc_probe(struct xrt_conversion_plugin_instance **out_inst)
 	load_runtime(p);
 	p->default_ep = p->ort != NULL ? choose_ep(p) : OC_EP_CPU;
 	p->ov_present = ov_located(p);
+	p->adapter_count = oc_dxgi_list_adapters(p->adapters, OC_RANK_MAX_ADAPTERS);
+	for (uint32_t i = 0; i < p->adapter_count; i++) {
+		const struct oc_dxgi_adapter *a = &p->adapters[i];
+		fprintf(stderr, "[open-conversion] DXGI adapter %d: '%s' vendor 0x%04x, %llu MB dedicated%s%s\n",
+		        a->index, a->name, a->vendor_id, (unsigned long long)a->dedicated_mb,
+		        a->software ? ", software" : "", oc_rank_dxgi_discrete(a) ? ", discrete" : "");
+	}
 	p->splat_cand[OC_SPLAT_FULL] = tier_model(p, "splats-mono", "high", &p->splat_pack[OC_SPLAT_FULL]);
 	p->splat_cand[OC_SPLAT_SMALL] = tier_model(p, "splats-mono", "low", &p->splat_pack[OC_SPLAT_SMALL]);
 	refresh_splat_presence(p);
@@ -1064,7 +1127,7 @@ oc_probe(struct xrt_conversion_plugin_instance **out_inst)
 		struct oc_cap *c = &p->caps[i];
 		c->state = XRT_CONV_STATE_UNKNOWN;
 		c->progress = -1.0f;
-		bind_cap_locked(p, c, is_splats(c) ? choose_splat_ep(p, c) : p->default_ep);
+		bind_cap_locked(p, c, is_splats(c) ? rank_splat_locked(p, c) : p->default_ep);
 		initial_state(p, c);
 	}
 
@@ -1314,9 +1377,23 @@ fall_back_to_cpu(struct oc_provider *p, struct oc_cap *c, const char *why)
 static void
 fall_back(struct oc_provider *p, struct oc_cap *c, const char *why)
 {
+	if (is_splats(c) && c->ep == OC_EP_DML) {
+		// DirectML could not start or a run failed: the rest of the ranking without it
+		// (OpenVINO, else ONNX Runtime's CPU EP), not straight to the slowest path.
+		fprintf(stderr, "[open-conversion] splats-mono: DirectML unavailable (%s)\n", why);
+		oc_lock(&p->lock);
+		c->dml_failed = true;
+		bind_cap_locked(p, c, rank_splat_locked(p, c));
+		p->generation++;
+		oc_unlock(&p->lock);
+		notify(0);
+		return;
+	}
 	if (c->ep == OC_EP_OPENVINO && strcmp(c->ov_device, "GPU") == 0) {
 		oc_lock(&p->lock);
 		oc_copy_str(c->ov_device, sizeof(c->ov_device), "CPU");
+		c->ov_provisional = false;
+		c->ov_gpu_failed = true;
 		bind_cap_locked(p, c, OC_EP_OPENVINO);
 		p->generation++;
 		oc_unlock(&p->lock);
@@ -1362,13 +1439,49 @@ prepare_openvino(struct oc_provider *p, struct oc_cap *c)
 		}
 	}
 	if (!p->ov_devices_known) {
-		p->ov_has_gpu = oc_ov_has_device(p->ov, "GPU", p->ov_gpu_name, sizeof(p->ov_gpu_name));
+		struct oc_ov_gpu gpus[OC_RANK_MAX_OV_GPUS];
+		const uint32_t n = oc_ov_list_gpus(p->ov, gpus, OC_RANK_MAX_OV_GPUS);
+		oc_lock(&p->lock);
+		memcpy(p->ov_gpus, gpus, sizeof(gpus));
+		p->ov_gpu_count = n;
 		p->ov_devices_known = true;
-		if (p->ov_has_gpu) {
-			fprintf(stderr, "[open-conversion] OpenVINO GPU: %s\n", p->ov_gpu_name);
+		oc_unlock(&p->lock);
+		for (uint32_t i = 0; i < n; i++) {
+			char why[160];
+			const bool ok = oc_rank_ov_gpu_ok(&gpus[i], why, sizeof(why));
+			fprintf(stderr,
+			        "[open-conversion] OpenVINO %s: %s (%s, vendor 0x%04x, IP %u.%u, %u EUs%s)%s%s\n",
+			        gpus[i].device, gpus[i].name,
+			        gpus[i].type == OC_OV_GPU_TYPE_DISCRETE     ? "dGPU"
+			        : gpus[i].type == OC_OV_GPU_TYPE_INTEGRATED ? "iGPU"
+			                                                    : "type unknown",
+			        gpus[i].vendor_id, gpus[i].arch_major, gpus[i].arch_minor, gpus[i].eu_count,
+			        gpus[i].hw_matmul ? ", matrix units" : "",
+			        ok ? "; used by EP=auto" : "; not used by EP=auto: ", ok ? "" : why);
+		}
+		if (n == 0) {
+			fprintf(stderr, "[open-conversion] OpenVINO: no GPU device\n");
 		}
 	}
-	if (strcmp(c->ov_device, "GPU") == 0 && !p->ov_has_gpu) {
+	if (is_splats(c) && c->ov_provisional) {
+		// The GPU device was picked before OpenVINO listed its devices: rank again with
+		// the real list (an NVIDIA / AMD / UHD-class device moves to the CPU device, and
+		// MODEL=auto then picks the small model).
+		oc_lock(&p->lock);
+		const char before = c->ov_device[0];
+		const struct oc_pack_model *mb = c->model;
+		const enum oc_ep ep = rank_splat_locked(p, c);
+		bind_cap_locked(p, c, ep);
+		const bool changed = c->ov_device[0] != before || c->ep != OC_EP_OPENVINO || c->model != mb;
+		if (changed) {
+			p->generation++;
+		}
+		oc_unlock(&p->lock);
+		if (changed) {
+			notify(0);
+		}
+	}
+	if (c->ep == OC_EP_OPENVINO && strcmp(c->ov_device, "GPU") == 0 && p->ov_gpu_count == 0) {
 		fall_back(p, c, "no GPU device");
 	}
 }
@@ -1453,13 +1566,13 @@ create_session(
 		char dir[1300];
 		const char *cache = ov_cache_dir(p, dir, sizeof(dir));
 		const bool cpu = strcmp(c->ov_device, "CPU") == 0;
-		return oc_ov_session_create(p->ov, path, c->ov_device, cache, cpu ? p->threads : 0, &c->ov_session, err,
-		                            err_size)
+		return oc_ov_session_create(p->ov, path, cpu ? "CPU" : p->ov_gpu_device, cache, cpu ? p->threads : 0,
+		                            &c->ov_session, err, err_size)
 		           ? OC_RUN_OK
 		           : OC_RUN_FAILED;
 	}
 	struct oc_ep_config epc = {
-	    .dml_device = p->dml_device,
+	    .dml_device = is_splats(c) && c->ep == OC_EP_DML ? c->dml_device : p->dml_device,
 	    .coreml_units = p->coreml_units,
 	    .coreml_cache_dir = NULL,
 	};
@@ -1566,7 +1679,9 @@ oc_warm(struct xrt_conversion_plugin_instance *inst, uint32_t cap_id, bool (*is_
 		if (p->ort != NULL) {
 			oc_lock(&p->lock);
 			p->default_ep = choose_ep(p);
-			if (c->ep != OC_EP_OPENVINO) {
+			if (is_splats(c)) {
+				bind_cap_locked(p, c, rank_splat_locked(p, c));
+			} else if (c->ep != OC_EP_OPENVINO) {
 				bind_cap_locked(p, c, p->default_ep);
 			}
 			p->generation++;
@@ -1743,11 +1858,14 @@ resolve:
 		release_session(p, c); // before the cache dir it may have mapped is removed
 	}
 	finish_cache(&txn, r == OC_RUN_OK);
-	if (r != OC_RUN_OK && r != OC_RUN_OUT_OF_MEMORY && c->ep != OC_EP_CPU) {
+	// A splat model that does not fit the accelerator's memory falls back too (its
+	// next backend is the CPU's RAM); a depth model out of memory is a resource failure.
+	if (r != OC_RUN_OK && (r != OC_RUN_OUT_OF_MEMORY || is_splats(c)) && c->ep != OC_EP_CPU) {
 		// DirectML / Core ML could not start (driver, feature level, an operator,
 		// a Core ML compile failure): the CPU execution provider serves the same model.
 		release_session(p, c);
 		fall_back(p, c, err);
+		prepare_openvino(p, c); // DirectML -> OpenVINO: load it and check its devices first
 		m = c->model;
 		if (!runtime_ready(p, c)) {
 			initial_state(p, c); // e.g. OpenVINO gone and no ONNX Runtime either
@@ -2190,7 +2308,11 @@ splat_job(struct oc_provider *p,
 	const uint32_t requested =
 	    COVERS(in, struct xrt_conv_job_in, requested_blob_format) ? in->requested_blob_format : 0u;
 	if (requested != 0 && requested != XRT_CONV_BLOB_PLY_3DGS) {
-		return splat_refuse(out, XRT_CONV_REFUSAL_UNSUPPORTED_INPUT, "this provider writes 3DGS PLY only",
+		// The requested OUTPUT format, not the photo, is the problem: say what to ask for.
+		// (No refusal code names an output format; UNSUPPORTED_INPUT is the job request's.)
+		return splat_refuse(out, XRT_CONV_REFUSAL_UNSUPPORTED_INPUT,
+		                    "output format not supported: this provider writes 3DGS PLY only; pass an output "
+		                    "path ending in .ply",
 		                    XRT_ERROR_OUTPUT_UNSUPPORTED);
 	}
 	const struct xrt_conv_image *color = find_color(
@@ -2277,7 +2399,7 @@ splat_job(struct oc_provider *p,
 		ran = r == OC_OV_RUN_OK;
 	} else {
 		const enum oc_run_status r = oc_session_run_named(c->session, ins, 2, outs, 5, err, sizeof(err));
-		if (r == OC_RUN_OUT_OF_MEMORY) {
+		if (r == OC_RUN_OUT_OF_MEMORY && c->ep == OC_EP_CPU) {
 			fprintf(stderr, "[open-conversion] %s: inference failed: %s\n", m->name, err);
 			return XRT_ERROR_ALLOCATION;
 		}
@@ -2496,13 +2618,16 @@ static const struct xrt_component_setting_desc g_settings[] = {
     {"ENABLE", XRT_COMPONENT_SETTING_TYPE_BOOL, "1", "0 = probe declines"},
     {"QUALITY", XRT_COMPONENT_SETTING_TYPE_ENUM, "medium", "low | medium | high: which model defaults[task] names"},
     {"EP", XRT_COMPONENT_SETTING_TYPE_ENUM, "auto",
-     "auto | cpu | dml | coreml | openvino: the execution provider (openvino: the splat capability only)"},
+     "auto | cpu | dml | coreml | openvino: the execution provider (openvino: the splat capability only; "
+     "splats auto = DirectML on a discrete non-Intel GPU, else OpenVINO's Intel Arc / Xe GPU, else a CPU)"},
     {"OV_DEVICE", XRT_COMPONENT_SETTING_TYPE_ENUM, "auto",
-     "auto | gpu | cpu: the OpenVINO device (auto = GPU, else CPU)"},
+     "auto | gpu | cpu: OpenVINO's device when OpenVINO serves splats (auto = an Intel Arc / Xe GPU, never an "
+     "NVIDIA / AMD / UHD one, else CPU; gpu = any GPU device); does not select OpenVINO over DirectML"},
     {"OV_CACHE", XRT_COMPONENT_SETTING_TYPE_BOOL, "1", "0 = no OpenVINO compiled-model cache in the scratch dir"},
     {"MODEL", XRT_COMPONENT_SETTING_TYPE_ENUM, "auto",
      "auto | full | int4: the splat model (full = defaults[splats-mono].high, int4 = .low; auto = full on a GPU "
-     "backend with >= 16 GB RAM, else int4, among the models in the store)"},
+     "backend with >= 16 GB RAM (DirectML: and >= 6 GB VRAM), else int4, among the models in the store; "
+     "DirectML runs the full model only)"},
     {"OPENVINO", XRT_COMPONENT_SETTING_TYPE_STRING, "", "absolute path of another OpenVINO runtime folder"},
     {"COREML_UNITS", XRT_COMPONENT_SETTING_TYPE_ENUM, "gpu", "gpu | all | ane | cpu: macOS Core ML compute units"},
     {"COREML_CACHE", XRT_COMPONENT_SETTING_TYPE_BOOL, "1", "0 = no Core ML compiled-model cache"},

@@ -362,22 +362,49 @@ def total_ram_gb():
         return None
 
 
+def windows_discrete_gpu():
+    """Windows: the name of a discrete NVIDIA / AMD video controller, or None. A heuristic for the
+    default variant only (the provider itself ranks DXGI adapters by dedicated memory)."""
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                              "(Get-CimInstance Win32_VideoController).Name"],
+                             capture_output=True, text=True, check=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for name in out.stdout.splitlines():
+        n = name.strip()
+        # "AMD Radeon(TM) Graphics" is an APU's iGPU; a discrete Radeon carries a model name.
+        if "NVIDIA" in n.upper() or ("RADEON" in n.upper() and n.upper() != "AMD RADEON(TM) GRAPHICS"):
+            return n
+    return None
+
+
 def splat_gpu():
-    """(bool, why): does the provider's splat capability run on a GPU here? Its backends are
-    OpenVINO's GPU device (Linux x86_64, Windows x64), else OpenVINO's CPU device, else ONNX
-    Runtime's CPU execution provider (the pack lists no DirectML / Core ML variant for SHARP)."""
+    """(bool, why): does the provider's splat capability run on a GPU here? Its EP=auto ranking:
+    ONNX Runtime + DirectML on a discrete NVIDIA / AMD GPU (Windows), else OpenVINO's GPU device
+    when it is an Intel Arc / Xe-class GPU (never NVIDIA / AMD through OpenCL, never a UHD-class
+    iGPU), else a CPU backend."""
     system = platform.system()
     if system == "Darwin":
         return False, "macOS: no OpenVINO, the splat capability runs on ONNX Runtime's CPU"
+    if system == "Windows":
+        dgpu = windows_discrete_gpu()
+        if dgpu:
+            return True, f"Windows: DirectML on {dgpu}"
     try:
         import openvino
 
-        devices = openvino.Core().available_devices
-        return any(d.startswith("GPU") for d in devices), f"OpenVINO reports {', '.join(devices) or 'no device'}"
+        core = openvino.Core()
+        gpus = [d for d in core.available_devices if d.startswith("GPU")]
+        for d in gpus:
+            name = str(core.get_property(d, "FULL_DEVICE_NAME"))
+            if "intel" in name.lower() and "uhd" not in name.lower() and "hd graphics" not in name.lower():
+                return True, f"OpenVINO {d}: {name}"
+        return False, f"OpenVINO GPU devices: {', '.join(gpus) or 'none'} (none is an Intel Arc / Xe GPU)"
     except Exception:  # noqa: BLE001 - openvino is optional here; any failure falls to the heuristic
         pass
     if system == "Windows":
-        return True, "Windows: assuming OpenVINO's GPU device (pip install openvino to check)"
+        return False, "Windows: no discrete NVIDIA / AMD GPU found (pip install openvino to check an Intel GPU)"
     render = os.path.isdir("/dev/dri") and any(n.startswith("renderD") for n in os.listdir("/dev/dri"))
     icd = os.path.isdir("/etc/OpenCL/vendors") and bool(os.listdir("/etc/OpenCL/vendors"))
     return render and icd, (f"GPU render node {'present' if render else 'absent'}, OpenCL driver "

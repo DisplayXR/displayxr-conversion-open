@@ -12,12 +12,16 @@ depth capabilities — `DEPTH_VIDEO` (temporal, a small streaming video-depth mo
 on macOS for the models whose pack variant lists `coreml`, CPU everywhere). The runtime composes
 views from them; this repo never declares `VIEWS_*`. A third, `SPLATS_MONO` (ADR-057, job lane:
 photo → 3DGS PLY), serves whatever model a pack names for `splats-mono` (none in the default
-pack; a research-only model is its own pack) on OpenVINO (GPU, else CPU; Linux x86_64 and
-Windows x64), else ONNX Runtime's CPU EP. Setting `MODEL` (`auto` | `full` | `int4`) picks
+pack; a research-only model is its own pack) on the backend `src/oc_rank.c` ranks (a pure
+function, unit-tested by `tests/rank_test.c`): ONNX Runtime + DirectML on a discrete non-Intel
+GPU (Windows; full model only), else OpenVINO's GPU device only when it is an Intel Arc /
+Xe-class GPU (Linux x86_64 and Windows x64; decided once OpenVINO has listed its devices), else
+OpenVINO's CPU device, else ONNX Runtime's CPU EP; explicit `EP` / `OV_DEVICE` / `MODEL` win, and
+one stderr line says what it resolved to and why. Setting `MODEL` (`auto` | `full` | `int4`) picks
 between the pack's full model (`defaults["splats-mono"].high`) and its small one (`.low`):
-`auto` = full when the bound backend is a GPU (OpenVINO GPU, DirectML, Core ML) and the OS
-reports ≥ 15 GiB of RAM (a "16 GB" machine), else int4 — and only among the models whose blobs
-are in the store (`pick_splat_model_locked`, re-picked at every warm).
+`auto` = full when the bound backend is a GPU (OpenVINO GPU, DirectML with ≥ 6 GB VRAM, Core ML)
+and the OS reports ≥ 15 GiB of RAM (a "16 GB" machine), else int4 — and only among the models
+whose blobs are in the store (`pick_splat_model_locked`, re-picked at every warm).
 
 **Public repository.** No internal data anywhere (code, comments, commit messages, docs): no
 dataset names or paths, no internal measurements, no vendor-module internals, no product or
@@ -37,6 +41,9 @@ re-upload of a model (exports are built from the official checkpoint by our own 
   sessions, the single-image run and the temporal run (IoBinding; the cache stays on device).
 - `src/oc_ov.{c,h}` — OpenVINO loaded at run time by absolute path through its C API (Linux: each
   library mapped in dependency order), the compiled-model cache, named-tensor runs with cancel.
+- `src/oc_rank.{c,h}` — the splat capability's backend ranking (DXGI adapters + OpenVINO GPU
+  devices + settings → backend, adapter / device, model), a pure function; `oc_dxgi_list_adapters`
+  (oc_ort.c) and `oc_ov_list_gpus` (oc_ov.c) feed it.
 - `src/oc_splat.{c,h}` — the splat capability's CPU work: the antialiased resample into the
   model's grid, the unprojection + covariance re-diagonalisation, the 3DGS PLY writer, the focus
   suggestion. `src/oc_tensor.h` — the named-tensor I/O both back ends share.

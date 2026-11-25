@@ -41,15 +41,13 @@ oc_ov_version(const struct oc_ov *ov)
 	return "";
 }
 
-bool
-oc_ov_has_device(struct oc_ov *ov, const char *prefix, char *full, size_t full_size)
+uint32_t
+oc_ov_list_gpus(struct oc_ov *ov, struct oc_ov_gpu *out, uint32_t max)
 {
 	(void)ov;
-	(void)prefix;
-	if (full != NULL && full_size > 0) {
-		full[0] = '\0';
-	}
-	return false;
+	(void)out;
+	(void)max;
+	return 0;
 }
 
 bool
@@ -327,35 +325,62 @@ oc_ov_load(const char *dir, struct oc_ov **out, char *detail, size_t detail_size
 	return OC_OV_OK;
 }
 
-bool
-oc_ov_has_device(struct oc_ov *ov, const char *prefix, char *full, size_t full_size)
+//! A string property of @p device into @p buf; false when not reported.
+static bool
+ov_prop(struct oc_ov *ov, const char *device, const char *key, char *buf, size_t size)
 {
-	if (full != NULL && full_size > 0) {
-		full[0] = '\0';
-	}
-	if (ov == NULL) {
+	char *v = NULL;
+	buf[0] = '\0';
+	if (ov->core_get_property(ov->core, device, key, &v) != OK || v == NULL) {
 		return false;
+	}
+	oc_copy_str(buf, size, v);
+	ov->free_str(v);
+	return true;
+}
+
+uint32_t
+oc_ov_list_gpus(struct oc_ov *ov, struct oc_ov_gpu *out, uint32_t max)
+{
+	if (ov == NULL) {
+		return 0;
 	}
 	ov_available_devices_t d;
 	memset(&d, 0, sizeof(d));
 	if (ov->core_devices(ov->core, &d) != OK) {
-		return false;
+		return 0;
 	}
-	bool found = false;
-	for (size_t i = 0; i < d.size && !found; i++) {
-		if (d.devices[i] != NULL && strncmp(d.devices[i], prefix, strlen(prefix)) == 0) {
-			found = true;
-			char *name = NULL;
-			if (full != NULL &&
-			    ov->core_get_property(ov->core, d.devices[i], "FULL_DEVICE_NAME", &name) == OK &&
-			    name != NULL) {
-				oc_copy_str(full, full_size, name);
-				ov->free_str(name);
-			}
+	uint32_t n = 0;
+	for (size_t i = 0; i < d.size && n < max; i++) {
+		if (d.devices[i] == NULL || strncmp(d.devices[i], "GPU", 3) != 0) {
+			continue;
+		}
+		struct oc_ov_gpu *g = &out[n++];
+		memset(g, 0, sizeof(*g));
+		oc_copy_str(g->device, sizeof(g->device), d.devices[i]);
+		if (!ov_prop(ov, d.devices[i], "FULL_DEVICE_NAME", g->name, sizeof(g->name))) {
+			oc_copy_str(g->name, sizeof(g->name), d.devices[i]);
+		}
+		char buf[64];
+		if (ov_prop(ov, d.devices[i], "DEVICE_TYPE", buf, sizeof(buf))) {
+			// ov::device::Type: "integrated" / "discrete" (older releases: "INTEGRATED").
+			g->type = (buf[0] == 'd' || buf[0] == 'D')   ? OC_OV_GPU_TYPE_DISCRETE
+			          : (buf[0] == 'i' || buf[0] == 'I') ? OC_OV_GPU_TYPE_INTEGRATED
+			                                             : OC_OV_GPU_TYPE_UNKNOWN;
+		}
+		if (ov_prop(ov, d.devices[i], "GPU_EXECUTION_UNITS_COUNT", buf, sizeof(buf))) {
+			g->eu_count = (uint32_t)strtoul(buf, NULL, 10);
+		}
+		if (ov_prop(ov, d.devices[i], "DEVICE_ARCHITECTURE", buf, sizeof(buf))) {
+			oc_rank_parse_ov_arch(buf, g);
+		}
+		char caps[256];
+		if (ov_prop(ov, d.devices[i], "OPTIMIZATION_CAPABILITIES", caps, sizeof(caps))) {
+			g->hw_matmul = strstr(caps, "GPU_HW_MATMUL") != NULL;
 		}
 	}
 	ov->devices_free(&d);
-	return found;
+	return n;
 }
 
 bool

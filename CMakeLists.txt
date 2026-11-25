@@ -90,6 +90,7 @@ add_library(${OPENCONV_PROVIDER} MODULE
 	src/oc_ov.c
 	src/oc_pack.c
 	src/oc_platform.c
+	src/oc_rank.c
 	src/oc_splat.c)
 target_include_directories(${OPENCONV_PROVIDER} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(${OPENCONV_PROVIDER} SYSTEM PRIVATE ${OPENCONV_ORT_INCLUDE_DIR})
@@ -167,6 +168,12 @@ if(OPENCONV_BUILD_TESTS)
 	endif()
 	openconv_warnings(open-conversion-fakehost)
 	add_dependencies(open-conversion-fakehost ${OPENCONV_PROVIDER})
+
+	# The splat backend ranking as a pure function, on described machines (no GPU needed).
+	add_executable(openconv-rank-test tests/rank_test.c src/oc_rank.c)
+	target_include_directories(openconv-rank-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+	openconv_warnings(openconv-rank-test)
+	add_test(NAME splats-rank COMMAND openconv-rank-test)
 
 	# The vendored IPC wire header stays compilable against the vendored ABI header.
 	add_library(openconv-header-check OBJECT tests/header_check.c)

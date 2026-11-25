@@ -1687,8 +1687,8 @@ run_splat_jobs(struct xrt_conversion_plugin_iface *iface,
 	// 3. A format it does not write: refused (job fails, no blob), the cap stays READY.
 	r = splat_job_once(iface, inst, cap, rgba, W, H, focal, XRT_CONV_BLOB_SOG, &ms, &out, &sr, &t);
 	check(r != XRT_SUCCESS && !ms.begun && sr.refusal_code == XRT_CONV_REFUSAL_UNSUPPORTED_INPUT &&
-	          sr.refusal_reason[0] != '\0',
-	      "a SOG request is refused with a reason (result %d, refusal %u '%s')", (int)r, sr.refusal_code,
+	          strstr(sr.refusal_reason, ".ply") != NULL,
+	      "a SOG request is refused with a reason naming .ply (result %d, refusal %u '%s')", (int)r, sr.refusal_code,
 	      sr.refusal_reason);
 	struct xrt_conv_state st;
 	memset(&st, 0, sizeof(st));

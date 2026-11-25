@@ -185,7 +185,7 @@
         {
           "id": "fp32",
           "backend": "onnxruntime",
-          "ep": ["openvino", "cpu"],
+          "ep": ["dml", "openvino", "cpu"],
           "precision": "fp32",
           "os": ["windows>=10.0.19041", "linux", "macos"],
           "min_ram_mb": 16384,

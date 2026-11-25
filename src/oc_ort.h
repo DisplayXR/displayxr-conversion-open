@@ -18,6 +18,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "oc_rank.h"
 #include "oc_tensor.h"
 
 #ifdef __cplusplus
@@ -120,6 +121,11 @@ oc_ort_has_coreml(const struct oc_ort *ort);
  *  adapters. false = no hardware adapter. Other OSes: always false. */
 bool
 oc_dml_pick_adapter(uint64_t preferred_luid, uint64_t avoid_luid, int *out_index, uint64_t *out_luid);
+
+/*! Windows: every DXGI adapter (hardware and software), in enumeration order,
+ *  into @p out (at most @p max). Returns the count; 0 on other OSes. */
+uint32_t
+oc_dxgi_list_adapters(struct oc_dxgi_adapter *out, uint32_t max);
 
 /*! Create a session for the model file at @p path (UTF-8, absolute; the
  *  verified blob the host resolved). @p threads 0 = ONNX Runtime's default.
