@@ -29,6 +29,9 @@ list(SORT _webp_sources)
 add_library(openconv_webp STATIC ${_webp_sources})
 target_include_directories(openconv_webp SYSTEM PUBLIC "${_webp_src}/src" "${_webp_src}")
 set_target_properties(openconv_webp PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden)
+# libwebp marks its API visibility("default"), which would export it from the provider: plain
+# extern keeps it hidden (the provider exports exactly one symbol).
+target_compile_definitions(openconv_webp PUBLIC "WEBP_EXTERN=extern")
 if(MSVC)
 	set_property(TARGET openconv_webp PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 	target_compile_options(openconv_webp PRIVATE /W0)
