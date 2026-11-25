@@ -1,7 +1,7 @@
 {
   "schema": 2,
   "pack": "dxr-open-sharp",
-  "generated": "2026-11-22",
+  "generated": "2026-11-24",
   "provider": "open-conversion",
   "commercial": false,
   "models": [
@@ -205,12 +205,116 @@
           ]
         }
       ]
+    },
+    {
+      "name": "sharp-fp16-1536",
+      "version": "1.0.0",
+      "task": "splats-mono",
+      "pipeline_tag": "image-to-3d",
+      "local_build": {
+        "script": "scripts/export_sharp.py",
+        "script_version": "1.2.0",
+        "requirements": "scripts/requirements-export-sharp.txt",
+        "deterministic": true,
+        "how": "Never downloaded: run `python scripts/export_sharp.py --accept-research-license --variant fp16` (DirectML machines only), which fetches the official checkpoint, verifies it, exports it, folds its shape arithmetic, converts it to float16 and writes these bytes into the model store."
+      },
+      "io": {
+        "input": {
+          "color_space": "srgb",
+          "range": [0, 1],
+          "layout": "nchw-rgb",
+          "normalize": null,
+          "resolution": "fixed-1536x1536",
+          "resize": "the whole image, stretched to 1536x1536 (aspect ratio not kept), bilinear (upstream: align_corners=True)",
+          "native_long_edge": 1536,
+          "intrinsics_in": "required",
+          "disparity_factor": "f_px / W of the ORIGINAL image (f_px = focal length in pixels, W = width in pixels); shape [1], float32. Upstream: f_px = f35 * sqrt(W^2 + H^2) / sqrt(36^2 + 24^2), f35 = EXIF 35 mm-equivalent focal length, else the raw focal length (x 8.4 below 10 mm), else 30"
+        },
+        "output": {
+          "splat_format": "sharp-projective",
+          "coords": "opencv",
+          "depth_kind": "metric",
+          "metric_basis": "model-estimated from disparity_factor; not a measured scale",
+          "count": 1179648,
+          "layers": 2,
+          "grid": [768, 768],
+          "order": "layer-major, then row, then column: index = layer * 589824 + y * 768 + x",
+          "means": "projective: (x_ndc * z, y_ndc * z, z); NDC (-1,-1) = top-left, (1,1) = bottom-right; z = depth along +Z",
+          "unproject": "D = diag(W / (2 f_px), H / (2 f_px), 1) with W, H, f_px of the ORIGINAL image: mean' = D mean; covariance' = D R diag(s^2) R^T D, re-decomposed (symmetric eigen) into scales and rotation",
+          "scales": "standard deviations (singular values of the covariance), linear, in the projective frame",
+          "rotations": "quaternion (w, x, y, z), NOT normalized: normalize before use",
+          "colors": "linear RGB in [0, 1]; for a 3DGS PLY convert to sRGB, then f_dc = (srgb - 0.5) / 0.28209479",
+          "opacities": "in (0, 1) (after sigmoid); a 3DGS PLY stores the logit",
+          "confidence": false
+        },
+        "tensors": {
+          "image": "image",
+          "disparity_factor": "disparity_factor",
+          "means": "mean_vectors",
+          "scales": "singular_values",
+          "rotations": "quaternions",
+          "colors": "colors",
+          "opacities": "opacities"
+        },
+        "shapes": {
+          "image": [1, 3, 1536, 1536],
+          "disparity_factor": [1],
+          "mean_vectors": [1, 1179648, 3],
+          "singular_values": [1, 1179648, 3],
+          "quaternions": [1, 1179648, 4],
+          "colors": [1, 1179648, 3],
+          "opacities": [1, 1179648]
+        },
+        "dtype": "float32"
+      },
+      "license": {
+        "spdx": "LicenseRef-apple-amlr",
+        "name": "apple-amlr",
+        "link": "https://huggingface.co/apple/Sharp/blob/50753d96c1f7ad0bae4184ddfb6aa98bca975f29/LICENSE",
+        "commercial": false,
+        "attribution": "SHARP by Apple, Apple Machine Learning Research Model licence (research use only; the licence follows derivatives)",
+        "dependencies": []
+      },
+      "provenance": {
+        "source_url": "https://huggingface.co/apple/Sharp/resolve/50753d96c1f7ad0bae4184ddfb6aa98bca975f29/sharp_2572gikvuh.pt",
+        "parent_sha256": "94211a75198c47f61fca7d739ba08a215418d8d398d48fddf023baccc24f073d",
+        "parent_size": 2809738232,
+        "base_model": "apple/Sharp",
+        "code": "https://github.com/apple/ml-sharp/tree/aed6527499ef91cba3b54c18d49a870f25947190",
+        "converter": "displayxr-conversion-open scripts/export_sharp.py 1.2.0",
+        "converted_by": "the user, locally: fp32 ONNX export (opset 18); static shape arithmetic folded (ONNX Runtime basic graph optimisation, standard operators only); float16 conversion (onnxconverter-common, fp32 inputs and outputs; the Gaussian composer, initialiser, prediction head and instance normalisations stay fp32); the graph and one external-data file, which the graph names by its own sha256"
+      },
+      "prefetch": false,
+      "variants": [
+        {
+          "id": "fp16",
+          "backend": "onnxruntime",
+          "ep": ["dml"],
+          "precision": "fp16",
+          "os": ["windows>=10.0.19041"],
+          "min_ram_mb": 16384,
+          "files": [
+            {
+              "role": "model",
+              "format": "onnx",
+              "sha256": "bc910d0d885f3840123d02a7c504c48195e0d3e91da16a42ec1399bae3f62567",
+              "size": 1197831
+            },
+            {
+              "role": "data",
+              "format": "bin",
+              "sha256": "8e156871dd80ec9357dc0674788954d1d79bd609a43e8b5154d984a9ec34870d",
+              "size": 1326800640
+            }
+          ]
+        }
+      ]
     }
   ],
   "defaults": {
     "splats-mono": {
       "low": "sharp-int4-1536",
-      "medium": "sharp-int4-1536",
+      "medium": "sharp-fp16-1536",
       "high": "sharp-full-1536"
     }
   }

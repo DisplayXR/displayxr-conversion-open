@@ -1,10 +1,11 @@
 # Copyright 2026, The DisplayXR Project
 # SPDX-License-Identifier: BSL-1.0
 #
-# Pinned environment for scripts/export_sharp.py. The int4 bytes the pack lists
+# Pinned environment for scripts/export_sharp.py. The bytes the pack lists
 # (packs/dxr-open-sharp.models.json) were produced with exactly these versions;
-# torch (the exporter), onnx + protobuf (serialisation) and onnxruntime (the
-# quantizer) decide the bytes. Python 3.12.
+# torch (the exporter), onnx + protobuf (serialisation), onnxruntime (the int4
+# quantizer and the fp16 variant's graph folding) and onnxconverter-common (the
+# fp16 conversion) decide the bytes. Python 3.12.
 #
 #   python3.12 -m venv sharp-venv
 #   sharp-venv/bin/pip install -r scripts/requirements-export-sharp.txt
@@ -18,6 +19,7 @@ torchvision==0.29.2+cpu ; sys_platform != "darwin"
 torchvision==0.29.2 ; sys_platform == "darwin"
 onnx==1.23.2
 onnxruntime==1.31.1
+onnxconverter-common==1.16.0
 onnxscript==0.7.2
 onnx-ir==1.1.0
 protobuf==7.36.2
