@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: BSL-1.0
 #
 # Tag-triggered release: vX.Y.Z -> Windows NSIS installer + Linux tarball attached to the
-# GitHub Release. Builds are unsigned (the release notes say so). The ordinary `build`
-# workflow already runs every test on each push; this lane only builds and packages.
+# GitHub Release. Builds here are unsigned; signed releases come from the signing provider
+# (the runtime's docs/specs/runtime/release-signing.md, driven by `/dxr-release
+# open-conversion`), which rebuilds the tag with SIGN_CMD and replaces the unsigned Windows
+# installer. The ordinary `build` workflow already runs every test on each push; this lane
+# only builds and packages.
 
 name: release
 
