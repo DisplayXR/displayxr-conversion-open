@@ -655,14 +655,22 @@ environment, else `Settings\<KEY>` under the registry row (Windows) or the manif
 
 ## Releases and installing
 
-A `vX.Y.Z` tag builds and attaches (unsigned):
+A `vX.Y.Z` tag builds and attaches the packages below. CI builds them unsigned; the Windows
+installer on the release is then replaced by a signed build of the same tag from the DisplayXR
+signing provider (`/dxr-release open-conversion`, the runtime's
+`docs/specs/runtime/release-signing.md`): the provider DLL, the uninstaller and the installer
+are Authenticode-signed, while the bundled ONNX Runtime, DirectML and OpenVINO DLLs keep their
+vendors' own signatures. The installer script signs when `SIGN_CMD` is defined
+(`makensis /DSIGN_CMD=<signer>`, the signer takes the file as its last argument; the DLL is
+signed before packaging); without it the build is unsigned, as CI's is.
 
 - `DisplayXROpenConversionSetup-<version>.exe` (Windows, DirectML + CPU): installs under
   `Program Files\DisplayXR\Plugins\OpenConversion`, writes the `ConversionProviders\open-conversion`
-  row (`ProbeOrder` 200, `Packs` = the shipped pack manifest, `Version` last) and, because the
-  build is unsigned, the provider DLL's SHA-256 under `HKLM\Software\DisplayXR\Trust\Allowlist`
-  (ADR-054 N4b: the runtime's provenance gate enforces on Windows and refuses an unsigned,
-  non-allowlisted component — 0.1.0 shipped without the row and was never loaded). It downloads
+  row (`ProbeOrder` 200, `Packs` = the shipped pack manifest, `Version` last) and the provider
+  DLL's SHA-256 under `HKLM\Software\DisplayXR\Trust\Allowlist` (ADR-054 N4b: the runtime's
+  provenance gate enforces on Windows and refuses an unsigned, non-allowlisted component — 0.1.0
+  shipped without the row and was never loaded). A signed DLL passes the gate on its signature;
+  the row, computed from the shipped bytes, is then redundant and harmless. It downloads
   no model; the runtime model store fetches blobs by URL and SHA-256 on first use. The uninstaller
   removes only this provider's row, its allowlist row and files, never the model store. It does
   **not** stop or start `displayxr-service`, by the runtime's installer contract (discovery spec

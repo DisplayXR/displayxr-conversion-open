@@ -11,8 +11,8 @@
 ; Order-independent: no runtime prerequisite. The uninstaller removes only this provider row
 ; and files, never the runtime or its model store.
 ;
-; Build-time definitions: VERSION, DIST_DIR (a `cmake --install` tree), OUTPUT_DIR, and
-; ALLOWLIST_NSH (see below).
+; Build-time definitions: VERSION, DIST_DIR (a `cmake --install` tree), OUTPUT_DIR,
+; ALLOWLIST_NSH (see below), and SIGN_CMD (optional; see "Code signing").
 ;
 ; ADR-054 N4b: the runtime's provenance gate ENFORCES on Windows — a component DLL must be
 ; Authenticode-signed or have its SHA-256 under HKLM\Software\DisplayXR\Trust\Allowlist, or
@@ -31,6 +31,35 @@
 	!define OUTPUT_DIR "."
 !endif
 
+; Code signing (SIGN_CMD; undefined or empty = unsigned build, exactly as before). No
+; certificate or secret lives here: the signing provider passes a per-file signer command
+; that takes the file path as its last argument. The installer .exe is signed via
+; !finalize; the UNINSTALLER via a two-pass build (compile an INNER installer whose only
+; job is to emit the uninstaller to %TEMP%, run it, sign that file, File-include it in the
+; real pass), because !uninstfinalize can leave the uninstaller with the installer's
+; certificate-table pointer dangling past its end. Same recipe as the DisplayXR runtime and
+; the Leia conversion provider. The provider DLL itself is signed BEFORE makensis runs, by
+; the caller, and the allowlist row (ALLOWLIST_NSH) is generated from the signed bytes.
+!ifndef INNER
+	!ifdef SIGN_CMD
+		!if "${SIGN_CMD}" != ""
+			!ifdef ALLOWLIST_NSH
+				!define OC_INNER_ALLOWLIST '"-DALLOWLIST_NSH=${ALLOWLIST_NSH}"'
+			!else
+				!define OC_INNER_ALLOWLIST ''
+			!endif
+			!finalize '${SIGN_CMD} "%1"'
+			!makensis '-DINNER "-DVERSION=${VERSION}" "-DDIST_DIR=${DIST_DIR}" ${OC_INNER_ALLOWLIST} "DisplayXROpenConversionInstaller.nsi"' = 0
+			; makensis runs in the script's own directory (its default, i.e. no /NOCD), so the inner
+			; pass names the script by file. Its .onInit writes %TEMP%\OpenConversion_Uninstall.exe,
+			; then Quit (exit 2).
+			!system '"$%TEMP%\DisplayXROpenConversion_inner.exe"' = 2
+			!system '${SIGN_CMD} "$%TEMP%\OpenConversion_Uninstall.exe"' = 0
+			!define USE_PRESIGNED_UNINST
+		!endif
+	!endif
+!endif
+
 !ifdef ALLOWLIST_NSH
 	!include "${ALLOWLIST_NSH}"
 !else
@@ -46,8 +75,13 @@
 !define UNINST "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXROpenConversion"
 
 Name "DisplayXR Open Conversion ${VERSION}"
-OutFile "${OUTPUT_DIR}\DisplayXROpenConversionSetup-${VERSION}.exe"
-RequestExecutionLevel admin
+!ifdef INNER
+	OutFile "$%TEMP%\DisplayXROpenConversion_inner.exe"
+	RequestExecutionLevel user
+!else
+	OutFile "${OUTPUT_DIR}\DisplayXROpenConversionSetup-${VERSION}.exe"
+	RequestExecutionLevel admin
+!endif
 InstallDir "$PROGRAMFILES64\DisplayXR\Plugins\OpenConversion"
 InstallDirRegKey HKLM "Software\DisplayXR\Plugins\OpenConversion" "InstallPath"
 ShowInstDetails show
@@ -62,6 +96,13 @@ AllowSkipFiles off
 Var MaintMutex
 
 Function .onInit
+!ifdef INNER
+	; Inner signing pass only: emit the uninstaller (the binary the outer pass signs and
+	; File-includes), then bail: no UI, no install, no registry. Exits 2 by design.
+	SetSilent silent
+	WriteUninstaller "$%TEMP%\OpenConversion_Uninstall.exe"
+	Quit
+!endif
 	${IfNot} ${RunningX64}
 		SetErrorLevel 3
 		Abort
@@ -95,7 +136,11 @@ Section "Open Conversion provider"
 	SetRegView 64
 	SetOutPath "$INSTDIR"
 	File /r "${DIST_DIR}\*.*"
+!ifdef USE_PRESIGNED_UNINST
+	File "/oname=Uninstall.exe" "$%TEMP%\OpenConversion_Uninstall.exe"
+!else
 	WriteUninstaller "$INSTDIR\Uninstall.exe"
+!endif
 
 	; The row. Values first, Version LAST (the "row complete" marker).
 	WriteRegStr   HKLM "${ROW}" "Binary"          "$INSTDIR\DisplayXR-OpenConversion.dll"
