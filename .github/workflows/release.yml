@@ -88,3 +88,39 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: false
+
+  # Tell displayxr-runtime to bump versions.json[conversion_open] to this tag, the way the
+  # Leia conversion provider does for `leia_conversion` and the Leia SR plug-in for
+  # `leia_plugin`. "Released = tested": a tag here means this build is meant for the dev
+  # orchestrator and the bundle. Needs `release`, so the runtime side always finds the
+  # assets. The App token is the org's publish bot (org secrets DISPLAYXR_APP_ID /
+  # DISPLAYXR_APP_PRIVATE_KEY); GITHUB_TOKEN is not used. Forks skip it. Before this job
+  # existed (v0.2.0 to v0.2.2) the bump was dispatched by hand:
+  #   gh workflow run versions-bump.yml -R DisplayXR/displayxr-runtime \
+  #     -f field=conversion_open -f tag=vX.Y.Z -f source_repo=DisplayXR/displayxr-conversion-open
+  dispatch-versions-bump:
+    if: github.repository_owner == 'DisplayXR'
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint dispatch token
+        id: dispatch-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DISPLAYXR_APP_ID }}
+          private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
+          owner: DisplayXR
+          repositories: displayxr-runtime
+
+      - name: Dispatch versions.json bump
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ steps.dispatch-token.outputs.token }}
+          repository: DisplayXR/displayxr-runtime
+          event-type: versions-bump
+          client-payload: |
+            {
+              "field":       "conversion_open",
+              "tag":         "${{ github.ref_name }}",
+              "source_repo": "${{ github.repository }}"
+            }
