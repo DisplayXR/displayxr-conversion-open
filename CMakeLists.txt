@@ -124,7 +124,10 @@ openconv_warnings(${OPENCONV_PROVIDER})
 # Ship-together files next to the binary: ONNX Runtime (+ DirectML) and the packs. Every
 # packs/*.models.json ships (the provider loads every *.models.json next to it): a
 # research-only model is its own pack, never the default one, and never pre-fetched.
-file(GLOB OPENCONV_PACKS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/packs/*.models.json")
+# A pack's licence texts (packs/*.txt, named by local_build.sources[].license.text) ship beside it:
+# the Dashboard shows the text offline, pinned by its sha256.
+file(GLOB OPENCONV_PACKS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/packs/*.models.json"
+	"${CMAKE_CURRENT_SOURCE_DIR}/packs/*.txt")
 set(_ship ${OPENCONV_ORT_RUNTIME_FILES} ${OPENCONV_PACKS})
 add_custom_command(TARGET ${OPENCONV_PROVIDER} POST_BUILD
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_ship} $<TARGET_FILE_DIR:${OPENCONV_PROVIDER}>

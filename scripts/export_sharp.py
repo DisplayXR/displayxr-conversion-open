@@ -226,11 +226,12 @@ def prepare_ml_sharp_archive(work):
             prefix = names[0].split("/")[0] + "/"
             files = [(n[len(prefix):], z.read(n)) for n in names
                      if n.startswith(prefix) and n[len(prefix):].startswith("src/")]
+            notices = [(r, z.read(prefix + r)) for r in ("LICENSE", "ACKNOWLEDGEMENTS") if prefix + r in names]
         got = ml_sharp_tree_sha256(files)
         if got != ML_SHARP_SRC_TREE_SHA256:
             fail(f"apple/ml-sharp archive src/ tree {got} is not the pinned {ML_SHARP_SRC_TREE_SHA256}; refusing it")
         shutil.rmtree(dest, ignore_errors=True)
-        for rel, blob in files:
+        for rel, blob in files + notices:
             out = os.path.join(dest, *rel.split("/"))
             os.makedirs(os.path.dirname(out), exist_ok=True)
             with open(out, "wb") as f:
@@ -243,7 +244,33 @@ def prepare_ml_sharp_archive(work):
     return src
 
 
+# The model builder carries apple/ml-sharp's src/ (and its LICENSE, which allows redistribution
+# with the notice kept) inside its own files, put there at freeze time by prepare_ml_sharp_archive.
+BUNDLED_ML_SHARP = os.path.join(getattr(sys, "_MEIPASS", _HERE), "ml-sharp") if FROZEN else None
+
+
+def prepare_ml_sharp_bundled():
+    """The builder's own copy of apple/ml-sharp's src/, re-checked against the pinned tree hash."""
+    src = os.path.join(BUNDLED_ML_SHARP, "src")
+    files = []
+    for dirpath, _, names in os.walk(src):
+        for n in names:
+            full = os.path.join(dirpath, n)
+            rel = os.path.relpath(full, BUNDLED_ML_SHARP).replace(os.sep, "/")
+            if "__pycache__" in rel.split("/"):
+                continue
+            with open(full, "rb") as f:
+                files.append((rel, f.read()))
+    got = ml_sharp_tree_sha256(files)
+    if got != ML_SHARP_SRC_TREE_SHA256:
+        fail(f"the bundled apple/ml-sharp src/ tree {got} is not the pinned {ML_SHARP_SRC_TREE_SHA256}")
+    log(f"ml-sharp ok: {ML_SHARP_COMMIT} (bundled, src/ tree {ML_SHARP_SRC_TREE_SHA256[:16]})")
+    return src
+
+
 def prepare_ml_sharp(path, work):
+    if path is None and BUNDLED_ML_SHARP and os.path.isdir(BUNDLED_ML_SHARP):
+        return prepare_ml_sharp_bundled()
     if path is None and (FROZEN or shutil.which("git") is None):
         return prepare_ml_sharp_archive(work)
     if path is None:

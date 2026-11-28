@@ -15,7 +15,32 @@
         "script_version": "1.0.0",
         "requirements": "scripts/requirements-export-sharp.txt",
         "deterministic": true,
-        "how": "Never downloaded: run `python scripts/export_sharp.py --accept-research-license`, which fetches the official checkpoint, verifies it, exports and quantizes it, and writes these bytes into the model store."
+        "how": "Never downloaded: the Dashboard's Build button or `displayxr-cli conv models fetch dxr-open-sharp --model sharp-int4-1536 --accept-license apple-amlr` builds it on this machine with the signed model builder; or run `python scripts/export_sharp.py --accept-research-license`, which fetches the official checkpoint, verifies it, exports and quantizes it, and writes these bytes into the model store.",
+        "recipe": "sharp-onnx",
+        "variant": "int4",
+        "tool": {
+          "id": "open-model-builder",
+          "catalog_id": "open-conversion-model-builder",
+          "min_version": "1.0.0",
+          "signer": "first-party"
+        },
+        "sources": [
+          {
+            "role": "checkpoint",
+            "url": "https://huggingface.co/apple/Sharp/resolve/50753d96c1f7ad0bae4184ddfb6aa98bca975f29/sharp_2572gikvuh.pt",
+            "revision": "50753d96c1f7ad0bae4184ddfb6aa98bca975f29",
+            "sha256": "94211a75198c47f61fca7d739ba08a215418d8d398d48fddf023baccc24f073d",
+            "size": 2809738232,
+            "license": {
+              "id": "apple-amlr",
+              "name": "Apple Machine Learning Research Model License Agreement",
+              "link": "https://huggingface.co/apple/Sharp/blob/50753d96c1f7ad0bae4184ddfb6aa98bca975f29/LICENSE",
+              "text": "dxr-open-sharp.apple-amlr.txt",
+              "text_sha256": "e177a921ef25a523c429c6916e819c769bb4942619aadd16afe0108105a2baaf"
+            }
+          }
+        ],
+        "needs": { "ram_mb": 12288, "disk_mb": 12288, "os": ["windows>=10.0.19041", "linux", "macos"] }
       },
       "io": {
         "input": {
@@ -112,7 +137,32 @@
         "script_version": "1.1.0",
         "requirements": "scripts/requirements-export-sharp.txt",
         "deterministic": true,
-        "how": "Never downloaded: run `python scripts/export_sharp.py --accept-research-license --variant full` (or `--variant both`), which fetches the official checkpoint, verifies it, exports it and writes these bytes into the model store."
+        "how": "Never downloaded: the Dashboard's Build button or `displayxr-cli conv models fetch dxr-open-sharp --model sharp-full-1536 --accept-license apple-amlr` builds it on this machine with the signed model builder; or run `python scripts/export_sharp.py --accept-research-license --variant full` (or `--variant both`), which fetches the official checkpoint, verifies it, exports it and writes these bytes into the model store.",
+        "recipe": "sharp-onnx",
+        "variant": "full",
+        "tool": {
+          "id": "open-model-builder",
+          "catalog_id": "open-conversion-model-builder",
+          "min_version": "1.0.0",
+          "signer": "first-party"
+        },
+        "sources": [
+          {
+            "role": "checkpoint",
+            "url": "https://huggingface.co/apple/Sharp/resolve/50753d96c1f7ad0bae4184ddfb6aa98bca975f29/sharp_2572gikvuh.pt",
+            "revision": "50753d96c1f7ad0bae4184ddfb6aa98bca975f29",
+            "sha256": "94211a75198c47f61fca7d739ba08a215418d8d398d48fddf023baccc24f073d",
+            "size": 2809738232,
+            "license": {
+              "id": "apple-amlr",
+              "name": "Apple Machine Learning Research Model License Agreement",
+              "link": "https://huggingface.co/apple/Sharp/blob/50753d96c1f7ad0bae4184ddfb6aa98bca975f29/LICENSE",
+              "text": "dxr-open-sharp.apple-amlr.txt",
+              "text_sha256": "e177a921ef25a523c429c6916e819c769bb4942619aadd16afe0108105a2baaf"
+            }
+          }
+        ],
+        "needs": { "ram_mb": 12288, "disk_mb": 12288, "os": ["windows>=10.0.19041", "linux", "macos"] }
       },
       "io": {
         "input": {
@@ -216,7 +266,32 @@
         "script_version": "1.4.0",
         "requirements": "scripts/requirements-export-sharp.txt",
         "deterministic": true,
-        "how": "Never downloaded: run `python scripts/export_sharp.py --accept-research-license --variant fp16` (DirectML machines only), which fetches the official checkpoint, verifies it, exports it, folds its shape arithmetic, converts it to float16 (fp32 inputs and outputs) and writes these bytes into the model store."
+        "how": "Never downloaded: the Dashboard's Build button or `displayxr-cli conv models fetch dxr-open-sharp --model sharp-fp16-1536 --accept-license apple-amlr` builds it on this machine with the signed model builder; or run `python scripts/export_sharp.py --accept-research-license --variant fp16` (DirectML machines only), which fetches the official checkpoint, verifies it, exports it, folds its shape arithmetic, converts it to float16 (fp32 inputs and outputs) and writes these bytes into the model store.",
+        "recipe": "sharp-onnx",
+        "variant": "fp16",
+        "tool": {
+          "id": "open-model-builder",
+          "catalog_id": "open-conversion-model-builder",
+          "min_version": "1.0.0",
+          "signer": "first-party"
+        },
+        "sources": [
+          {
+            "role": "checkpoint",
+            "url": "https://huggingface.co/apple/Sharp/resolve/50753d96c1f7ad0bae4184ddfb6aa98bca975f29/sharp_2572gikvuh.pt",
+            "revision": "50753d96c1f7ad0bae4184ddfb6aa98bca975f29",
+            "sha256": "94211a75198c47f61fca7d739ba08a215418d8d398d48fddf023baccc24f073d",
+            "size": 2809738232,
+            "license": {
+              "id": "apple-amlr",
+              "name": "Apple Machine Learning Research Model License Agreement",
+              "link": "https://huggingface.co/apple/Sharp/blob/50753d96c1f7ad0bae4184ddfb6aa98bca975f29/LICENSE",
+              "text": "dxr-open-sharp.apple-amlr.txt",
+              "text_sha256": "e177a921ef25a523c429c6916e819c769bb4942619aadd16afe0108105a2baaf"
+            }
+          }
+        ],
+        "needs": { "ram_mb": 12288, "disk_mb": 12288, "os": ["windows>=10.0.19041", "linux", "macos"] }
       },
       "io": {
         "input": {

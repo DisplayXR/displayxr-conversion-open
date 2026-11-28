@@ -29,10 +29,19 @@ if(NOT DEFINED VERSION)
 	set(VERSION "dev")
 endif()
 
-# The one runtime-loaded binary in the `cmake --install` tree (DIST_DIR).
-set(_shipped_plugins
-	"${BIN_DIR}/DisplayXR-OpenConversion.dll"
-)
+# The one runtime-loaded binary in the `cmake --install` tree (DIST_DIR), or -DFILES=<a;b>
+# (names under BIN_DIR): the model builder installer passes dxr-model-builder.exe, the one
+# binary the runtime's model store runs (conversion-provider-discovery section 5.6.3 step 4).
+if(DEFINED FILES)
+	set(_shipped_plugins "")
+	foreach(_f IN LISTS FILES)
+		list(APPEND _shipped_plugins "${BIN_DIR}/${_f}")
+	endforeach()
+else()
+	set(_shipped_plugins
+		"${BIN_DIR}/DisplayXR-OpenConversion.dll"
+	)
+endif()
 
 set(_write "")
 set(_remove "")
