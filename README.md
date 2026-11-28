@@ -691,7 +691,25 @@ signed before packaging); without it the build is unsigned, as CI's is.
   dependency is the GPU driver, which nothing should bundle: `install.sh` prints a note when no
   OpenCL loader is present (the capability then runs on OpenVINO's CPU device). `uninstall.sh`
   removes both.
-- Neither package carries a splat model's weights; the Windows installer lists the splat pack in
+- `displayxr-open-conversion_<version>_amd64.deb` (the same payload, system-wide, for the Linux
+  meta-installer bundle and `apt install`): the payload goes to
+  `/usr/lib/displayxr/plugins/open-conversion/`, the manifest
+  (`200-open-conversion-conversion-provider.json`, `packs` = every pack shipped) to
+  `/usr/lib/displayxr/plugins/`, all root-owned, so the runtime classifies the provider
+  `platform-trusted`. The payload sits one level down because the provider loads every
+  `*.models.json` next to it and would otherwise pick up other providers' packs from the shared
+  root. `Depends: displayxr-runtime (>= OPENCONV_MIN_RUNTIME_VERSION)` (`CMakeLists.txt`) plus the
+  versioned C / C++ runtime libraries `dpkg-shlibdeps` derives; `Recommends: ocl-icd-libopencl1`
+  (OpenVINO's GPU device; without it the splat capability runs on OpenVINO's CPU device);
+  `Suggests: intel-opencl-icd`. Built on Ubuntu 22.04 and install-checked in clean 22.04 / 24.04 /
+  26.04 containers next to the released runtime `.deb` (`scripts/verify_deb_install_linux.sh`).
+  Its maintainer scripts only ask the runtime's `displayxr-restart-service` helper to restart a
+  running user service. Model weights are not in it and it creates no store: the runtime's model
+  store lives in the hosting process's `$XDG_DATA_HOME/displayxr/models` (the user's, since the
+  service is a user unit), wherever the provider is installed. A per-user manifest with the same
+  id (the tarball's `install.sh`) shadows the system one; run the tarball's `uninstall.sh` when
+  moving to the package.
+- No package carries a splat model's weights; the Windows installer lists the splat pack in
   `Packs` when the build ships it.
 
 ## Registration

@@ -1,8 +1,8 @@
 # Copyright 2026, The DisplayXR Project
 # SPDX-License-Identifier: BSL-1.0
 #
-# Tag-triggered release: vX.Y.Z -> Windows NSIS installer + Linux tarball attached to the
-# GitHub Release. Builds here are unsigned; signed releases come from the signing provider
+# Tag-triggered release: vX.Y.Z -> Windows NSIS installer + Linux tarball (per-user) + Linux .deb
+# (system-wide) attached to the GitHub Release. Builds here are unsigned; signed releases come from the signing provider
 # (the runtime's docs/specs/runtime/release-signing.md, driven by `/dxr-release
 # open-conversion`), which rebuilds the tag with SIGN_CMD and replaces the unsigned Windows
 # installer. The ordinary `build` workflow already runs every test on each push; this lane
@@ -56,27 +56,66 @@ jobs:
           path: out/DisplayXROpenConversionSetup-*.exe
           if-no-files-found: error
 
+  # Built in an ubuntu:22.04 container (the oldest supported release): the tarball and the
+  # .deb carry the build host's glibc floor, and both must run on 22.04 / 24.04 / 26.04.
   linux:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
     steps:
+      - name: Build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates build-essential cmake python3 dpkg-dev fakeroot binutils
       - uses: actions/checkout@v4
       - name: Version from tag
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
       - name: Build
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOPENCONV_BUILD_TESTS=OFF -DOPENCONV_DOWNLOAD_DIR="$PWD/downloads"
           cmake --build build
           cmake --install build --prefix dist
       - name: Tarball
         run: bash scripts/package_posix.sh dist "$VERSION" out
+      - name: Debian package (system-wide)
+        env:
+          DXR_DEB_MAX_GLIBC: "2.35"
+        run: bash scripts/package_deb.sh dist "$VERSION" out
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-tarball
-          path: out/*.tar.gz
+          name: linux-packages
+          path: |
+            out/*.tar.gz
+            out/*.deb
           if-no-files-found: error
 
+  # The released .deb installs next to the released runtime .deb on every supported release.
+  deb-install:
+    name: deb-install (Ubuntu ${{ matrix.release }})
+    needs: linux
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['22.04', '24.04', '26.04']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-packages
+          path: out
+      - name: Fetch the latest released runtime .deb
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download --repo DisplayXR/displayxr-runtime --pattern 'displayxr-runtime_*_amd64.deb' --dir runtime-deb
+      - name: apt install + ldd -r + discovery in clean ubuntu:${{ matrix.release }}
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w "ubuntu:${{ matrix.release }}" \
+            ./scripts/verify_deb_install_linux.sh out/*.deb runtime-deb/*.deb
+
   release:
-    needs: [windows, linux]
+    needs: [windows, linux, deb-install]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4

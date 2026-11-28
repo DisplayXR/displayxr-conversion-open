@@ -23,6 +23,12 @@ project(displayxr_conversion_open VERSION 0.2.0 LANGUAGES C)
 # re-vendor the headers in that PR.
 set(DXR_RUNTIME_GIT_TAG "v2.69.4")
 
+# The oldest runtime the Linux .deb Depends on (scripts/package_deb.sh reads this line): the
+# conversion-provider ABI 1 (2.41.0), POSIX manifests with `packs` and the runtime-owned model
+# store (2.45.0, #2108), and that store downloading over http(s) on POSIX (2.47.1, #2195);
+# without the last, every model is FAILED(NETWORK) on Linux. A floor, not the header pin above.
+set(OPENCONV_MIN_RUNTIME_VERSION "2.47.1")
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 # gnu11 on GCC / Clang: POSIX (nanosleep, realpath, dladdr) is visible without feature macros.
