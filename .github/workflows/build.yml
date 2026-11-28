@@ -151,3 +151,59 @@ jobs:
           name: open-conversion-${{ matrix.os }}
           path: dist
           if-no-files-found: error
+
+  # The system-wide Linux package, exactly as the release lane builds it: in ubuntu:22.04 (the
+  # oldest supported release; the package carries its build host's glibc floor).
+  deb:
+    name: deb (built on Ubuntu 22.04)
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    steps:
+      - name: Build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates build-essential cmake python3 dpkg-dev fakeroot binutils shellcheck
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git describe -> the package version
+      - name: Script lint
+        run: shellcheck --severity=warning scripts/package_posix.sh scripts/package_deb.sh scripts/verify_deb_install_linux.sh
+      - name: Build
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOPENCONV_BUILD_TESTS=OFF -DOPENCONV_DOWNLOAD_DIR="$PWD/downloads"
+          cmake --build build
+          cmake --install build --prefix dist
+      - name: Debian package
+        env:
+          DXR_DEB_MAX_GLIBC: "2.35"
+        run: bash scripts/package_deb.sh dist "$(git describe --tags --always --dirty --match 'v[0-9]*')" out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: open-conversion-deb
+          path: out/*.deb
+          if-no-files-found: error
+
+  deb-install:
+    name: deb-install (Ubuntu ${{ matrix.release }})
+    needs: deb
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['22.04', '24.04', '26.04']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: open-conversion-deb
+          path: out
+      - name: Fetch the latest released runtime .deb
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download --repo DisplayXR/displayxr-runtime --pattern 'displayxr-runtime_*_amd64.deb' --dir runtime-deb
+      - name: apt install + ldd -r + discovery in clean ubuntu:${{ matrix.release }}
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w "ubuntu:${{ matrix.release }}" \
+            ./scripts/verify_deb_install_linux.sh out/*.deb runtime-deb/*.deb

@@ -89,6 +89,10 @@ re-upload of a model (exports are built from the official checkpoint by our own 
   store. Both outputs are byte-deterministic. The version written into a blob's metadata is its
   recipe's (`VARIANTS`), not `SCRIPT_VERSION`, so an unrelated script change never moves a pinned
   hash. Never commit or publish its output: the weights are research-only.
+- `scripts/package_posix.sh` — the per-user Linux tarball; `scripts/package_deb.sh` — the system-wide
+  `.deb` (built on Ubuntu 22.04; payload in `/usr/lib/displayxr/plugins/open-conversion/`, manifest
+  in the plug-in root; `Depends` floor `OPENCONV_MIN_RUNTIME_VERSION` in `CMakeLists.txt`);
+  `scripts/verify_deb_install_linux.sh` — its install check, root in a throwaway container only.
 - `cmake/OnnxRuntime.cmake`, `cmake/OpenVINO.cmake` — the pinned archives and their SHA-256.
 - `tests/make_tiny_splat_model.py` — a synthetic splat model with the real I/O contract and its
   expected output (the splat CTests; needs `onnx`), plus a two-model pack (`tiny-full` stored as
