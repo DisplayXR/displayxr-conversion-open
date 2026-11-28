@@ -68,6 +68,7 @@ Exit code 0 = done, 1 = a check failed (bad hash, wrong commit, parity), 2 = usa
 import argparse
 import gc
 import hashlib
+import io
 import json
 import logging
 import os
@@ -91,13 +92,22 @@ LICENSE_URL = f"https://huggingface.co/apple/Sharp/blob/{CHECKPOINT_REVISION}/LI
 # Apple's reference model code.
 ML_SHARP_REPO = "https://github.com/apple/ml-sharp.git"
 ML_SHARP_COMMIT = "aed6527499ef91cba3b54c18d49a870f25947190"
+# Without git (the frozen export tool, or a machine with no git): the same commit as GitHub's
+# source archive, accepted only when its src/ tree hashes to this (ml_sharp_tree_sha256: the
+# sorted relative paths with each file's SHA-256; the archive's own bytes are not stable).
+ML_SHARP_ARCHIVE_URL = f"https://codeload.github.com/apple/ml-sharp/zip/{ML_SHARP_COMMIT}"
+ML_SHARP_SRC_TREE_SHA256 = "8cc6748c48480225c1862c96f8623421afcd25ad4223d96bc4b26e5ba2a8383b"
 
 RESOLUTION = 1536
 OPSET = 18
 INPUTS = ["image", "disparity_factor"]
 OUTPUTS = ["mean_vectors", "singular_values", "quaternions", "colors", "opacities"]
 
-PACK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "packs", "dxr-open-sharp.models.json")
+# Frozen (PyInstaller) export tool: the pack is bundled next to the program's own files.
+FROZEN = bool(getattr(sys, "frozen", False))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+PACK_FILE = (os.path.join(getattr(sys, "_MEIPASS", _HERE), "packs", "dxr-open-sharp.models.json") if FROZEN
+             else os.path.join(_HERE, "..", "packs", "dxr-open-sharp.models.json"))
 # variant -> (pack model, the script version whose recipe made these bytes). That version is
 # written into the model's metadata, so it is part of the bytes: it changes only when the
 # recipe does, never with an unrelated script change.
@@ -192,7 +202,50 @@ def git(*args, cwd=None):
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
 
 
+def ml_sharp_tree_sha256(files):
+    """@p files: (relative path under the repo root, bytes) for every file under src/."""
+    h = hashlib.sha256()
+    for rel, data in sorted(files):
+        h.update(rel.encode() + b"\0" + hashlib.sha256(data).hexdigest().encode() + b"\n")
+    return h.hexdigest()
+
+
+def prepare_ml_sharp_archive(work):
+    """apple/ml-sharp at the pinned commit from GitHub's source archive (no git needed)."""
+    import zipfile
+
+    dest = os.path.join(work, f"ml-sharp-{ML_SHARP_COMMIT[:12]}")
+    src = os.path.join(dest, "src")
+    if not os.path.isfile(os.path.join(dest, ".tree-ok")):
+        log(f"downloading {ML_SHARP_ARCHIVE_URL} ...")
+        req = urllib.request.Request(ML_SHARP_ARCHIVE_URL, headers={"User-Agent": "displayxr-export-sharp"})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = r.read()
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            names = [n for n in z.namelist() if not n.endswith("/")]
+            prefix = names[0].split("/")[0] + "/"
+            files = [(n[len(prefix):], z.read(n)) for n in names
+                     if n.startswith(prefix) and n[len(prefix):].startswith("src/")]
+        got = ml_sharp_tree_sha256(files)
+        if got != ML_SHARP_SRC_TREE_SHA256:
+            fail(f"apple/ml-sharp archive src/ tree {got} is not the pinned {ML_SHARP_SRC_TREE_SHA256}; refusing it")
+        shutil.rmtree(dest, ignore_errors=True)
+        for rel, blob in files:
+            out = os.path.join(dest, *rel.split("/"))
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            with open(out, "wb") as f:
+                f.write(blob)
+        with open(os.path.join(dest, ".tree-ok"), "w") as f:
+            f.write(ML_SHARP_SRC_TREE_SHA256 + "\n")
+    if not os.path.isfile(os.path.join(src, "sharp", "models", "__init__.py")):
+        fail(f"{dest} does not hold apple/ml-sharp's src/")
+    log(f"ml-sharp ok: {ML_SHARP_COMMIT} (source archive, src/ tree {ML_SHARP_SRC_TREE_SHA256[:16]})")
+    return src
+
+
 def prepare_ml_sharp(path, work):
+    if path is None and (FROZEN or shutil.which("git") is None):
+        return prepare_ml_sharp_archive(work)
     if path is None:
         path = os.path.join(work, "ml-sharp")
         if not os.path.isdir(os.path.join(path, ".git")):
@@ -806,7 +859,8 @@ def main():
                     help="what to build (default: the variant this machine's provider picks, MODEL=auto; "
                          "both = full + int4; fp16 is for DirectML only and is never a default)")
     ap.add_argument("--checkpoint", help=f"the official {CHECKPOINT_NAME} (downloaded into --work when omitted)")
-    ap.add_argument("--ml-sharp", help=f"a clean apple/ml-sharp checkout at {ML_SHARP_COMMIT[:12]} (cloned when omitted)")
+    ap.add_argument("--ml-sharp", help=f"a clean apple/ml-sharp checkout at {ML_SHARP_COMMIT[:12]} "
+                    "(cloned when omitted; without git, or in the export tool, its source archive is used)")
     ap.add_argument("--work", default=os.path.join(os.path.expanduser("~"), "displayxr-sharp-export"),
                     help="work directory for the download, the clone and the fp32 intermediate")
     ap.add_argument("--store", help="model store root (default: the runtime's own resolution)")
