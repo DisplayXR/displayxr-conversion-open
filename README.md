@@ -130,8 +130,12 @@ The runtime's model store downloads the official checkpoint, verifies it, and ru
 `dxr-model-builder` (DisplayXR Model Builder, a signed, frozen build of `export_sharp.py`
 with every pinned dependency inside it, so it needs no Python and no git), which writes exactly
 the bytes the pack pins; the store then checks each file's SHA-256 before storing it. The
-builder is installed by `DisplayXRModelBuilderSetup-<version>.exe` (it writes
-`HKLM\Software\DisplayXR\ModelBuilders\open-model-builder`), is never part of a default
+builder is installed on Windows by `DisplayXRModelBuilderSetup-<version>.exe` (it writes
+`HKLM\Software\DisplayXR\ModelBuilders\open-model-builder`) and on Linux x86_64 by
+`displayxr-model-builder_<version>_amd64.deb` (Ubuntu 22.04 / 24.04 / 26.04: the onedir in
+`/usr/lib/displayxr/model-builder/dxr-model-builder/` and the root-owned manifest
+`/usr/share/displayxr/model-builders/open-model-builder.json`, `{"id","version","binary"}`,
+which the store reads on every fetch, so no service restart). It is never part of a default
 install, and downloads and builds nothing by itself. Its contract (command line, JSON events,
 exit codes) is the runtime's conversion-provider-discovery spec, section 5.6;
 `tools/model-builder/` holds its source and PyInstaller spec. Apple's licence text ships beside
@@ -476,8 +480,11 @@ official checkpoint: by the model builder, which `displayxr-cli conv models fetc
 or by `scripts/export_sharp.py` directly. A pack whose model has a downloadable source is fetched
 the same way (the Dashboard's Download button). Either way the runtime selects the capability
 only with `AllowResearchOnly` (`displayxr-cli conv research on`, or `conv run …
---allow-research-only` for one run), read on Windows from the registry and on Linux and macOS
-from the per-user file `conversion-allow-research-only`.
+--allow-research-only` for one run). On Windows the runtime reads it from the registry
+(`ConversionProviders\AllowResearchOnly`, HKCU over HKLM unless `Policy\Lock`); on Linux and
+macOS from the per-user file
+`~/.local/share/DisplayXR/DisplayProcessors/conversion-allow-research-only` (runtime #2759),
+which `displayxr-cli conv research on` writes and `conv research off` removes.
 
 ## Build
 

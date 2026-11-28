@@ -1,0 +1,65 @@
+# Copyright 2026, The DisplayXR Project
+# SPDX-License-Identifier: BSL-1.0
+#
+# The research-preview model builder on Linux x86_64 (tools/model-builder): freeze it in
+# ubuntu:22.04 (the glibc floor of the runtime's Linux packages, runtime #1656), run the contract
+# checks the model store relies on (spec 5.6.2), package the .deb, and reproduce the int4 pin
+# (the cheapest variant: ~0.6 GB out, ~8 GB peak memory) from the official checkpoint with the
+# frozen binary, run the way the store runs it. full and fp16 are reproduced on a dev box before
+# a builder release (README); nothing built here is uploaded (no weights, no derived file).
+#
+# Only when the builder or what it pins changes, or on demand: each int4 run downloads the
+# 2.8 GB checkpoint from its official source.
+
+name: model-builder-linux
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tools/model-builder/**'
+      - 'scripts/export_sharp.py'
+      - 'scripts/requirements-export-sharp.txt'
+      - 'packs/dxr-open-sharp.*'
+      - '.github/workflows/model-builder-linux.yml'
+  pull_request:
+    paths:
+      - 'tools/model-builder/**'
+      - 'scripts/export_sharp.py'
+      - 'scripts/requirements-export-sharp.txt'
+      - 'packs/dxr-open-sharp.*'
+      - '.github/workflows/model-builder-linux.yml'
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: model builder (Linux)
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    timeout-minutes: 120
+    steps:
+      - name: Tools
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            curl ca-certificates binutils libquadmath0 dpkg-dev git >/dev/null
+      - uses: actions/checkout@v4
+      - name: Freeze (CPython 3.12.10 + the pinned set, PyInstaller onedir)
+        run: tools/model-builder/freeze_linux.sh --out build/mb --cache "$RUNNER_TEMP/mb-cache"
+      - name: Contract checks
+        run: |
+          "$RUNNER_TEMP/mb-cache/python-3.12.10/bin/python3.12" -I tools/model-builder/contract_test.py \
+            build/mb/dist/dxr-model-builder/dxr-model-builder
+      - name: .deb
+        run: |
+          v=$(build/mb/dist/dxr-model-builder/dxr-model-builder describe --json | \
+              "$RUNNER_TEMP/mb-cache/python-3.12.10/bin/python3.12" -I -c "import sys,json;print(json.load(sys.stdin)['version'])")
+          tools/model-builder/package_deb_linux.sh build/mb/dist/dxr-model-builder "$v" out
+          dpkg-deb --info out/*.deb
+          dpkg-deb --contents out/*.deb | grep -E 'model-builders/|/dxr-model-builder$'
+      - name: Reproduce the int4 pin (frozen binary, the store's environment)
+        run: |
+          df -h . ; free -m
+          "$RUNNER_TEMP/mb-cache/python-3.12.10/bin/python3.12" -I tools/model-builder/hash_check.py \
+            build/mb/dist/dxr-model-builder/dxr-model-builder --variant int4 \
+            --root "$RUNNER_TEMP/mb-hash" --download
