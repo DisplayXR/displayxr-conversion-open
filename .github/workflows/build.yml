@@ -32,7 +32,36 @@ jobs:
       - name: Validate the SHARP pack (research only, built locally, never downloaded)
         run: python3 -I scripts/check_model_pack.py --allow-research packs/dxr-open-sharp.models.json
       - name: Byte-compile the SHARP export script
-        run: python3 -I -m py_compile scripts/export_sharp.py
+        run: python3 -I -m py_compile scripts/export_sharp.py tools/model-builder/dxr_model_builder.py tools/model-builder/contract_test.py
+
+  # The research-preview model builder (tools/model-builder): freeze it from the pinned set,
+  # then run the contract checks the runtime's model store relies on (spec 5.6.2: describe,
+  # JSON events on stdout, exit codes, cancel) and build its installer. No checkpoint and no
+  # model build here: the hash reproduction runs on a dev box before a builder release.
+  model-builder:
+    name: model builder (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Pinned environment + PyInstaller
+        run: python -m pip install -r tools/model-builder/requirements-freeze.txt
+      - name: Freeze
+        run: python -m PyInstaller --noconfirm --clean --distpath build/mb/dist --workpath build/mb/work tools/model-builder/dxr-model-builder.spec
+      - name: Contract checks
+        run: python -I tools/model-builder/contract_test.py build/mb/dist/dxr-model-builder/dxr-model-builder.exe
+      - name: Installer
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe")) { choco install nsis -y --no-progress }
+          cmake "-DBIN_DIR=$PWD\build\mb\dist\dxr-model-builder" "-DFILES=dxr-model-builder.exe" "-DVERSION=0.0.0-ci" "-DOUT=$PWD\build\MbAllowlist.nsh" -P installer\gen_allowlist_nsh.cmake
+          if ($LASTEXITCODE -ne 0) { throw "gen_allowlist_nsh failed" }
+          New-Item -ItemType Directory -Force out | Out-Null
+          & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" /V2 "/DVERSION=0.0.0-ci" "/DDIST_DIR=$PWD\build\mb\dist\dxr-model-builder" "/DOUTPUT_DIR=$PWD\out" "/DALLOWLIST_NSH=$PWD\build\MbAllowlist.nsh" installer\DisplayXRModelBuilderInstaller.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
+          Get-ChildItem out
 
   build:
     name: ${{ matrix.os }}
