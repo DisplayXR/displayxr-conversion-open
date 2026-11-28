@@ -124,14 +124,21 @@ def main():
         f.truncate(src["size"])
     argv = [exe, "build", "--recipe", "sharp-onnx", "--variant", "int4", "--source", f"checkpoint={bad}",
             "--out", s["out"], "--work", s["work"], "--cancel-file", s["cancel"], "--accept-license", "apple-amlr"]
+    # The cancel file appears once the first progress line is out (mid-hash; a fast disk hashes
+    # the sparse file in a couple of seconds, so a fixed sleep races the end of the run).
     proc = subprocess.Popen(argv, cwd=s["work"], env=min_env(s["work"]), stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    time.sleep(3)
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    lines = []
+    for ln in proc.stdout:
+        lines.append(ln)
+        if '"progress"' in ln:
+            break
     open(s["cancel"], "w").close()
     t0 = time.monotonic()
     try:
-        out, _ = proc.communicate(timeout=10)
+        rest, _ = proc.communicate(timeout=10)
         took = time.monotonic() - t0
+        out = "".join(lines) + rest
         ev = events(out)
         check(proc.returncode == 17 and ev is not None and ev[-1].get("event") == "done",
               f"cancel file: exit 17 within 10 s ({took:.1f} s)")
