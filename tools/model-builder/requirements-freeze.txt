@@ -1,0 +1,7 @@
+# Copyright 2026, The DisplayXR Project
+# SPDX-License-Identifier: BSL-1.0
+#
+# Freezing dxr-model-builder: the export's pinned set plus PyInstaller. Python 3.12.
+-r ../../scripts/requirements-export-sharp.txt
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.10

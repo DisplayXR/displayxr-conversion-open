@@ -1,0 +1,65 @@
+# Copyright 2026, The DisplayXR Project
+# SPDX-License-Identifier: BSL-1.0
+#
+# Tag-triggered release of the research-preview model builder: model-builder-vX.Y.Z ->
+# DisplayXRModelBuilderSetup-X.Y.Z.exe attached to its own GitHub Release (a separate version
+# line from the provider's vX.Y.Z). The tag must equal the builder's TOOL_VERSION
+# (tools/model-builder/dxr_model_builder.py), which the packs' local_build.tool.min_version
+# compares against. Builds here are unsigned; the runtime's model store runs only a builder
+# signed by a first-party signer (leaf CN "Leia, Inc.") or allowlisted, so the signing provider
+# (the runtime's docs/specs/runtime/release-signing.md) rebuilds the tag with SIGN_CMD and
+# replaces this installer. Before tagging, reproduce the pack's hashes with the frozen builder
+# (README, "SHARP ... built on your machine").
+
+name: release-model-builder
+
+on:
+  push:
+    tags: ['model-builder-v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version from tag
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#model-builder-v}" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Pinned environment + PyInstaller
+        run: python -m pip install -r tools/model-builder/requirements-freeze.txt
+      - name: Freeze
+        run: python -m PyInstaller --noconfirm --clean --distpath build/mb/dist --workpath build/mb/work tools/model-builder/dxr-model-builder.spec
+      - name: Tag equals the builder's version
+        shell: bash
+        run: |
+          v=$(build/mb/dist/dxr-model-builder/dxr-model-builder.exe describe --json | python -c "import sys,json;print(json.load(sys.stdin)['version'])")
+          test "$v" = "$VERSION" || { echo "::error::tag $VERSION but the builder reports $v"; exit 1; }
+      - name: Contract checks
+        run: python -I tools/model-builder/contract_test.py build/mb/dist/dxr-model-builder/dxr-model-builder.exe
+      - name: NSIS
+        run: choco install nsis -y --no-progress
+      - name: Installer (allowlist row for the unsigned exe)
+        shell: pwsh
+        run: |
+          cmake "-DBIN_DIR=$PWD\build\mb\dist\dxr-model-builder" "-DFILES=dxr-model-builder.exe" "-DVERSION=$env:VERSION" "-DOUT=$PWD\build\MbAllowlist.nsh" -P installer\gen_allowlist_nsh.cmake
+          if ($LASTEXITCODE -ne 0) { throw "gen_allowlist_nsh failed" }
+          New-Item -ItemType Directory -Force out | Out-Null
+          & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" /V2 "/DVERSION=$env:VERSION" "/DDIST_DIR=$PWD\build\mb\dist\dxr-model-builder" "/DOUTPUT_DIR=$PWD\out" "/DALLOWLIST_NSH=$PWD\build\MbAllowlist.nsh" installer\DisplayXRModelBuilderInstaller.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
+          Get-ChildItem out
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/DisplayXRModelBuilderSetup-*.exe
+          fail_on_unmatched_files: true
+          name: DisplayXR Model Builder ${{ env.VERSION }} (research preview)
+          body: |
+            Research preview (non-commercial). Builds research-only models (Apple's SHARP) on your
+            own machine from the official upstream checkpoint; DisplayXR hosts no weights and no
+            file made from them. Installed from the DisplayXR Dashboard / Catalog; never part of a
+            default install.

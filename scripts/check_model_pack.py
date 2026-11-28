@@ -93,6 +93,70 @@ def check_local_build(m, mw, pack_dir, rep):
         rep.fail(mw, "local_build needs provenance.parent_size")
     if not isinstance(prov.get("converter"), str) or not prov["converter"]:
         rep.fail(mw, "local_build needs provenance.converter (the script and its version)")
+    if "tool" in lb:
+        check_buildable(lb, mw, pack_dir, rep)
+
+
+ID = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def check_buildable(lb, mw, pack_dir, rep):
+    """A model the runtime builds itself with the signed model builder (the runtime's
+    conversion-provider-discovery spec section 5.6.1; the runtime refuses the whole pack on any of these)."""
+    if lb.get("deterministic") is not True:
+        rep.fail(mw, "a buildable model needs local_build.deterministic true")
+    for k in ("recipe", "variant"):
+        if not ID.match(str(lb.get(k) or "")):
+            rep.fail(mw, f"local_build.{k} missing or not [A-Za-z0-9._-]")
+    tool = lb.get("tool")
+    if not isinstance(tool, dict):
+        rep.fail(mw, "local_build.tool must be an object")
+        tool = {}
+    if not ID.match(str(tool.get("id") or "")):
+        rep.fail(mw, "local_build.tool.id missing or not [A-Za-z0-9._-]")
+    if not isinstance(tool.get("catalog_id"), str) or not tool["catalog_id"]:
+        rep.fail(mw, "local_build.tool.catalog_id missing")
+    if not re.match(r"^\d+\.\d+\.\d+$", str(tool.get("min_version") or "")):
+        rep.fail(mw, "local_build.tool.min_version must be X.Y.Z")
+    if tool.get("signer") != "first-party":
+        rep.fail(mw, "local_build.tool.signer must be first-party")
+    sources = lb.get("sources")
+    if not isinstance(sources, list) or not 1 <= len(sources) <= 2:
+        rep.fail(mw, "local_build.sources must list 1 or 2 sources")
+        sources = []
+    for i, src in enumerate(sources):
+        w = f"{mw} source[{i}]"
+        if not ID.match(str(src.get("role") or "")):
+            rep.fail(w, "role missing or not [A-Za-z0-9._-]")
+        if not str(src.get("url") or "").startswith(("https://", "http://", "file://")):
+            rep.fail(w, "url must be https / http / file")
+        if src.get("auth") is not None and not str(src.get("url")).startswith("https://"):
+            rep.fail(w, "auth needs an https url")
+        if not SHA256.match(src.get("sha256") or ""):
+            rep.fail(w, "sha256 missing")
+        if not isinstance(src.get("size"), int) or src["size"] <= 0:
+            rep.fail(w, "size missing")
+        lic = src.get("license") or {}
+        if not ID.match(str(lic.get("id") or "")):
+            rep.fail(w, "license.id missing or not [A-Za-z0-9._-]")
+        text = lic.get("text")
+        if not isinstance(text, str) or not text or os.path.basename(text) != text or text in (".", ".."):
+            rep.fail(w, "license.text must be a bare file name beside the pack")
+        elif not SHA256.match(lic.get("text_sha256") or ""):
+            rep.fail(w, "license.text_sha256 missing")
+        else:
+            try:
+                with open(os.path.join(pack_dir, text), "rb") as f:
+                    got = hashlib.sha256(f.read()).hexdigest()
+            except OSError as e:
+                rep.fail(w, f"license.text {text}: {e}")
+            else:
+                if got != lic["text_sha256"]:
+                    rep.fail(w, f"license.text {text} hashes to {got}, not license.text_sha256")
+    needs = lb.get("needs")
+    if needs is not None and not (isinstance(needs, dict) and all(
+            isinstance(needs.get(k), int) and needs[k] > 0 for k in ("ram_mb", "disk_mb"))):
+        rep.fail(mw, "local_build.needs must carry ram_mb and disk_mb (positive integers)")
 
 
 def check_pack(path, args, rep):

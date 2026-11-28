@@ -114,7 +114,31 @@ The provider picks between them per machine (setting `MODEL`, [below](#which-sha
 SHARP's weights are licensed **for research only** (Apple Machine Learning Research Model
 licence, `apple-amlr`), and the licence follows every derivative, so this repository never
 ships, mirrors or links a weight file. The pack has no download URL; you build the blobs
-yourself from the official checkpoint:
+yourself from the official checkpoint, on your own machine.
+
+**With the model builder (research preview).** In the DisplayXR Dashboard's 2D-to-3D models
+section, each SHARP model has a row badged *Research preview (non-commercial)*: get the
+builder from the Catalog, read Apple's licence in the row, tick it, and press Build. The same
+from a terminal:
+
+```
+displayxr-cli conv research on
+displayxr-cli conv models fetch dxr-open-sharp --model sharp-int4-1536 --accept-license apple-amlr --events
+```
+
+The runtime's model store downloads the official checkpoint, verifies it, and runs
+`dxr-model-builder` (DisplayXR Model Builder, a signed, frozen build of `export_sharp.py`
+with every pinned dependency inside it, so it needs no Python and no git), which writes exactly
+the bytes the pack pins; the store then checks each file's SHA-256 before storing it. The
+builder is installed by `DisplayXRModelBuilderSetup-<version>.exe` (it writes
+`HKLM\Software\DisplayXR\ModelBuilders\open-model-builder`), is never part of a default
+install, and downloads and builds nothing by itself. Its contract (command line, JSON events,
+exit codes) is the runtime's conversion-provider-discovery spec, section 5.6;
+`tools/model-builder/` holds its source and PyInstaller spec. Apple's licence text ships beside
+the pack (`packs/dxr-open-sharp.apple-amlr.txt`, pinned by `text_sha256`); your acceptance is
+recorded per user and per licence text, never by an installer.
+
+**With the export script** (any machine with Python 3.12):
 
 ```
 python3.12 -m venv sharp-venv
@@ -447,17 +471,13 @@ and better, so it is the default there; on the CPU the int4 build is the faster,
 
 Research-only weights are **never bundled, mirrored or pre-fetched** (ADR-057 §5), and the
 installers download no model. A SHARP pack's blob is built on the user's machine from Apple's
-official checkpoint by `scripts/export_sharp.py` (it downloads the checkpoint, verifies its
-SHA-256, exports it, keeps it fp32, 4-bit-quantises it or converts it to fp16, and writes the bytes the pack
-pins into the model store);
-see that script for its requirements and the licence it asks you to accept. A pack whose model has
-a downloadable source is fetched the usual way, `displayxr-cli conv models fetch <pack>
---model <name>` (the same action as the Dashboard's Download button). Either way the runtime
-selects the capability only with `AllowResearchOnly` (`displayxr-cli conv run … --allow-research-only`
-for one run). As of runtime v2.69.4 the runtime reads `AllowResearchOnly` only from the Windows
-registry, so on Linux and macOS its model store refuses a research-only model (`fetch` reports
-`policy`), and `conv run` hosts providers without a model store; both are runtime work, tracked
-with this capability.
+official checkpoint: by the model builder, which `displayxr-cli conv models fetch dxr-open-sharp
+--model <name>` runs (the Dashboard's Build button; [above](#sharp-image--gaussian-splats-built-on-your-machine)),
+or by `scripts/export_sharp.py` directly. A pack whose model has a downloadable source is fetched
+the same way (the Dashboard's Download button). Either way the runtime selects the capability
+only with `AllowResearchOnly` (`displayxr-cli conv research on`, or `conv run …
+--allow-research-only` for one run), read on Windows from the registry and on Linux and macOS
+from the per-user file `conversion-allow-research-only`.
 
 ## Build
 
