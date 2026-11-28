@@ -63,3 +63,44 @@ jobs:
             own machine from the official upstream checkpoint; DisplayXR hosts no weights and no
             file made from them. Installed from the DisplayXR Dashboard / Catalog; never part of a
             default install.
+
+  linux:
+    # The Linux x86_64 builder: frozen in ubuntu:22.04 (glibc floor of the runtime's Linux
+    # packages), contract-checked, packaged as displayxr-model-builder_X.Y.Z_amd64.deb (the
+    # platform-trusted install the store admits: root-owned files under /usr, manifest in
+    # /usr/share/displayxr/model-builders/) plus the onedir tarball (standalone use, or a dev box's
+    # DXR_MODEL_BUILDER_OPEN_MODEL_BUILDER override). Reproduce the three pins with the frozen
+    # binary before tagging (tools/model-builder/hash_check.py; the int4 pin also runs in
+    # model-builder-linux.yml).
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    steps:
+      - name: Tools
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            curl ca-certificates binutils libquadmath0 dpkg-dev git >/dev/null
+      - uses: actions/checkout@v4
+      - name: Version from tag
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#model-builder-v}" >> "$GITHUB_ENV"
+      - name: Freeze
+        run: tools/model-builder/freeze_linux.sh --out build/mb --cache "$RUNNER_TEMP/mb-cache"
+      - name: Tag equals the builder's version
+        shell: bash
+        run: |
+          v=$(build/mb/dist/dxr-model-builder/dxr-model-builder describe --json | \
+              "$RUNNER_TEMP/mb-cache/python-3.12.10/bin/python3.12" -I -c "import sys,json;print(json.load(sys.stdin)['version'])")
+          test "$v" = "$VERSION" || { echo "::error::tag $VERSION but the builder reports $v"; exit 1; }
+      - name: Contract checks
+        run: |
+          "$RUNNER_TEMP/mb-cache/python-3.12.10/bin/python3.12" -I tools/model-builder/contract_test.py \
+            build/mb/dist/dxr-model-builder/dxr-model-builder
+      - name: .deb
+        run: tools/model-builder/package_deb_linux.sh build/mb/dist/dxr-model-builder "$VERSION" out
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/displayxr-model-builder_*_amd64.deb
+            build/mb/dxr-model-builder-*-linux-x86_64.tar.gz
+          fail_on_unmatched_files: true

@@ -32,7 +32,7 @@ jobs:
       - name: Validate the SHARP pack (research only, built locally, never downloaded)
         run: python3 -I scripts/check_model_pack.py --allow-research packs/dxr-open-sharp.models.json
       - name: Byte-compile the SHARP export script
-        run: python3 -I -m py_compile scripts/export_sharp.py tools/model-builder/dxr_model_builder.py tools/model-builder/contract_test.py
+        run: python3 -I -m py_compile scripts/export_sharp.py tools/model-builder/dxr_model_builder.py tools/model-builder/contract_test.py tools/model-builder/hash_check.py
 
   # The research-preview model builder (tools/model-builder): freeze it from the pinned set,
   # then run the contract checks the runtime's model store relies on (spec 5.6.2: describe,
